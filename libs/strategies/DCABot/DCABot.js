@@ -1857,34 +1857,85 @@ const checkActiveDeal = async (botId, pair) => {
 };
 
 
-const getDealsMaxUsedFunds = async () => {
-
-	let results;
-	let botIds = [];
-
-	let success = true;
+const getDealsMaxUsedFunds = async (maxDealsPerBot = 1, useConfig = false) => {
 
 	const bots = await getBots();
 
-	if (bots && bots.length > 0) {
+	let botIds = bots?.map(bot => bot.botId) || [];
 
-		for (let i in bots) {
+	const results = botIds.length ?
+		await getDeals(
+			null,
+			null,
+			null,
+			DbQueries.dealsMaxUsedFundsPipeline({
+					status: [null, 0, 1]
+				},
+				botIds,
+				null,
+				maxDealsPerBot
+			)
+		) : [];
 
-			botIds.push(bots[i].botId)
+	if (useConfig) {
+
+		try {
+
+			for (let i in results) {
+
+				let totalSum = 0;
+				let lastSumArr = [];
+
+				let botObj = results[i];
+
+				const pairMax = Math.max(parseInt(botObj['botConfig']['pairMax']), 1);
+				const pairDealsMax = Math.max(parseInt(botObj['botConfig']['pairDealsMax']), 1);
+
+				const botMaxDeals = Math.round(pairMax * pairDealsMax);
+
+				const resultsBot = await getDeals(
+					null,
+					null,
+					null,
+					DbQueries.dealsMaxUsedFundsPipeline({
+						status: [null, 0, 1]
+					},
+						botObj['botId'],
+						null,
+						botMaxDeals
+					)
+				);
+
+				const config = results[i]['botConfig'];
+				const maxFundsObj = await calculateMaxFunds(config);
+
+				const mergedBot = resultsBot[0];
+
+				results[i] = {
+					...mergedBot,
+					...maxFundsObj
+				};
+
+				for (let d in results[i]['deals']) {
+
+					const deal = results[i]['deals'][d];
+
+					const lastSum = deal['lastSum'];
+
+					lastSumArr.push(lastSum);
+					totalSum += Number(lastSum)
+				}
+
+				results[i]['bot_max_funds_exposure'] = Math.round(totalSum * 100) / 100;
+			}
 		}
-
-		const pipeline = DbQueries.dealsMaxUsedFundsPipeline({ status: [ null, 0, 1 ] }, botIds);
-
-		results = await getDeals(null, null, null, pipeline);
-	}
-	else {
-
-		success = false;
+		catch(e) {}
 	}
 
-	let dataObj = { 'success': success, 'data': results };
-
-	return dataObj;
+	return {
+		success: bots && bots.length > 0,
+		data: results
+	};
 };
 
 

@@ -71,7 +71,7 @@ async function processWorkerTask(instanceData) {
 
 		SymBot.setInstanceParentPort(parentPort); 
 
-		await SymBot.start();
+		await SymBot.start(instanceData.args);
 
 		console.log(colors.bgBlack.brightGreen.bold(`Finished Starting Instance: ${instanceName}`));
 

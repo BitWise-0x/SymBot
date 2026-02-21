@@ -94,6 +94,7 @@ async function updateConfig(req, res) {
 
 	const ollama = body.ollama_enabled;
 	const ollamaHost = body.ollama_host;
+	const ollamaApiKey = body.ollama_api_key;
 	const ollamaModel = body.ollama_model;
 
 	const cronBackup = body.cron_backup_enabled;
@@ -272,6 +273,7 @@ async function updateConfig(req, res) {
 
 		appConfig['ai']['ollama']['enabled'] = ollamaEnabled;
 		appConfig['ai']['ollama']['host'] = ollamaHost;
+		appConfig['ai']['ollama']['api_key'] = ollamaApiKey;
 		appConfig['ai']['ollama']['model'] = ollamaModel;
 
 		shareData['appData']['telegram_id'] = telegramUserId;
@@ -327,7 +329,7 @@ async function updateConfig(req, res) {
 
 			if (ollamaEnabled) {
 
-				shareData.Ollama.start(ollamaHost, ollamaModel);
+				shareData.Ollama.start(ollamaHost, ollamaApiKey, ollamaModel);
 			}
 
 			// Restart Signals

@@ -162,6 +162,11 @@ async function startAllWorkers(configs) {
 			const enabled = config['enabled'];
 			const startBoot = config['start_boot'];
 
+			if (process.argv.length > 2) {
+
+				config['args'] = process.argv.slice(2);
+			}
+
 			if (enabled && startBoot) {
 
 				startWorker({

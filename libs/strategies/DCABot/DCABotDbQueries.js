@@ -6,7 +6,12 @@ const path = require('path');
 const pathRoot = path.resolve(__dirname, ...Array(3).fill('..'));
 
 
-const dealsMaxUsedFundsPipeline = (filters = {}, botIds = null, since = null) => {
+const dealsMaxUsedFundsPipeline = (
+    filters = {},
+    botIds = null,
+    since = null,
+    maxDealsPerBot = 1
+) => {
 
     const matchStage = {};
 
@@ -23,7 +28,6 @@ const dealsMaxUsedFundsPipeline = (filters = {}, botIds = null, since = null) =>
     return [
         { $match: matchStage },
 
-        // Keep only filled orders
         {
             $addFields: {
                 filledOrders: {
@@ -36,25 +40,18 @@ const dealsMaxUsedFundsPipeline = (filters = {}, botIds = null, since = null) =>
             }
         },
 
-        // Get last filled order per deal
         {
             $addFields: {
                 lastFilledOrder: { $arrayElemAt: ["$filledOrders", -1] }
             }
         },
 
-        // Optional filtering by since date
-        ...(since
-            ? [
-                {
-                    $match: {
-                        "lastFilledOrder.dateFilled": { $gte: new Date(since) }
-                    }
-                }
-            ]
-            : []),
+        ...(since ? [{
+            $match: {
+                "lastFilledOrder.dateFilled": { $gte: new Date(since) }
+            }
+        }] : []),
 
-        // Project last order info
         {
             $project: {
                 botId: 1,
@@ -66,36 +63,53 @@ const dealsMaxUsedFundsPipeline = (filters = {}, botIds = null, since = null) =>
             }
         },
 
-        // Sort descending by lastSum so the highest is first per bot
         { $sort: { botId: 1, lastSum: -1 } },
 
-        // Group by botId, taking the first (highest) lastSum
         {
             $group: {
                 _id: "$botId",
                 botName: { $first: "$botName" },
-                maxLastSum: { $first: "$lastSum" },
-                maxOrder: { $first: "$lastOrder" },
-                dealId: { $first: "$dealId" },
-                orderNo: { $first: "$lastOrderNo" }
+                maxLastSum: { $max: "$lastSum" },
+                deals: {
+                    $push: {
+                        dealId: "$dealId",
+                        lastSum: "$lastSum",
+                        lastOrderNo: "$lastOrderNo",
+                        lastOrder: "$lastOrder"
+                    }
+                }
             }
         },
 
-        // Rename _id to botId
+        {
+            $lookup: {
+                from: "bots",
+                localField: "_id",
+                foreignField: "botId",
+                as: "bot"
+            }
+        },
+
+        {
+            $addFields: {
+                botConfig: { $arrayElemAt: ["$bot.config", 0] }
+            }
+        },
+
         {
             $project: {
                 botId: "$_id",
                 botName: 1,
                 maxLastSum: 1,
-                maxOrder: 1,
-                dealId: 1,
-                orderNo: 1,
+                botConfig: 1,
+                deals: { $slice: ["$deals", maxDealsPerBot] },
                 _id: 0
             }
-        }
+        },
+
+        { $sort: { botName: 1 } }
     ];
 };
-
 
 
 module.exports = {

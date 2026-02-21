@@ -68,6 +68,7 @@
 				"ollama": {
 					"enabled": true,
 					"host": "",
+					"api_key": "",
 					"model": ""
 				}
 			},

@@ -642,7 +642,7 @@
 				<tr>
 					<td></td>
 					<td>
-						<a href="https://ollama.com/" target=_blank>Ollama</a> must be installed
+						<a href="https://ollama.com/" target=_blank>Ollama</a> must be installed or use cloud services
 					</td>
 				</tr>
 				<tr>
@@ -656,6 +656,20 @@
 
 					<td>
 						<input name="ollama_host" id="ollama_host" class="form-field" style="width: 250px;" value="<%= services['ai']['ollama']['host'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="password">API Key:
+							<span class="toolTip">?<span class="toolTipText">
+								This is your API key if you are using Ollama Cloud services
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="password" name="ollama_api_key" id="ollama_api_key" class="form-field" style="width: 250px;" value="<%= services['ai']['ollama']['api_key'] %>">
 					</td>
 				</tr>
 

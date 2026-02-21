@@ -488,6 +488,7 @@ Before installing Ollama, ensure your system meets the following requirements:
     -   Models can also run on a CPU, but this may result in significantly slower performance.
 
 1. Visit [Ollama's official website](https://ollama.com), download the installer for your operating system and follow the provided installation instructions.
+	- **NOTE:** You do not need to manually install using the steps below if you sign up and use Ollama Cloud services.
 2. Download a model using the command: `ollama pull <model_name>`. For example: `ollama pull llama3.2`.
 3. By default, Ollama runs on port 11434.
 	- If you need to access Ollama remotely, you must configure it to listen on `0.0.0.0` instead of `localhost`.
@@ -1114,18 +1115,23 @@ To reset the SymBot database or server ID, you must use the command line. The sy
 
 #### Configuration mode
 1. Stop any running instances of SymBot
-2. Type: `npm start config` (or `node ./symbot.js config`)
+2. Type: `npm start config` (or `node symbot.js config`)
 
 #### Reset database
 ##### *** CAUTION *** This will purge all data from the SymBot database!
 
 1. Stop any running instances of SymBot
-2. Type: `npm start reset` (or `node ./symbot.js reset`)
+2. Type: `npm start reset` (or `node symbot.js reset`)
 
 #### Reset server ID only
 
 1. Stop any running instances of SymBot
-2. Type: `npm start reset serverid` (or `node ./symbot.js reset serverid`)
+2. Type: `npm start reset serverid` (or `node symbot.js reset serverid`)
+
+#### Reset login sessions only
+
+1. Stop any running instances of SymBot
+2. Type: `npm start reset sessions` (or `node symbot.js reset sessions`)
 
 
 ## Frequently Asked Questions (FAQ)

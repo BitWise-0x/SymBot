@@ -27,17 +27,9 @@
         'rgba(255, 159, 64, 1)'
     ];
 
-    function remapLabels(data) {
-        const remapped = {};
-        for (const key in data) {
-            const label = botIdNameMap[key] || key;
-            remapped[label] = data[key];
-        }
-        return remapped;
-    }
-
     $(document).ready(function () {
 
+        // --- Populate account balance ---
         function populateBalance(currency) {
             let balance = Number(balances[currency]);
             if (isNaN(balance)) balance = 0;
@@ -86,18 +78,14 @@
             alertBox('Deals are being loaded. Please wait a few minutes and refresh the page.');
         <% } %>
 
+        // --- Chart creation helper ---
         function createChart(ctx, label, data, showMaxOnTop=false, maxData={}) {
-            const moneyCharts = [
-                'Bot Profit',
-                'Active P/L',
-                'Adjusted P/L',
-                'Profit Per Day',
-                'Funds in Use'
-            ];
-
+            const moneyCharts = ['Bot Profit','Active P/L','Adjusted P/L','Profit Per Day','Funds in Use'];
             const isMoney = moneyCharts.includes(label);
-            const labels = Object.keys(data);
-            const values = Object.values(data);
+
+            const keys = Object.keys(data);
+            const labels = keys; // already using botName or date strings
+            const values = keys.map(k => data[k] || 0);
 
             return new Chart(ctx, {
                 type: 'bar',
@@ -149,15 +137,16 @@
                         const ctx = chart.ctx;
                         chart.data.datasets.forEach((dataset, i) => {
                             chart.getDatasetMeta(i).data.forEach((bar, index) => {
-                                const botLabel = chart.data.labels[index];
-                                const maxValue = maxData[botLabel] || 0;
-                                const valueText = '$' + maxValue.toLocaleString();
+                                const key = chart.data.labels[index];
+                                const maxValue = maxData[key] || 0;
+                                if (maxValue <= 0) return;
+
                                 ctx.save();
                                 ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-color') || '#999';
                                 ctx.font = 'bold 12px Arial';
                                 ctx.textAlign = 'center';
                                 ctx.textBaseline = 'bottom';
-                                ctx.fillText(valueText, bar.x, bar.y - 5);
+                                ctx.fillText('$' + maxValue.toLocaleString(), bar.x, bar.y - 5);
                                 ctx.restore();
                             });
                         });
@@ -166,19 +155,18 @@
             });
         }
 
-        createChart(document.getElementById('botProfitChart').getContext('2d'), 'Bot Profit', remapLabels(profit_by_bot_map));
-        createChart(document.getElementById('activePLChart').getContext('2d'), 'Active P/L', remapLabels(active_pl_map));
-        createChart(document.getElementById('adjustedPLChart').getContext('2d'), 'Adjusted P/L', remapLabels(adjusted_pl_map));
+        // --- Render all charts ---
+        createChart(document.getElementById('botProfitChart').getContext('2d'), 'Bot Profit', profit_by_bot_map);
+        createChart(document.getElementById('activePLChart').getContext('2d'), 'Active P/L', active_pl_map);
+        createChart(document.getElementById('adjustedPLChart').getContext('2d'), 'Adjusted P/L', adjusted_pl_map);
         createChart(document.getElementById('profitPerDayChart').getContext('2d'), 'Profit Per Day', profit_by_day_map);
-
-        // Responsive Deal Duration + Funds in Use charts
-        createChart(document.getElementById('botDealDurationChart').getContext('2d'), 'Deal Duration (Minutes)', remapLabels(bot_deal_duration_map));
+        createChart(document.getElementById('botDealDurationChart').getContext('2d'), 'Deal Duration (Minutes)', bot_deal_duration_map);
         createChart(
             document.getElementById('fundsInUseChart').getContext('2d'),
             'Funds in Use',
-            remapLabels(bot_funds_in_use_map),
+            bot_funds_in_use_map,
             true,
-            remapLabels(max_funds_deals_map)
+            max_funds_deals_map
         );
 
         // Hide the Max Deal Exposure chart

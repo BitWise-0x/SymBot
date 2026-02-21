@@ -66,6 +66,7 @@ const resetDatabase = async (resetDb, resetServerId) => {
 	let isErr;
 	let collectionBots;
 	let collectionDeals;
+	let collectionSessions;
 	let collectionServer;
 
 	try {
@@ -77,6 +78,7 @@ const resetDatabase = async (resetDb, resetServerId) => {
 
 			collectionBots = await db.dropCollection('bots');
 			collectionDeals = await db.dropCollection('deals');
+			collectionSessions = await db.dropCollection('sessions');
 		}
 
 		if (resetServerId) {
@@ -99,8 +101,49 @@ const resetDatabase = async (resetDb, resetServerId) => {
 						'error': isErr,
 						'collectionBots': collectionBots,
 						'collectionDeals': collectionDeals,
-						'collectionServer': collectionServer
+						'collectionServer': collectionServer,
+						'collectionSessions': collectionSessions
 					};
+
+	return resObj;
+};
+
+
+const resetSessions = async () => {
+
+	let success = true;
+	let isErr;
+	let collectionSessions;
+
+	const collection = 'sessions';
+
+	try {
+
+		const dbConnection = await connectDb();
+		const db = dbConnection.db;
+
+		const collections = await db.listCollections({
+			'name': collection
+		}).toArray();
+
+		if (collections.length > 0) {
+
+			collectionSessions = await db.collection(collection).drop();
+		}
+
+		await dbConnection.close();
+	}
+	catch (e) {
+
+		success = false;
+		isErr = e;
+	}
+
+	const resObj = {
+		'success': success,
+		'error': isErr,
+		'collectionSessions': collectionSessions
+	};
 
 	return resObj;
 };
@@ -1655,6 +1698,7 @@ async function resetConsole(serverIdError, resetServerId) {
 
 					console.log('Bots reset: ' + resetData['collectionBots']);
 					console.log('Deals reset: ' + resetData['collectionDeals']);
+					console.log('Sessions reset: ' + resetData['collectionSessions']);
 				}
 
 				if (!success) {
@@ -1898,6 +1942,7 @@ module.exports = {
 	pause,
 	resetConsole,
 	resetDatabase,
+	resetSessions,
 	updateSystem,
 	connectDb,
 	backupDb,

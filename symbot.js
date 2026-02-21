@@ -70,6 +70,7 @@ async function init() {
 	let isConfig = false;
 	let isReset = false;
 	let resetServerId = false;
+	let resetSessions = false;
 	let consoleLog = false;
 	let serverIdError = false;
 
@@ -99,6 +100,11 @@ async function init() {
 		if (process.argv[3] && process.argv[3].toLowerCase() == 'serverid') {
 
 			resetServerId = true;
+		}
+
+		if (process.argv[3] && process.argv[3].toLowerCase() == 'sessions') {
+
+			resetSessions = true;
 		}
 	}
 
@@ -447,7 +453,18 @@ async function init() {
 
 	if (isReset && (success || serverIdError)) {
 
-		await System.resetConsole(serverIdError, resetServerId);
+		if (resetSessions) {
+
+			const resetData = await System.resetSessions();
+
+			console.log('Sessions reset: ' + resetData['success']);
+
+			process.exit(1);
+		}
+		else {
+
+			await System.resetConsole(serverIdError, resetServerId);
+		}
 
 		return({ 'nostart': true });
 	}
@@ -470,11 +487,12 @@ async function init() {
 		// Start AI / Ollama client
 		const ollamEnabled = appConfig['data']['ai']['ollama']['enabled'];
 		const ollamaHost = appConfig['data']['ai']['ollama']['host'];
+		const ollamaApiKey = appConfig['data']['ai']['ollama']['api_key'];
 		const ollamaModel = appConfig['data']['ai']['ollama']['model'];
 
 		if (ollamEnabled) {
 
-			Ollama.start(ollamaHost, ollamaModel);
+			Ollama.start(ollamaHost, ollamaApiKey, ollamaModel);
 		}
 
 		const TWELVE_HOURS = 12 * 60 * 60 * 1000;
@@ -607,7 +625,7 @@ async function setInstanceParentPort(port) {
 }
 
 
-async function start() {
+async function start(args) {
 
 	let initData;
 
@@ -618,6 +636,14 @@ async function start() {
 	await Common.makeDir('logs');
 	await Common.makeDir('logs/services');
 	await Common.makeDir('logs/services/notifications');
+
+	if (args && args.length > 0) {
+
+		for (let i = 0; i < args.length; i++) {
+
+			process.argv[i + 2] = args[i];
+		}
+	}
 
 	try {
 

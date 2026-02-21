@@ -1924,32 +1924,18 @@ async function getProcessedDeals(deals) {
 }
 
 
-function insertValueToMap(map, key, value) {
-
-	if(!map[key]) {
-
-		map[key] = Number(value);
-	}
-	else {
-
-		map[key] += Number(value);
-	}
-}
-
-
 async function getDashboardData({ duration, timeZoneOffset }) {
 
-    const cleanedOffset = timeZoneOffset.replace(':', '');
+	let maxDealsPerBot = 1;
+
+	const cleanedOffset = timeZoneOffset.replace(':', '');
     const offsetSign = cleanedOffset.startsWith('-') ? -1 : 1;
     const offsetHours = parseInt(cleanedOffset.slice(1, 3), 10);
     const offsetMinutes = parseInt(cleanedOffset.slice(3), 10);
     const totalOffsetMinutes = offsetSign * (offsetHours * 60 + offsetMinutes);
 
-    // Current time adjusted for timezone
     const localNow = new Date(Date.now() + totalOffsetMinutes * 60000);
     const localDateOnly = new Date(localNow.getFullYear(), localNow.getMonth(), localNow.getDate());
-
-    // Local midnight UTC
     const localMidnightUTC = new Date(localDateOnly.getTime() - totalOffsetMinutes * 60000);
 
     const dateTo = new Date(localMidnightUTC.getTime() + 86400000 - 1);
@@ -1965,31 +1951,29 @@ async function getDashboardData({ duration, timeZoneOffset }) {
     });
     const complete_deals = await getProcessedDeals(raw_deals);
 
-    const max_funds_deals = await shareData.DCABot.getDealsMaxUsedFunds();
+    const max_funds_deals = await shareData.DCABot.getDealsMaxUsedFunds(maxDealsPerBot);
     const deal_tracker = await shareData.DCABot.getDealTracker();
 
     const adjustedEndDate = new Date(dateTo.getTime() - 86400000);
-
     const startParts = shareData.Common.getDateParts(X_DAYS_AGO, false);
     const endParts = shareData.Common.getDateParts(adjustedEndDate, false);
-
     const period = `${startParts.month}/${startParts.day}/${startParts.year} - ${endParts.month}/${endParts.day}/${endParts.year}`;
 
     const isLoading = active_deals.length !== Object.keys(deal_tracker).length;
 
-    let max_funds_deals_map = {};
     let profit_by_bot_map = {};
     let active_pl_map = {};
     let profit_by_day_map = {};
     let adjusted_pl_map = {};
     let bot_deal_duration_map = {};
     let bot_funds_in_use_map = {};
+    let max_funds_deals_map = {};
     let total_profit = 0;
     let total_in_deals = 0;
     let total_pl = 0;
-
     let currencies = [];
 
+    // Available balance
     const available_balance = await (async () => {
         const exchangeObj = shareData.appData.bots?.exchange;
         if (exchangeObj) {
@@ -2002,43 +1986,42 @@ async function getDashboardData({ duration, timeZoneOffset }) {
             }
         }
 
-        if (data.sandBox) {
-            return Object.fromEntries(currencies.map(c => [c, data.sandBoxWallet]));
-        }
+        if (data.sandBox) return Object.fromEntries(currencies.map(c => [c, data.sandBoxWallet]));
 
         const exchange = await shareData.DCABot.connectExchange(data);
         const { success, balance } = await shareData.DCABot.getBalance(exchange);
         return success ? balance : {};
     })();
 
-    // Fetch all bots to build botIdNameMap
+    // Bot map helpers
     const allBots = await shareData.DCABot.getBots();
     const botIdNameMap = {};
-    allBots.forEach(bot => {
-        botIdNameMap[bot.botId] = bot.botName || `Bot (${bot.botId})`;
-    });
+    allBots.forEach(bot => botIdNameMap[bot.botId] = bot.botName || `Bot (${bot.botId})`);
 
-    // Process deals
+    const getBotKey = (botIdOrName) => botIdNameMap[botIdOrName] || botIdOrName;
+
+    // Process completed deals
     complete_deals.forEach(deal => {
-        const { botId, bot_name, profit, date_end, date_start } = deal;
+        const botKey = getBotKey(deal.botId || deal.bot_name);
 
-        if (profit && typeof profit === 'number') {
-            const mapKey = botId || bot_name;
-            insertValueToMap(profit_by_bot_map, mapKey, profit);
-            insertValueToMap(profit_by_day_map, date_end.toDateString(), profit);
-            total_profit += profit;
+        // Profit by bot
+        if (!profit_by_bot_map[botKey]) profit_by_bot_map[botKey] = 0;
+        if (typeof deal.profit === 'number') {
+            profit_by_bot_map[botKey] += deal.profit;
+            total_profit += deal.profit;
         }
 
-        const duration = shareData.Common.dealDurationMinutes(date_start, date_end);
-        const mapKey = botId || bot_name;
-        if (!bot_deal_duration_map[mapKey]) {
-            bot_deal_duration_map[mapKey] = [duration];
-        } else {
-            bot_deal_duration_map[mapKey].push(duration);
-        }
+        // Profit by day
+        const dayKey = deal.date_end.toDateString();
+        profit_by_day_map[dayKey] = (profit_by_day_map[dayKey] || 0) + (deal.profit || 0);
+
+        // Deal duration
+        const durationMinutes = shareData.Common.dealDurationMinutes(deal.date_start, deal.date_end);
+        if (!bot_deal_duration_map[botKey]) bot_deal_duration_map[botKey] = [];
+        bot_deal_duration_map[botKey].push(durationMinutes);
     });
 
-    // Average durations
+    // Average deal durations
     for (const key in bot_deal_duration_map) {
         const durations = bot_deal_duration_map[key];
         bot_deal_duration_map[key] = Math.round(durations.reduce((a, b) => a + b, 0) / durations.length);
@@ -2049,44 +2032,56 @@ async function getDashboardData({ duration, timeZoneOffset }) {
         Object.entries(profit_by_day_map).sort((a, b) => new Date(a[0]) - new Date(b[0]))
     );
 
-    // Process deal_tracker for active P/L and funds in use
+    // Active P/L and Funds in Use
     for (const key in deal_tracker) {
+
         const { deal: { botId, botName, orders }, info: { profit } } = deal_tracker[key];
-        if (!profit || !botId) continue;
-        insertValueToMap(active_pl_map, botId, profit);
+        const botKey = getBotKey(botId || botName);
+        if (!profit) continue;
+
+        active_pl_map[botKey] = (active_pl_map[botKey] || 0) + profit;
         total_pl += profit;
 
-        let in_deal = 0;
-        for (let order of orders) {
-            if (order.filled) in_deal = Number(order.sum);
+        let inDeal = 0;
+        for (const order of orders) {
+            if (order.filled) inDeal = Number(order.sum);
             else break;
         }
-        insertValueToMap(bot_funds_in_use_map, botId, in_deal);
-        total_in_deals += in_deal;
+        bot_funds_in_use_map[botKey] = (bot_funds_in_use_map[botKey] || 0) + inDeal;
+        total_in_deals += inDeal;
     }
 
     // Adjusted P/L
-    for (const key in profit_by_bot_map) {
-        const total = profit_by_bot_map[key] + (active_pl_map[key] || 0);
-        if (total) adjusted_pl_map[key] = total;
+    for (const botKey in profit_by_bot_map) {
+
+        if (active_pl_map[botKey] != null) {
+            adjusted_pl_map[botKey] = active_pl_map[botKey] + profit_by_bot_map[botKey];
+        }
     }
 
     // Max funds deals
-	for (const row of max_funds_deals.data) {
-		if (profit_by_bot_map[row.botId] || active_pl_map[row.botId] || adjusted_pl_map[row.botId]) {
-    	    max_funds_deals_map[row.botId] = row.maxLastSum;
-    	}
-	}
+    max_funds_deals.data.forEach(bot => {
+        const botKey = getBotKey(bot.botId);
+        if (botKey) max_funds_deals_map[botKey] = bot.maxLastSum || 0;
+    });
 
-    // Sort all maps
-    const sortMapDesc = obj => Object.fromEntries(Object.entries(obj).sort((a, b) => b[1] - a[1]));
-    const sortMapAsc = obj => Object.fromEntries(Object.entries(obj).sort((a, b) => a[1] - b[1]));
+    const sortDesc = obj => Object.fromEntries(Object.entries(obj).sort((a, b) => b[1] - a[1]));
+    const sortAsc = obj => Object.fromEntries(Object.entries(obj).sort((a, b) => a[1] - b[1]));
 
-    profit_by_bot_map = sortMapDesc(profit_by_bot_map);
-    active_pl_map = sortMapAsc(active_pl_map);
-    adjusted_pl_map = sortMapDesc(adjusted_pl_map);
-    bot_deal_duration_map = sortMapDesc(bot_deal_duration_map);
-    bot_funds_in_use_map = sortMapDesc(bot_funds_in_use_map);
+    profit_by_bot_map = sortDesc(profit_by_bot_map);
+    active_pl_map = sortAsc(active_pl_map);
+
+    // Adjusted P/L follows active P/L order
+    const adjustedPlSorted = {};
+    for (const botKey of Object.keys(active_pl_map)) {
+        if (adjusted_pl_map[botKey] !== undefined) {
+            adjustedPlSorted[botKey] = adjusted_pl_map[botKey];
+        }
+    }
+    adjusted_pl_map = adjustedPlSorted;
+
+    bot_deal_duration_map = sortDesc(bot_deal_duration_map);
+    bot_funds_in_use_map = sortDesc(bot_funds_in_use_map);
 
     return {
         kpi: {
@@ -2111,7 +2106,6 @@ async function getDashboardData({ duration, timeZoneOffset }) {
         period
     };
 }
-
 
 
 async function initApp() {

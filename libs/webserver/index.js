@@ -11,7 +11,7 @@ const cookieParser = require('cookie-parser');
 const express = require('express');
 const session = require('express-session');
 const multer = require('multer');
-const MongoDBStore = require('connect-mongodb-session')(session);
+const MongoStore = require('connect-mongo').default;
 const app = express();
 const router = express.Router();
 const Routes = require(pathRoot + '/webserver/routes.js');
@@ -46,17 +46,11 @@ function initApp() {
 
 	if (!shareData.appData.config_mode) {
 
-		store = new MongoDBStore({
-
-			'uri': shareData.appData.mongo_db_url,
-			'collection': 'sessions'
-		},
-		function(err) {
-
-			if (err) {
-
-				shareData.Common.logger(JSON.stringify(err));
-			}
+		store = MongoStore.create({
+			'mongoUrl': shareData.appData.mongo_db_url,
+			'collectionName': 'sessions',
+			'ttl': sessionExpireMins * 60,
+			'autoRemove': 'native'
 		});
 	}
 	else {
@@ -78,8 +72,10 @@ function initApp() {
 		'resave': false,
 		'saveUninitialized': false,
 		'store': store,
+		'rolling': true,
 		'cookie': {
-			'expires': (sessionExpireMins * 60) * 1000
+			'maxAge:': sessionExpireMins * 60 * 1000,
+			'sameSite': 'lax'
 		}
 	});
 
