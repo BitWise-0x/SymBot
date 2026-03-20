@@ -211,7 +211,7 @@ async function apiAiAnalyzeDeal(req, res, sendResponse = true) {
 						}
 					};
 
-		const aiOut = await shareData.Ollama.streamChat(JSON.stringify(aiBody));
+		const aiOut = await shareData.AIClient.streamChat(JSON.stringify(aiBody));
 
 		if (aiOut.success) {
 

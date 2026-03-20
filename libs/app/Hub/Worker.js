@@ -4,7 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const colors = require('colors');
 
-const pathRoot = path.resolve(__dirname, '..', '..', '..');
+const pathRoot = path.resolve(__dirname, '..', '..', '..'); 
+const { HUB_TO_WORKER, WORKER_TO_HUB } = require(__dirname + '/MessageTypes.js');
 
 let parentPort;
 let shutdownTimeout;
@@ -24,7 +25,7 @@ async function processWorkerTask(instanceData) {
 		function sendLog(level, msg) {
 			
 			parentPort.postMessage({
-				type: 'log',
+				type: WORKER_TO_HUB.LOG,
 				level,
 				data: prefData + msg
 			});
@@ -93,25 +94,25 @@ async function processWorkerTask(instanceData) {
 async function processWorkerTaskMessage(SymBot, message) {
 
 	// Get worker instance memory usage
-	if (message.type === 'memory') {
+	if (message.type === HUB_TO_WORKER.MEMORY) {
 
 		const memoryUsage = process.memoryUsage();
 	
 		parentPort.postMessage({
 	
-			type: 'memory',
+			type: WORKER_TO_HUB.MEMORY,
 			data: memoryUsage
 		});
 	}
 
 	// Get worker instance active deals
-	if (message.type === 'deals_active') {
+	if (message.type === HUB_TO_WORKER.DEALS_ACTIVE) {
 	
 		const deals = await SymBot.DCABot.getActiveDeals();
 	
 		parentPort.postMessage({
 	
-			type: 'deals_active_received',
+			type: WORKER_TO_HUB.DEALS_ACTIVE_RECEIVED,
 			id: message.id,
 			data: {
 					'name': message.name,
@@ -121,11 +122,11 @@ async function processWorkerTaskMessage(SymBot, message) {
 	}
 	
 	// System pause received for SymBot worker
-	if (message.type === 'system_pause') {
+	if (message.type === HUB_TO_WORKER.SYSTEM_PAUSE) {
 	
 		parentPort.postMessage({
 	
-			type: 'system_pause_received'
+			type: WORKER_TO_HUB.SYSTEM_PAUSE_RECEIVED
 		});
 	
 		const data = message.data;
@@ -137,11 +138,11 @@ async function processWorkerTaskMessage(SymBot, message) {
 	}
 
 	// Shutdown received for SymBot worker
-	if (message.type === 'shutdown') {
+	if (message.type === HUB_TO_WORKER.SHUTDOWN) {
 	
 		parentPort.postMessage({
 	
-			type: 'shutdown_received'
+			type: WORKER_TO_HUB.SHUTDOWN_RECEIVED
 		});
 	
 		SymBot.shutDown();

@@ -5,7 +5,6 @@
 	const token = '<%= token %>';
 	const telegramEnabled = '<%= appData['telegram_enabled_config'] %>';
 	const signals3CQSEnabled = '<%= appData['signals_3cqs_enabled'] %>';
-	const ollamaEnabled = '<%= services['ai']['ollama']['enabled'] %>';
 	const configMode = '<%= appData['config_mode'] %>';
 	const pairButtons = <%- '[' + appData.bots['pair_buttons'].map(button => `'${button}'`).join(',') + ']'; %>;
 	const pairBlackList = <%- '[' + appData.bots['pair_blacklist'].map(pair => `'${pair}'`).join(',') + ']'; %>;
@@ -242,6 +241,28 @@
 		// Remove existing backup_enabled
 		formData = formData.filter(item => item.name !== 'backup_enabled');
 
+		// Private key submit logic:
+		// - If the clear flag is set, keep sftp_private_key_clear=1 in the payload
+		//   and drop the textarea value so the server removes the stored key.
+		// - If the textarea is blank with no clear flag, drop the field entirely
+		//   so the server preserves the existing encrypted key.
+		// - If the textarea has content, reset the clear flag to 0 so a new key
+		//   being pasted doesn't get accidentally cleared by a stale flag.
+		if ($('#sftp_private_key_clear').val() === '1') {
+
+			formData = formData.filter(item => item.name !== 'sftp_private_key');
+		}
+		else if (!$('#sftp_private_key').val().trim()) {
+
+			formData = formData.filter(item => item.name !== 'sftp_private_key');
+			formData = formData.filter(item => item.name !== 'sftp_private_key_clear');
+		}
+		else {
+
+			// New key being submitted — ensure clear flag is 0
+			formData = formData.filter(item => item.name !== 'sftp_private_key_clear');
+		}
+
 		formData.push({ name: 'cron_backup_schedule', value: cronData.cronSchedule });
 		formData.push({ name: 'cron_backup_days', value: cronData.daysOfWeek.join(',') });
 		formData.push({ name: 'cron_backup_local_time', value: cronData.localTime });
@@ -312,6 +333,14 @@
 			
 			input.attr('type', type);
 			$(this).text(type === 'password' ? 'Show' : 'Hide');
+		});
+
+		$('#sftp_clear_key').on('click', function () {
+
+			// Mark the key for deletion on save — does not take effect until form is submitted
+			$('#sftp_private_key_clear').val('1');
+			$('#sftp_private_key').val('');
+			$('#sftp_private_key_status').html('Key will be cleared on save').css('color', 'var(--warning-color, #e67e22)');
 		});
 
 		$('#showSftpPassphrase').on('click', function () {
@@ -421,10 +450,7 @@
 			$('#toggleTelegram').click();
 		}
 
-		if (convertBoolean(ollamaEnabled)) {
 
-			$('#toggleOllama').click();
-		}
 
 		$('#configChangePass').on('click', function(e) {
 
@@ -638,16 +664,30 @@
 
 				<b>Artificial Intelligence (AI)</b>
 				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
-				
+
 				<tr>
-					<td></td>
 					<td>
-						<a href="https://ollama.com/" target=_blank>Ollama</a> must be installed or use cloud services
+						<label for="ai_provider">Active Provider:
+							<span class="toolTip">?<span class="toolTipText">
+								Select which AI provider to use. Only one provider can be active at a time. Select None to disable AI.
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<select name="ai_provider" id="ai_provider" class="form-field" style="width: 256px;">
+							<option value="none"<%= services['ai']['provider'] === 'none' || (!services['ai']['ollama']['enabled'] && !services['ai']['openai']['enabled']) ? ' selected' : '' %>>None</option>
+							<option value="ollama"<%= services['ai']['ollama']['enabled'] ? ' selected' : '' %>>Ollama</option>
+							<option value="openai"<%= services['ai']['openai']['enabled'] ? ' selected' : '' %>>OpenAI</option>
+						</select>
 					</td>
 				</tr>
+
+				<tr><td colspan=2 style="padding-top: 6px; padding-bottom: 2px;"><b>Ollama</b> &mdash; <small><a href="https://ollama.com/" target=_blank>ollama.com</a> &mdash; local or cloud hosted</small></td></tr>
+
 				<tr>
 					<td>
-						<label for="password">Ollama Host:
+						<label for="ollama_host">Host:
 							<span class="toolTip">?<span class="toolTipText">
 								This is the host URL to the server running Ollama
 							</span></span>
@@ -661,9 +701,9 @@
 
 				<tr>
 					<td>
-						<label for="password">API Key:
+						<label for="ollama_api_key">API Key:
 							<span class="toolTip">?<span class="toolTipText">
-								This is your API key if you are using Ollama Cloud services
+								Your API key when using Ollama cloud services
 							</span></span>
 						</label>
 					</td>
@@ -675,9 +715,9 @@
 
 				<tr>
 					<td>
-						<label for="password">Model:
+						<label for="ollama_model">Model:
 							<span class="toolTip">?<span class="toolTipText">
-								This is the Large Language Model (LLM) that will be used to process content
+								The Large Language Model (LLM) to use, e.g. llama3.2
 							</span></span>
 						</label>
 					</td>
@@ -687,14 +727,52 @@
 					</td>
 				</tr>
 
+				<tr><td colspan=2 style="padding-top: 6px; padding-bottom: 2px;"><b>OpenAI</b> &mdash; <small><a href="https://platform.openai.com/" target=_blank>platform.openai.com</a> &mdash; compatible with any OpenAI-compatible API</small></td></tr>
+
 				<tr>
-					<td>Enabled:</td>
+					<td>
+						<label for="openai_api_key">API Key:
+							<span class="toolTip">?<span class="toolTipText">
+								Your OpenAI API key, or the key for any OpenAI-compatible provider
+							</span></span>
+						</label>
+					</td>
 
 					<td>
-						<input id="toggleOllama" name="ollama_enabled" type=checkbox>
+						<input type="password" name="openai_api_key" id="openai_api_key" class="form-field" style="width: 250px;" value="<%= services['ai']['openai']['api_key'] %>">
 					</td>
 				</tr>
+
+				<tr>
+					<td>
+						<label for="openai_model">Model:
+							<span class="toolTip">?<span class="toolTipText">
+								The model to use, e.g. gpt-4o or gpt-4o-mini
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="openai_model" id="openai_model" class="form-field" style="width: 250px;" value="<%= services['ai']['openai']['model'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="openai_base_url">Base URL:
+							<span class="toolTip">?<span class="toolTipText">
+								Optional. Override the base URL for OpenAI-compatible providers. Leave blank to use the default OpenAI endpoint.
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="openai_base_url" id="openai_base_url" class="form-field" style="width: 250px;" value="<%= services['ai']['openai']['base_url'] %>">
+					</td>
+				</tr>
+
 				</table>
+
 			</div>
 
 			<div class="divHr"></div>
@@ -873,16 +951,22 @@
 				</tr>
 
 				<tr>
-					<td>
-						<label for="backups">Private Key:
+					<td style="vertical-align: top; padding-top: 6px;">
+						<label for="sftp_private_key">Private Key:
 							<span class="toolTip">?<span class="toolTipText">
-								This is the full path to your private key which will be used instead of a password
+								Paste the contents of your private key file (e.g. id_rsa or id_ed25519). The key will be encrypted and stored securely. Leave blank to keep the existing key.
 							</span></span>
 						</label>
 					</td>
 
 					<td>
-						<input name="sftp_private_key" id="sftp_private_key" class="form-field" style="width: 250px;" value="<%= services['cron_backup']['sftp']['private_key'] %>">
+						<input type="hidden" name="sftp_private_key_clear" id="sftp_private_key_clear" value="0">
+						<textarea name="sftp_private_key" id="sftp_private_key" class="form-field" style="width: 350px; height: 120px; font-family: monospace; font-size: 11px; resize: vertical;" placeholder="Paste private key here (leave blank to keep existing)"></textarea>
+						<% if (services['cron_backup']['sftp']['private_key_set']) { %>
+							<div id="sftp_private_key_status" style="margin-top: 4px; font-size: 12px; color: var(--green-color, #2ecc71);">&#10003; Private key is set &nbsp;<span id="sftp_clear_key" style="cursor: pointer; color: var(--link-color); font-size: 12px;">[Clear]</span></div>
+						<% } else { %>
+							<div id="sftp_private_key_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+						<% } %>
 					</td>
 				</tr>
 

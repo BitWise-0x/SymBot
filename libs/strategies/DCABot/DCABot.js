@@ -38,6 +38,16 @@ const sellErrorAddFeeMultiplier = 0.25;
 // Max additional percentage fee that will be applied if a sell error occurs for a deal
 const sellErrorAddFeeMaxPerc = 0.05;
 
+// Minimum shortfall percentage of requested sell quantity that triggers a partial fill retry
+// Shortfalls below this threshold are treated as dust and no retry is attempted
+const partialSellFillThresholdPercent = 1;
+
+// Maximum number of additional sell attempts when a partial fill is detected
+const maxPartialSellRetries = 10;
+
+// Delay in milliseconds between partial fill retry attempts
+const partialSellRetryDelayMs = 3000;
+
 
 let dealTracker = {};
 let timerTracker = {};
@@ -1308,7 +1318,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 
 								let profitCurrency = config['profitCurrency'];
 
-								let sellOrderId = '';
+								let sellOrderIds = [];
 								let sellError;
 								let sellOrderPrice;
 								let sellOrderInvalid = false;
@@ -1345,51 +1355,54 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 								const handleSuccessfulSell = async () => {
 
 									await updateDealTracker({
-																'exchange': exchange,
-																'deal_id': dealId,
-																'price': price,
-																'config': config,
-																'orders': orders,
-																'pause': isDealPause,
-																'pause_buy': isDealPauseBuy,
-																'pause_sell': isDealPauseSell
-															});
+																									'exchange': exchange,
+																									'deal_id': dealId,
+																									'price': price,
+																									'config': config,
+																									'orders': orders,
+																									'pause': isDealPause,
+																									'pause_buy': isDealPauseBuy,
+																									'pause_sell': isDealPauseSell
+																								});
 
 									if (shareData.appData.verboseLog) {
 
 										Common.logger(
-														colors.blue.bold.italic(
-														'Pair: ' + pair +
-														'\tQty: ' + currentOrder.qtySum +
-														'\tLast Price: $' + price +
-														'\tDCA Price: $' + currentOrder.average +
-														'\tSell Price: $' + currentOrder.target +
-														'\tStatus: ' + colors.red('SELL') +
-														'\tProfit: ' + profit
-													));
+																								colors.blue.bold.italic(
+																								'Pair: ' + pair +
+																								'\tQty: ' + currentOrder.qtySum +
+																								'\tLast Price: $' + price +
+																								'\tDCA Price: $' + currentOrder.average +
+																								'\tSell Price: $' + currentOrder.target +
+																								'\tStatus: ' + colors.red('SELL') +
+																								'\tProfit: ' + profit
+																							));
 									}
 
+									// orderId is stored as an array for partial fill retry compatibility.
+									// Single-order deals will have a one-element array.
+									// Legacy deals with a string orderId are handled transparently by consumers.
 									const sellData = {
-														'date': new Date(),
-														'orderId': sellOrderId,
-														'qtySum': currentOrder.qtySum,
-														'qtySumSell': qtySumSell,
-														'qtySumSellOrder': qtySumSellOrder,
-														'price': price,
-														'average': currentOrder.average,
-														'target': currentOrder.target,
-														'profit': profitPercFinal,
-														'profitBase': profitBase,
-														'profitQuote': profitQuote,
-														'feeData': feeData
-													 };
+																									'date': new Date(),
+																									'orderId': sellOrderIds,
+																									'qtySum': currentOrder.qtySum,
+																									'qtySumSell': qtySumSell,
+																									'qtySumSellOrder': qtySumSellOrder,
+																									'price': price,
+																									'average': currentOrder.average,
+																									'target': currentOrder.target,
+																									'profit': profitPercFinal,
+																									'profitBase': profitBase,
+																									'profitQuote': profitQuote,
+																									'feeData': feeData
+																								 };
 
 									await Deals.updateOne({ dealId }, {
-																		'sellData': sellData,
-																		'panicSell': isDealPanicSell,
-																		'canceled': isDealCancel,
-																		'status': 1
-																	  });
+																																	'sellData': sellData,
+																																	'panicSell': isDealPanicSell,
+																																	'canceled': isDealCancel,
+																																	'status': 1
+																																  });
 
 									finished = true;
 
@@ -1407,7 +1420,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 
 									const sell = await sellOrder(exchange, dealId, pair, qtySumSellOrder, priceFiltered);
 
-									// Sell not successful / Sell successful but verification failed 
+									// Sell not successful / Sell successful but verification failed
 									if (!sell.success || (sell.success && !sell.success_verify)) {
 
 										// sellOrderInvalid - Order not found or unable to be looked up on exchange
@@ -1452,7 +1465,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 													try {
 														
 														if (dealTracker[dealId]?.update?.deal_sell_error) {
-														
+															
 															dealTracker[dealId].update.deal_sell_error.verifying = false;
 														}
 													}
@@ -1474,7 +1487,130 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 									}
 									else {
 
-										sellOrderId = sell['data']['id'];
+										// Initial sell succeeded — record this order ID and check for partial fill
+										sellOrderIds.push(sell['data']['id']);
+
+										const initialQtyFilled = Number(sell['data_order']['quantity'] ?? 0);
+										let totalQtyFilled = initialQtyFilled;
+										let qtyRemaining = Number(qtySumSellOrder) - totalQtyFilled;
+
+										// Only attempt partial fill retry if the exchange reported a positive
+										// filled quantity. A zero or null quantity after a successful
+										// verifyBuySellOrder means the exchange didn't report the fill amount —
+										// not that nothing was filled. Retrying in that case would sell again
+										// on a position that has already been fully closed.
+										const shortfallPercent = initialQtyFilled > 0
+											? (qtyRemaining / Number(qtySumSellOrder)) * 100
+											: 0;
+
+										if (shortfallPercent > partialSellFillThresholdPercent) {
+
+											// Partial fill detected — attempt to sell the remainder
+											let retryCount = 0;
+
+											Common.logger(colors.bgYellow.bold(
+												'Partial sell fill detected for deal ID ' + dealId +
+												' / Requested: ' + qtySumSellOrder +
+												' / Filled: ' + totalQtyFilled.toFixed(8) +
+												' / Remaining: ' + qtyRemaining.toFixed(8) +
+												' / Shortfall: ' + shortfallPercent.toFixed(2) + '%'
+											));
+
+											Common.sendNotification({
+												'message': 'Partial sell fill detected for deal ID ' + dealId + '. Attempting to sell remaining quantity.',
+												'type': 'deal_error',
+												'telegram_id': shareData.appData.telegram_id
+											});
+
+											while (retryCount < maxPartialSellRetries && qtyRemaining > 0) {
+
+												// Stop retrying if a cancel or panic sell was requested
+												if (isDealCancel || isDealPanicSell) {
+
+													break;
+												}
+
+												await Common.delay(partialSellRetryDelayMs);
+
+												retryCount++;
+
+												// Get fresh price for this retry attempt
+												const symbolDataRetry = await getSymbol(exchange, pair);
+												const symbolRetry = symbolDataRetry.data;
+												const priceRetry = symbolRetry?.bid ?? price;
+												const priceRetryFiltered = await filterPrice(exchange, pair, priceRetry);
+
+												// Check the remaining qty meets exchange minimum after precision filter
+												const qtyRemainingFiltered = await filterAmount(exchange, pair, qtyRemaining);
+
+												if (!qtyRemainingFiltered || Number(qtyRemainingFiltered) <= 0) {
+
+													Common.logger(colors.bgYellow.bold(
+														'Partial sell retry halted for deal ID ' + dealId +
+														' — remaining quantity ' + qtyRemaining.toFixed(8) +
+														' is below exchange minimum. Accepting partial fill.'
+													));
+
+													break;
+												}
+
+												Common.logger(colors.bgYellow.bold(
+													'Partial sell retry ' + retryCount + '/' + maxPartialSellRetries +
+													' for deal ID ' + dealId +
+													' / Selling remaining: ' + qtyRemainingFiltered
+												));
+
+												const sellRetry = await sellOrder(exchange, dealId, pair, qtyRemainingFiltered, priceRetryFiltered);
+
+												if (sellRetry.success && sellRetry.success_verify) {
+
+													sellOrderIds.push(sellRetry['data']['id']);
+
+													const retryQtyFilled = Number(sellRetry['data_order']['quantity'] ?? 0);
+
+													totalQtyFilled += retryQtyFilled;
+													qtyRemaining = Number(qtySumSellOrder) - totalQtyFilled;
+
+													Common.logger(colors.bgYellow.bold(
+														'Partial sell retry ' + retryCount + ' succeeded for deal ID ' + dealId +
+														' / Filled this attempt: ' + retryQtyFilled.toFixed(8) +
+														' / Total filled: ' + totalQtyFilled.toFixed(8) +
+														' / Remaining: ' + qtyRemaining.toFixed(8)
+													));
+
+													const remainingShortfallPercent = (Math.max(qtyRemaining, 0) / Number(qtySumSellOrder)) * 100;
+
+													if (remainingShortfallPercent <= partialSellFillThresholdPercent) {
+
+														// Within acceptable threshold — done
+														break;
+													}
+												}
+												else {
+
+													Common.logger(colors.bgYellow.bold(
+														'Partial sell retry ' + retryCount + ' failed for deal ID ' + dealId +
+														': ' + (sellRetry.message || 'unknown error')
+													));
+												}
+											}
+
+											if (retryCount >= maxPartialSellRetries) {
+
+												const finalShortfall = ((Math.max(qtyRemaining, 0) / Number(qtySumSellOrder)) * 100).toFixed(2);
+
+												Common.logger(colors.bgRed.bold(
+													'Max partial sell retries reached for deal ID ' + dealId +
+													'. Accepting fill. Final shortfall: ' + finalShortfall + '%'
+												));
+
+												Common.sendNotification({
+													'message': 'Max partial sell retries reached for deal ID ' + dealId + '. Accepted fill with ' + finalShortfall + '% shortfall.',
+													'type': 'deal_error',
+													'telegram_id': shareData.appData.telegram_id
+												});
+											}
+										}
 									}
 								}
 

@@ -7,6 +7,7 @@ const net = require('net');
 const ccxt = require('ccxt');
 const Convert = require('ansi-to-html');
 const { parseStringPromise } = require('xml2js');
+const { HUB_TO_WORKER, WORKER_TO_HUB } = require(__dirname + '/MessageTypes.js');
 
 const convertAnsi = new Convert();
 
@@ -731,19 +732,6 @@ async function routeUpdateInstances(req, res) {
 						}
 					}
 
-					if (!updatedConfig['overrides']['server_id'] && updatedConfig['overrides']['web_server_port'] && (updatedConfig.web_server_port != updatedConfig['overrides']['web_server_port'])) {
-
-						// Port override set on primary instance
-						//portUpdated = true;
-
-						const webServerPortOverride = updatedConfig.web_server_port;
-						const result = await checkPortInUse(webServerPortOverride);
-
-						if (!result.success) {
-
-							//console.log('Port is in use.');
-						}
-					}
 
 					// Update any port changes in app configs
 					if (appConfig['data']['web_server']['port'] != updatedConfig.web_server_port) {
@@ -752,12 +740,15 @@ async function routeUpdateInstances(req, res) {
 
 						if (!updatedAppConfigs[updatedConfig.app_config] || updatedAppConfigs[updatedConfig.app_config] !== updatedConfig.web_server_port) {
 
-							const webServerPort = updatedConfig.web_server_port
-							const result = await checkPortInUse(webServerPort);
+							const webServerPort = updatedConfig.web_server_port;
+							const portCheck = await checkPortInUse(webServerPort);
 
-							if (!result.success) {
+							// Port in use by another process — log a warning but still save
+							// the config since the port may be transiently occupied during
+							// a rolling restart or held by a previous instance winding down.
+							if (portCheck.success) {
 
-								//console.log('Port is in use.');
+								logger('info', `WARNING: Web server port ${webServerPort} for instance '${updatedConfig.name}' appears to be in use. Verify no port conflict exists.`);
 							}
 
 							appConfig['data']['web_server']['port'] = webServerPort;
@@ -873,7 +864,7 @@ async function logMemoryUsage() {
 	for (const { worker } of shareData.workerMap.values()) {
 
 		worker.postMessage({
-			type: 'memory'
+			type: HUB_TO_WORKER.MEMORY
 		});
 	}
 }
@@ -889,11 +880,15 @@ async function getActiveDeals() {
 		// Wrap each worker response in a Promise
 		const p = new Promise((resolve, reject) => {
 
+			let dealsTimeout;
+
 			const onMessage = (msg) => {
 
-				if (msg.type === 'deals_active_received' && msg.id === instance.id) {
+				if (msg.type === WORKER_TO_HUB.DEALS_ACTIVE_RECEIVED && msg.id === instance.id) {
 
-					worker.off('message', onMessage); // Clean up listener
+					// Cancel the timeout and remove the listener before resolving
+					clearTimeout(dealsTimeout);
+					worker.off('message', onMessage);
 
 					resolve({
 						id,
@@ -905,13 +900,13 @@ async function getActiveDeals() {
 			worker.on('message', onMessage);
 
 			worker.postMessage({
-				type: 'deals_active',
+				type: HUB_TO_WORKER.DEALS_ACTIVE,
 				id: instance.id,
 				name: instance.name
 			});
 
-			// Optional timeout in case worker doesn't respond
-			setTimeout(() => {
+			// Reject and remove the listener if the worker doesn't respond in time
+			dealsTimeout = setTimeout(() => {
 
 				worker.off('message', onMessage);
 				reject(new Error(`Timeout waiting for response from worker ${id}`));
@@ -985,47 +980,76 @@ async function terminateInstance(instanceId) {
 
 			if (worker) {
 
-				// Wait until shutdown_received is received from worker and delay has passed
-				await new Promise((resolve, reject) => {
+			// Wait until shutdown_received is received from worker and delay has passed.
+			// A per-instance timeout prevents an indefinite hang if the worker is
+			// already dead or crashes before it can acknowledge the shutdown request.
+			const terminateTimeoutMs = shareData.appData['shutdown_timeout'] + 8000;
 
-					worker.on('message', async (message) => {
+			await new Promise((resolve, reject) => {
 
-						if (message.type === 'shutdown_received') {
+				let terminateTimeout;
 
-							try {
+				const onShutdownReceived = async (message) => {
 
-								// Wait additional delay to ensure graceful shutdown
-								await shareData.Common.delay(shareData.appData['shutdown_timeout'] + 3000);
+					if (message.type !== WORKER_TO_HUB.SHUTDOWN_RECEIVED) return;
 
-								// Terminate the worker after the delay
-								await worker.terminate();
+					// Message received — cancel the safety timeout
+					clearTimeout(terminateTimeout);
 
-								logger('info', `Worker ${workerId} terminated.`);
+					try {
 
-								resolve();
-							}
-							catch (err) {
-							
-								logger('error', `Error terminating instance: ${err}`);
-							
-								reject(err);
-							}
-						}
-					});
+						// Wait additional delay to ensure graceful shutdown
+						await shareData.Common.delay(shareData.appData['shutdown_timeout'] + 3000);
 
-					// Send a "shutdown" message to the worker
-					worker.postMessage({
+						// Terminate the worker after the delay
+						await worker.terminate();
 
-						type: 'shutdown'
-					});
+						logger('info', `Worker ${workerId} terminated.`);
+
+						resolve();
+					}
+					catch (err) {
+
+						logger('error', `Error terminating instance: ${err}`);
+
+						reject(err);
+					}
+				};
+
+				// Use once so the listener is removed automatically after the first message
+				worker.once('message', onShutdownReceived);
+
+				// Safety timeout — resolves (not rejects) so one unresponsive worker
+				// does not block the entire shutdown sequence
+				terminateTimeout = setTimeout(async () => {
+
+					worker.off('message', onShutdownReceived);
+
+					logger('info', `Worker ${workerId} did not acknowledge shutdown within ${terminateTimeoutMs}ms. Forcing termination.`);
+
+					try {
+
+						await worker.terminate();
+					}
+					catch (e) {}
+
+					resolve();
+
+				}, terminateTimeoutMs);
+
+				// Send the shutdown request to the worker
+				worker.postMessage({
+
+					type: HUB_TO_WORKER.SHUTDOWN
 				});
-			}
+			});
 		}
 	}
-	catch (error) {
+}
+catch (error) {
 
-		console.error(`Failed to retrieve instance ${instanceId}:`, error);
-	}
+	console.error(`Failed to retrieve instance ${instanceId}:`, error);
+}
 }
 
 
@@ -1245,25 +1269,57 @@ async function logger(type, msg) {
 
 	const dateNow = new Date().toISOString();
 
-	msg = dateNow + ' ' + msg;
+	if (typeof msg !== 'string') {
+		msg = JSON.stringify(msg);
+	}
+
+	const logData = dateNow + ' ' + msg;
 
 	if (type == 'error') {
 
-		console.error(msg);
+		console.error(logData);
 	}
 	else {
 
-		console.log(msg);
+		console.log(logData);
 	}
 
 	try {
 
-		// Relay message to WebSocket notifications room
+		// Strip ANSI codes before writing to file (same as Common.logger)
+		let logDataFile = logData.replace(
+			/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g,
+			''
+		);
+
+		logDataFile = logDataFile.replace(/[\t\r\n]+/g, ' ');
+
+		// Write to dated hub log file: YYYY-MM-DD-hub.log
+		// Kept in the same /logs directory as instance logs so the existing
+		// delFiles cleanup in Common.logMonitor() handles rotation automatically.
+		const dateStr = dateNow.substring(0, 10);
+		const logFile = shareData.appData.path_root + '/logs/' + dateStr + '-hub.log';
+
+		fs.appendFileSync(logFile, logDataFile + '\n', 'utf8');
+	}
+	catch (e) {}
+
+	try {
+
+		// Relay to both WebSocket rooms so Hub log viewer and notification
+		// panel receive the message (mirrors Common.logger behaviour)
+		shareData.Common.sendSocketMsg({
+
+			'room': 'logs',
+			'type': 'log',
+			'message': convertAnsi.toHtml(logData)
+		});
+
 		shareData.Common.sendSocketMsg({
 
 			'room': 'notifications',
 			'type': 'notification',
-			'message': convertAnsi.toHtml(msg)
+			'message': convertAnsi.toHtml(logData)
 		});
 	}
 	catch (e) {}

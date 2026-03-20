@@ -1,13 +1,20 @@
 'use strict';
 
 const { Ollama } = require('ollama');
+const OpenAI = require('openai');
 
-let ollama;
+
+let aiClient;
+let aiProvider;
 let modelCurrent;
 let shareData;
 
 
-const modelDefault = 'llama3.2';
+const modelDefaults = {
+	ollama: 'llama3.2',
+	openai: 'gpt-4o',
+};
+
 const TIMEOUT_MS = 75000;
 const maxHistory = 25;
 const maxMessageAge = 2 * (60 * 60 * 1000);
@@ -52,11 +59,11 @@ Instructions:
 // Map to store conversation history for each room
 const conversationHistory = new Map();
 
-let ollamaStarted = false;
+let aiStarted = false;
 
 setInterval(() => {
 
-    cleanupRooms();
+	cleanupRooms();
 
 }, (hoursInterval * (60 * 60 * 1000)));
 
@@ -98,7 +105,7 @@ const streamChatResponse = async ({ room, model, message, abortSignal, reset, st
 		roomData.messages.splice(0, roomData.messages.length - (maxHistory - 1));
 	}
 
-	// Build final message payload for Ollama
+	// Build final message payload for the model
 	const messagesForModel = [
 		roomData.persona,
 		...roomData.messages.map(m => ({
@@ -109,42 +116,14 @@ const streamChatResponse = async ({ room, model, message, abortSignal, reset, st
 
 	try {
 
-		const result = await ollama.chat({
+		fullResponse = await streamChatProvider({
 			model,
 			stream,
-			messages: messagesForModel
+			messages: messagesForModel,
+			abortSignal,
+			onActivity,
+			room,
 		});
-
-		if (!stream) {
-
-			if (abortSignal.aborted) {
-
-				throw new Error('Request aborted due to timeout');
-			}
-
-			onActivity?.();
-			fullResponse = result.message.content;
-
-		}
-		else {
-
-			for await (const part of result) {
-
-				if (abortSignal.aborted) {
-					throw new Error('Stream aborted due to timeout');
-				}
-
-				const content = part?.message?.content;
-				if (!content) continue;
-
-				onActivity?.();
-
-				fullResponse += content;
-				sendMessage(room, content);
-			}
-
-			sendMessage(room, 'END_OF_CHAT');
-		}
 
 		// Store assistant response
 		roomData.messages.push({
@@ -156,7 +135,7 @@ const streamChatResponse = async ({ room, model, message, abortSignal, reset, st
 		conversationHistory.set(room, roomData);
 
 		shareData.Common.logger(
-			'Ollama Request: ' + JSON.stringify({
+			'AI Request (' + aiProvider + '): ' + JSON.stringify({
 				room,
 				message,
 				response: fullResponse
@@ -164,7 +143,6 @@ const streamChatResponse = async ({ room, model, message, abortSignal, reset, st
 		);
 
 		return stream ? undefined : fullResponse;
-
 	}
 	catch (err) {
 
@@ -176,6 +154,91 @@ const streamChatResponse = async ({ room, model, message, abortSignal, reset, st
 
 		throw err;
 	}
+};
+
+
+// Per-provider adapter set at start() time.
+// Each adapter exposes two methods with a normalised interface:
+//   createStream(client, model, messages, abortSignal) → async iterable of chunks
+//   createNonStream(client, model, messages, abortSignal) → { content: string }
+//   extractChunkContent(chunk) → string | null | undefined
+const providerAdapters = {
+
+	ollama: {
+
+		createStream: (client, model, messages) =>
+			client.chat({ model, stream: true, messages }),
+
+		createNonStream: (client, model, messages) =>
+			client.chat({ model, stream: false, messages }),
+
+		extractChunkContent: (chunk) => chunk?.message?.content,
+
+		extractNonStreamContent: (result) => result.message.content,
+	},
+
+	openai: {
+
+		createStream: (client, model, messages, abortSignal) =>
+			client.chat.completions.create({ model, stream: true, messages }, { signal: abortSignal }),
+
+		createNonStream: (client, model, messages, abortSignal) =>
+			client.chat.completions.create({ model, stream: false, messages }, { signal: abortSignal }),
+
+		extractChunkContent: (chunk) => chunk.choices[0]?.delta?.content,
+
+		extractNonStreamContent: (result) => result.choices[0]?.message?.content ?? '',
+	},
+};
+
+
+const streamChatProvider = async ({ model, stream, messages, abortSignal, onActivity, room }) => {
+
+	let fullResponse = '';
+
+	const adapter = providerAdapters[aiProvider];
+
+	if (!adapter) {
+
+		throw new Error('No adapter found for AI provider: ' + aiProvider);
+	}
+
+	if (!stream) {
+
+		const result = await adapter.createNonStream(aiClient, model, messages, abortSignal);
+
+		if (abortSignal.aborted) {
+
+			throw new Error('Request aborted due to timeout');
+		}
+
+		onActivity?.();
+		fullResponse = adapter.extractNonStreamContent(result);
+	}
+	else {
+
+		const result = await adapter.createStream(aiClient, model, messages, abortSignal);
+
+		for await (const part of result) {
+
+			if (abortSignal.aborted) {
+
+				throw new Error('Stream aborted due to timeout');
+			}
+
+			const content = adapter.extractChunkContent(part);
+			if (!content) continue;
+
+			onActivity?.();
+
+			fullResponse += content;
+			sendMessage(room, content);
+		}
+
+		sendMessage(room, 'END_OF_CHAT');
+	}
+
+	return fullResponse;
 };
 
 
@@ -254,9 +317,9 @@ async function streamChat(data) {
 		reset = parsedData.message.reset || false;
 		stream = parsedData.message.stream ?? true;
 
-		if (!ollamaStarted) {
+		if (!aiStarted) {
 
-			throw new Error('Ollama not started or is not enabled');
+			throw new Error('AI client not started or is not enabled');
 		}
 
 		const result = await streamChatResponseWithTimeout({
@@ -301,60 +364,89 @@ async function sendMessage(room, msg) {
 
 async function sendError(room, msg) {
 
-    const logData = 'Ollama Error: ' + msg;
+	const logData = 'AI Error (' + (aiProvider || 'unknown') + '): ' + msg;
 
 	shareData.Common.logger(logData);
 	sendMessage(room, logData);
 }
 
 
-function start(host, apiKey, model) {
+function start(provider, config) {
 
-	let headers;
-
-	if (apiKey) {
-
-		headers = { 'Authorization': 'Bearer ' + apiKey };
-	}
+	const host = config.host;
+	const apiKey = config.api_key;
+	const model = config.model;
+	const baseUrl = config.base_url;
 
 	if (model != undefined && model != null && model != '') {
 
-        modelCurrent = model;
+		modelCurrent = model;
 	}
-    else {
+	else {
 
-		modelCurrent = modelDefault;
+		modelCurrent = modelDefaults[provider] || modelDefaults.ollama;
 	}
+
+	aiProvider = provider;
 
 	try {
 
-		ollamaStarted = true;
+		if (provider === 'openai') {
 
-		ollama = new Ollama({
-			'host': host,
-			'headers': headers
-		});
+			const openAIConfig = {
+				apiKey: apiKey || '',
+			};
+
+			if (baseUrl != undefined && baseUrl != null && baseUrl != '') {
+
+				openAIConfig.baseURL = baseUrl;
+			}
+
+			aiClient = new OpenAI(openAIConfig);
+		}
+		else {
+
+			let headers;
+
+			if (apiKey) {
+
+				headers = { 'Authorization': 'Bearer ' + apiKey };
+			}
+
+			aiClient = new Ollama({
+				'host': host,
+				'headers': headers
+			});
+		}
+
+		aiStarted = true;
 	}
-    catch (err) {
+	catch (err) {
 
-		ollamaStarted = false;
+		aiStarted = false;
 
-        sendError('', err.message);
+		sendError('', err.message);
 	}
 }
 
 
 function stop() {
 
-    if (ollama) {
+	if (aiClient) {
 
-		ollamaStarted = false;
+		aiStarted = false;
 
-        try {
-			ollama.abort();
-			ollama = null;
+		try {
+
+			// Ollama has an abort method; OpenAI does not
+			if (typeof aiClient.abort === 'function') {
+
+				aiClient.abort();
+			}
+
+			aiClient = null;
 		}
-        catch (e) {}
+		catch (e) {}
 	}
 }
 

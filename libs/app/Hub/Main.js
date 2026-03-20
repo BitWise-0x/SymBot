@@ -4,7 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const colors = require('colors');
 
-const pathRoot = path.resolve(__dirname, '..', '..', '..');
+const pathRoot = path.resolve(__dirname, '..', '..', '..'); 
+const { HUB_TO_WORKER, WORKER_TO_HUB } = require(__dirname + '/MessageTypes.js');
 
 let Worker;
 let shutDownFunction;
@@ -18,11 +19,11 @@ function processWorkerMessage(workerId, instanceName) {
 
 	return (message) => {
 
-		if (message.type === 'log') {
+		if (message.type === WORKER_TO_HUB.LOG) {
 
 			shareData.Hub.logger('info', message.data);
 		}
-		else if (message.type === 'memory') {
+		else if (message.type === WORKER_TO_HUB.MEMORY) {
 
 			const workerInfo = shareData.workerMap.get(workerId);
 
@@ -53,11 +54,11 @@ function processWorkerMessage(workerId, instanceName) {
 				shareData.Hub.logger('error', `Information for Worker ID ${workerId} not found.`);
 			}
 		}
-		else if (message.type === 'deals_active') {
+		else if (message.type === WORKER_TO_HUB.DEALS_ACTIVE_RECEIVED) {
 
 			//console.log(message.data);
 		}
-		else if (message.type === 'system_pause_all') {
+		else if (message.type === WORKER_TO_HUB.SYSTEM_PAUSE_ALL) {
 
 			// Worker sent system pause for all instances
 			shareData.Hub.logger('info', `Worker ID ${workerId} [${instanceName}] requested system pause for all instances`);
@@ -66,12 +67,12 @@ function processWorkerMessage(workerId, instanceName) {
 			for (const { worker } of shareData.workerMap.values()) {
 
 				worker.postMessage({
-					type: 'system_pause',
+					type: HUB_TO_WORKER.SYSTEM_PAUSE,
 					data: message.data
 				});
 			}
 		}
-		else if (message.type === 'shutdown_hub') {
+		else if (message.type === WORKER_TO_HUB.SHUTDOWN_HUB) {
 
 			// Worker sent global Hub shutdown
 			shareData.Hub.logger('info', `Worker ID ${workerId} [${instanceName}] requested Hub shutdown`);
@@ -134,7 +135,7 @@ function startWorker(instanceData) {
 	});
 
 	worker.on('message', processWorkerMessage(workerId, instanceName));
-	worker.on('error', (error) => Hub.logger('error', `Instance for ${instanceName} encountered an error:`, error));
+	worker.on('error', (error) => shareData.Hub.logger('error', `Instance for ${instanceName} encountered an error: ${error}`));
 	worker.on('exit', processWorkerExit(workerId));
 
 	worker.once('online', () => {

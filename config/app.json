@@ -66,11 +66,18 @@
 			   },
 	"ai": {
 				"ollama": {
-					"enabled": true,
+					"enabled": false,
 					"host": "",
 					"api_key": "",
 					"model": ""
 				}
 			},
+				"openai": {
+					"enabled": false,
+					"api_key": "",
+					"model": "",
+					"base_url": ""
+        	},
+		"provider": "",
 	"verbose_log": true
 }

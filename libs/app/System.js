@@ -1473,14 +1473,12 @@ async function sftpUploadBackup(configObj, localFile, remoteDir, maxBackups, isT
 
 		let config = JSON.parse(JSON.stringify(configObj));
 
-		if (config.private_key) {
+		// privateKey is already decrypted content passed in via config.privateKey.
+		// Remove it from the config object if empty so ssh2-sftp-client
+		// falls back to password auth cleanly.
+		if (!config.privateKey) {
 
-			if (fs.existsSync(config.private_key)) {
-
-				config.privateKey = fs.readFileSync(config.private_key, 'utf8');
-			}
-
-			delete config.private_key;
+			delete config.privateKey;
 		}
 
 		await sftp.connect(config);
@@ -1904,12 +1902,28 @@ async function sftpUploadFile(localFile, isTest) {
 		}
 	}
 
+	// Decrypt the stored private key content.
+	// The value in app.json is now an encrypted blob, not a file path.
+	let privateKey = '';
+
+	const sftpPrivateKeyEnc = shareData['appData']['cron_backup']['sftp']['private_key'];
+
+	if (sftpPrivateKeyEnc) {
+
+		const sftpPrivateKeyDecObj = await decrypt(sftpPrivateKeyEnc, shareData.appData.password);
+
+		if (sftpPrivateKeyDecObj.success) {
+
+			privateKey = sftpPrivateKeyDecObj.data;
+		}
+	}
+
 	const config = {
         'host': shareData.appData['cron_backup']['sftp']['host'],
         'port': shareData.appData['cron_backup']['sftp']['port'],
         'username': shareData.appData['cron_backup']['sftp']['username'],
         'password': password,
-        'private_key': shareData.appData['cron_backup']['sftp']['private_key'],
+        'privateKey': privateKey,
         'passphrase': passphrase
     };
 

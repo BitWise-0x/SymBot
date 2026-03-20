@@ -387,11 +387,20 @@ function initRoutes(router, upload) {
 
 		if (req.session.loggedIn || validApiKey(req)) {
 
-			shareData.Ollama.streamChat(JSON.stringify(body));
+			try {
 
-			let obj = { 'success': true };
+				shareData.AIClient.streamChat(JSON.stringify(body));
 
-			res.status(200).send(obj);
+				let obj = { 'success': true };
+
+				res.status(200).send(obj);
+			}
+			catch (e) {
+
+				let obj = { 'success': false, 'data': e.message };
+
+				res.status(200).send(obj);
+			}
 		}
 		else {
 
@@ -590,9 +599,30 @@ async function processConfig(req, res) {
 
 		const appConfig = await shareData.Common.getConfig(appConfigFile);
 
+		const aiRaw = JSON.parse(JSON.stringify(appConfig.data.ai));
+
+		// Normalise the ai config so the template always receives a complete
+		// structure regardless of which schema version is on disk.
+		// Old app.json files may be missing 'provider' or the 'openai' sub-object.
+		const aiNormalised = {
+			provider: aiRaw.provider || (aiRaw.ollama?.enabled ? 'ollama' : 'none'),
+			ollama: {
+				enabled: aiRaw.ollama?.enabled || false,
+				host:    aiRaw.ollama?.host    || '',
+				model:   aiRaw.ollama?.model   || '',
+				api_key: aiRaw.ollama?.api_key || '',
+			},
+			openai: {
+				enabled:  aiRaw.openai?.enabled  || false,
+				api_key:  aiRaw.openai?.api_key  || '',
+				model:    aiRaw.openai?.model    || '',
+				base_url: aiRaw.openai?.base_url || '',
+			},
+		};
+
 		let services = Object.assign({
 
-			'ai': JSON.parse(JSON.stringify(appConfig.data.ai)),
+			'ai': aiNormalised,
 			'cron_backup': JSON.parse(JSON.stringify(appConfig.data.cron_backup)),
 			'telegram': JSON.parse(JSON.stringify(appConfig.data.telegram)),
 			'signals': JSON.parse(JSON.stringify(appConfig.data.signals))
@@ -606,6 +636,13 @@ async function processConfig(req, res) {
 
 		const sftpPassphraseEnc = services['cron_backup']['sftp']['passphrase'];
 		services['cron_backup']['sftp']['passphrase'] = '';
+
+		// Never send the encrypted private key to the browser. Replace it with
+		// a boolean flag so the UI can show '(Private key is set)' without
+		// ever exposing the encrypted blob or the key content.
+		const sftpPrivateKeySet = !!services['cron_backup']['sftp']['private_key'];
+		services['cron_backup']['sftp']['private_key'] = '';
+		services['cron_backup']['sftp']['private_key_set'] = sftpPrivateKeySet;
 
 		if (cronBackupPasswordEnc) {
 

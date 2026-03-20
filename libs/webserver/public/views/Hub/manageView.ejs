@@ -93,7 +93,10 @@
 
 				const socket = socketGlobal;
 				const instanceMap = new Map();
-				const TIMEOUT = 15000;
+				// Staleness threshold: if no update has arrived within 2.5× the server's
+				// poll interval, the instance is considered offline and removed from the
+				// display. This always tracks the actual memory_poll_ms in hub.json.
+				const TIMEOUT = <%= appData.memory_poll_ms %> * 2.5;
 
 				socket.on('connect', (data) => {
 
@@ -162,7 +165,7 @@
 					updateMemoryDisplay();
 				}
 
-				setInterval(cleanupInstances, 5000);
+				setInterval(cleanupInstances, <%= appData.memory_poll_ms %>);
 
 				socket.on('data', (data) => {
 

@@ -17,6 +17,7 @@ const HubMain = require(__dirname + '/libs/app/Hub/Main.js');
 const HubWorker = require(__dirname + '/libs/app/Hub/Worker.js');
 const WebServer = require(__dirname + '/libs/webserver/Hub');
 const packageJson = require(__dirname + '/package.json');
+const { HUB_TO_WORKER, WORKER_TO_HUB } = require(__dirname + '/libs/app/Hub/MessageTypes.js');
 
 
 let gotSigInt = false;
@@ -55,6 +56,8 @@ async function startHub() {
 
 	let port;
 	let configs;
+	let maxLogDays;
+	let memoryPollIntervalMs;
 
 	let success = true;
 
@@ -66,6 +69,8 @@ async function startHub() {
 
 		port = hubData.data.port;
 		configs = hubData.data.instances;
+		maxLogDays = hubData.data.max_log_days;
+		memoryPollIntervalMs = hubData.data.memory_poll_interval_ms;
 
 		const password = hubData['data']['password'];
 
@@ -121,7 +126,14 @@ async function startHub() {
 							'hub_config': hubConfigFile,
 							'shutdown_timeout': shutdownTimeout,
 							'sig_int': false,
-							'started': new Date()
+							'started': new Date(),
+							// worker_data.name drives the Hub log filename in Hub.logger.
+							// 'hub' produces YYYY-MM-DD-hub.log, kept in the same /logs
+							// directory as instance logs and cleaned up automatically by
+							// Common.logMonitor() on the same schedule.
+							'worker_data': { 'name': 'hub' },
+							'console_log': true,
+							'max_log_days': (maxLogDays != undefined && maxLogDays != null && maxLogDays > 0) ? maxLogDays : 10
 						},
 					'Common': Common,
 					'WebServer': WebServer,
@@ -137,6 +149,10 @@ async function startHub() {
 		Common.init(shareData);
 		WebServer.init(shareData);
 		Hub.init(shareData);
+
+		// Start Hub log rotation on the same schedule as SymBot instances.
+		// Cleans YYYY-MM-DD-hub.log files from /logs alongside instance logs.
+		Common.logMonitor();
 
 		let processData = await Hub.processConfig(configs);
 
@@ -194,7 +210,23 @@ async function startHub() {
 
 	HubMain.start(configs);
 
-	setInterval(() => Hub.logMemoryUsage(), 5000);
+	// Poll worker memory usage on a configurable interval.
+	// Set memory_poll_interval_ms in hub.json to override the default.
+	// Shorter intervals increase WebSocket traffic; longer intervals reduce it.
+	const memoryPollMs = (memoryPollIntervalMs != undefined && memoryPollIntervalMs != null && memoryPollIntervalMs >= 1000)
+		? memoryPollIntervalMs
+		: 30000;
+
+	// Store in appData so the Hub manage view can read it at render time and set
+	// its staleness threshold to match the actual polling rate
+	shareData.appData['memory_poll_ms'] = memoryPollMs;
+
+	// Fire an initial poll shortly after startup so instances appear online as
+	// soon as the page loads. The delay gives workers time to come online before
+	// the first request is sent — without it the workerMap may still be empty.
+	// The interval then handles all subsequent refreshes.
+	setTimeout(() => Hub.logMemoryUsage(), 3000);
+	setInterval(() => Hub.logMemoryUsage(), memoryPollMs);
 }
 
 
@@ -232,39 +264,65 @@ async function shutDown() {
 			const dateStart = instance.dateStart;
 			const upTime = Common.timeDiff(new Date(dateStart), new Date());
 
-			// Create a promise to track the worker shutdown process
-			const shutdownPromise = new Promise((resolve, reject) => {
+			// Create a promise to track the worker shutdown process.
+			// worker.once ensures the listener is removed after the first fire.
+			// The per-worker timeout resolves (not rejects) so one unresponsive
+			// worker does not prevent the others from being cleaned up.
+			const workerTimeoutMs = shutdownTimeout + 10000;
 
-				// Wait for the worker to handle the shutdown
-				worker.on('message', async (message) => {
+			const shutdownPromise = new Promise((resolve) => {
 
-					if (message.type === 'shutdown_received') {
+				let workerShutdownTimeout;
 
-						// Wait additional short delay to ensure worker shutdown gracefully
-						await Common.delay(shutdownTimeout + 3000);
+				const onShutdownReceived = async (message) => {
 
-						// Once shutdown is complete, terminate the worker
-						try {
+					if (message.type !== WORKER_TO_HUB.SHUTDOWN_RECEIVED) return;
 
-							await worker.terminate();
+					// Acknowledged — cancel the safety timeout
+					clearTimeout(workerShutdownTimeout);
 
-							Hub.logger('info', `Worker ${workerId} terminated after ${upTime}.`);
+					// Wait additional short delay to ensure worker shutdown gracefully
+					await Common.delay(shutdownTimeout + 3000);
 
-							resolve();
-						}
-						catch (err) {
+					// Once shutdown is complete, terminate the worker
+					try {
 
-							Hub.logger('error', `Error terminating instance: ${err}`);
+						await worker.terminate();
 
-							reject(err);
-						}
+						Hub.logger('info', `Worker ${workerId} terminated after ${upTime}.`);
 					}
-				});
+					catch (err) {
+
+						Hub.logger('error', `Error terminating instance: ${err}`);
+					}
+
+					resolve();
+				};
+
+				// Use once — listener removed automatically after first matching message
+				worker.once('message', onShutdownReceived);
+
+				// Safety timeout — force-terminate and resolve if worker never responds
+				workerShutdownTimeout = setTimeout(async () => {
+
+					worker.off('message', onShutdownReceived);
+
+					Hub.logger('info', `Worker ${workerId} did not acknowledge shutdown within ${workerTimeoutMs}ms. Forcing termination.`);
+
+					try {
+
+						await worker.terminate();
+					}
+					catch (e) {}
+
+					resolve();
+
+				}, workerTimeoutMs);
 
 				// Send a "shutdown" message to the worker
 				worker.postMessage({
 
-					type: 'shutdown'
+					type: HUB_TO_WORKER.SHUTDOWN
 				});
 			});
 

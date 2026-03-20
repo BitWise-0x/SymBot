@@ -214,7 +214,7 @@ These files are located in the `config` directory
 			- `port` is the port to connect to (defaults to 22)
 			- `username` to login as
 			- `password` associated with the username. This is an encrypted value so it should not be manually entered.
-			- `private_key` is the full path to your private key which will be used instead of a password
+			- `private_key` stores an encrypted form of your private key content. This should not be manually entered — paste the contents of your private key file (e.g. `id_rsa` or `id_ed25519`) into the Private Key field on the configuration screen. The key will be encrypted and stored securely. If the configuration password is ever changed, all stored SFTP secrets including the private key are automatically re-encrypted under the new password.
 			- `passphrase` an optional passphrase for your private key. This is an encrypted value so it should not be manually entered.
 			- `remote_directory` is the path on the remote host where your backups will be uploaded. This must be unique as files will be automatically removed according to the value set for maximum backups
 			- `enabled` is whether the backups will be automatically uploaded after being processed via cron
@@ -238,7 +238,7 @@ mongodb://localhost:27017/SymBot
 
 	- `signals` contains a section to use signals with SymBot. There is a 3CQS signals section by default. You must have a 3CQS API key for these to work. You can get one by signing up for free at https://www.3CQS.com. Webhooks must also be enabled for these signals to work.
 
-	- `ai` contains a section to use artificial intelligent services with SymBot.
+	- `ai` contains settings for the AI provider used with SymBot. See the [Artificial Intelligence (AI)](#artificial-intelligence-ai) section for full details and configuration options.
 
 - **bot.json**
 
@@ -468,17 +468,28 @@ Artificial Intelligence (AI) refers to machines designed to think and learn like
 
 AI can be a big help in trading by analyzing market trends, predicting price movements, and automating trades. It looks at data like price changes, trading volumes, and news to help traders make smarter decisions. AI can also spot risks in deals, help automate buying or selling based on certain conditions, and even analyze the mood of the market using tools like sentiment analysis. Large Language Models (LLMs), a type of AI, can also process and understand large amounts of text data, such as news or social media, to help predict how the market might react to certain events. This makes trading easier and safer for regular people by offering insights and automating tasks.
 
-SymBot makes it easy to analyze your trading deals. With just one click, it uses information from your existing orders and current pricing which then, using Ollama, the AI processes this data, analyzing price trends and market conditions to predict potential outcomes. This helps you make smarter decisions about whether to continue, adjust, or pause your strategy.
+SymBot makes it easy to analyze your trading deals. With just one click, it uses information from your existing orders and current pricing which the AI then processes, analyzing price trends and market conditions to predict potential outcomes. This helps you make smarter decisions about whether to continue, adjust, or pause your strategy.
 
-### What is Ollama?
+### Supported AI Providers
 
-Ollama is an AI tool that helps process and understand large amounts of data. It can analyze text, make predictions, and provide insights based on the information it receives. Ollama is designed to handle complex tasks like analyzing market data or understanding trends, making it easier to make informed decisions.
+SymBot supports two AI providers. Only one provider can be active at a time, selected from the **Active Provider** dropdown in the configuration screen. Selecting **None** disables AI features entirely.
 
-SymBot uses Ollama to quickly analyze your trading data, such as your deal orders and current prices, to help predict if a deal will be profitable. You don’t need to be an expert; just click and let SymBot handle the analysis!
+| Provider | Best For |
+|----------|----------|
+| **Ollama** | Self-hosted or Ollama Cloud — full control, no usage costs |
+| **OpenAI** | Hosted API — easy setup, compatible with any OpenAI-compatible endpoint |
 
-### Ollama Installation
+The active provider and all its settings are saved in `config/app.json` under the `ai` section.
 
-Before installing Ollama, ensure your system meets the following requirements:
+---
+
+### Ollama
+
+Ollama is an open-source AI tool that runs Large Language Models locally or via cloud services. It can analyze text, make predictions, and provide insights based on the information it receives. Running Ollama locally keeps your trading data entirely on your own infrastructure.
+
+#### Ollama Installation
+
+Before installing Ollama locally, ensure your system meets the following requirements:
 
 -   **Processor:** A multi-core CPU
 -   **Memory:** At least 16 GB of RAM is recommended, especially for running large models.
@@ -488,12 +499,67 @@ Before installing Ollama, ensure your system meets the following requirements:
     -   Models can also run on a CPU, but this may result in significantly slower performance.
 
 1. Visit [Ollama's official website](https://ollama.com), download the installer for your operating system and follow the provided installation instructions.
-	- **NOTE:** You do not need to manually install using the steps below if you sign up and use Ollama Cloud services.
+	- **NOTE:** You do not need to install Ollama locally if you sign up and use Ollama Cloud services.
 2. Download a model using the command: `ollama pull <model_name>`. For example: `ollama pull llama3.2`.
 3. By default, Ollama runs on port 11434.
 	- If you need to access Ollama remotely, you must configure it to listen on `0.0.0.0` instead of `localhost`.
 4. If Ollama did not start automatically, start it using: `ollama serve`.
-5. Now just put the host URL and model in SymBot's configuration. For example: `http://127.0.0.1:11434` and `llama3.2` to use Ollama for AI trading analysis.
+5. In SymBot's configuration, set the **Active Provider** to **Ollama** and enter the host URL and model name. For example: `http://127.0.0.1:11434` and `llama3.2`.
+
+#### Ollama Configuration Fields
+
+| Field | Description |
+|-------|-------------|
+| **Host** | URL to the server running Ollama. For local installs this is typically `http://127.0.0.1:11434`. For Ollama Cloud, use the provided endpoint URL. |
+| **API Key** | Required only when using Ollama Cloud services. Leave blank for local installations. |
+| **Model** | The model to use for analysis, e.g. `llama3.2`. Must already be pulled on your Ollama instance. |
+
+---
+
+### OpenAI
+
+SymBot supports OpenAI's API as well as any OpenAI-compatible API endpoint, including self-hosted models that expose an OpenAI-compatible interface (such as LM Studio, Ollama's OpenAI-compatible endpoint, and various other providers).
+
+#### OpenAI Setup
+
+1. Sign up at [platform.openai.com](https://platform.openai.com) and generate an API key, or obtain an API key from your chosen OpenAI-compatible provider.
+2. In SymBot's configuration, set the **Active Provider** to **OpenAI** and fill in the settings described below.
+
+#### OpenAI Configuration Fields
+
+| Field | Description |
+|-------|-------------|
+| **API Key** | Your OpenAI API key, or the API key provided by your compatible provider. |
+| **Model** | The model to use, e.g. `gpt-4o` or `gpt-4o-mini`. |
+| **Base URL** | Optional. Override the API endpoint for OpenAI-compatible providers. Leave blank to use the default OpenAI endpoint (`https://api.openai.com/v1`). Set this when using a self-hosted or third-party OpenAI-compatible service. |
+
+---
+
+### AI Configuration in app.json
+
+The `ai` section of `config/app.json` stores all provider settings:
+
+```json
+"ai": {
+    "provider": "ollama",
+    "ollama": {
+        "enabled": true,
+        "host": "http://127.0.0.1:11434",
+        "model": "llama3.2",
+        "api_key": ""
+    },
+    "openai": {
+        "enabled": false,
+        "api_key": "",
+        "model": "gpt-4o",
+        "base_url": ""
+    }
+}
+```
+
+- `provider` is set automatically by the **Active Provider** dropdown and determines which provider SymBot starts on launch. Valid values are `ollama`, `openai`, or `none`.
+- Only one provider can have `enabled` set to `true` at a time. The configuration screen enforces this automatically.
+- Changes to AI settings take effect immediately after saving — no restart required.
 
 ## API Information
 

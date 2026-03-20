@@ -21,7 +21,7 @@ const Queue = require(__dirname + '/libs/app/Queue.js');
 const System = require(__dirname + '/libs/app/System.js');
 const Telegram = require(__dirname + '/libs/telegram');
 const WebServer = require(__dirname + '/libs/webserver');
-const Ollama = require(__dirname + '/libs/ai/OllamaClient.js');
+const AIClient = require(__dirname + '/libs/ai/AIClient.js');
 const packageJson = require(__dirname + '/package.json');
 const Dependencies = require('check-dependencies').sync({ verbose: false });
 
@@ -314,7 +314,7 @@ async function init() {
 						'System': System,
 						'Telegram': Telegram,
 						'WebServer': WebServer,
-						'Ollama': Ollama,
+						'AIClient': AIClient,
 					};
 
 	Common.freezeProperty(shareData['appData'], [ 'path_root', 'app_filename' ]);
@@ -365,7 +365,7 @@ async function init() {
 	DCABotManager.init(shareData);
 	Telegram.init(shareData);
 	WebServer.init(shareData);
-	Ollama.init(shareData);
+	AIClient.init(shareData);
 
 	let success = true;
 
@@ -484,15 +484,17 @@ async function init() {
 		Telegram.start(appConfig['data']['telegram']['token_id'], appDataConfig['telegram_enabled']);
 		WebServer.start(appDataConfig['web_server_port']);
 
-		// Start AI / Ollama client
-		const ollamEnabled = appConfig['data']['ai']['ollama']['enabled'];
-		const ollamaHost = appConfig['data']['ai']['ollama']['host'];
-		const ollamaApiKey = appConfig['data']['ai']['ollama']['api_key'];
-		const ollamaModel = appConfig['data']['ai']['ollama']['model'];
+		// Start AI client
+		const aiConfig = appConfig['data']['ai'];
+		const aiProvider = aiConfig['provider'];
 
-		if (ollamEnabled) {
+		if (aiProvider === 'openai' && aiConfig['openai']['enabled']) {
 
-			Ollama.start(ollamaHost, ollamaApiKey, ollamaModel);
+			AIClient.start('openai', aiConfig['openai']);
+		}
+		else if (aiProvider === 'ollama' && aiConfig['ollama']['enabled']) {
+
+			AIClient.start('ollama', aiConfig['ollama']);
 		}
 
 		const TWELVE_HOURS = 12 * 60 * 60 * 1000;

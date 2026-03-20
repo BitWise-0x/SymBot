@@ -92,10 +92,15 @@ async function updateConfig(req, res) {
 	const signals3CQS = body.signals_3cqs_enabled;
 	const signals3CQSApiKey = body.signals_3cqs_api_key;
 
-	const ollama = body.ollama_enabled;
 	const ollamaHost = body.ollama_host;
 	const ollamaApiKey = body.ollama_api_key;
 	const ollamaModel = body.ollama_model;
+
+	const openaiApiKey = body.openai_api_key;
+	const openaiModel = body.openai_model;
+	const openaiBaseUrl = body.openai_base_url;
+
+	const aiProviderSelected = body.ai_provider;
 
 	const cronBackup = body.cron_backup_enabled;
 	const cronBackupSchedule = body.cron_backup_schedule;
@@ -107,7 +112,8 @@ async function updateConfig(req, res) {
 	const sftpPort = Number(body.sftp_port ?? 22) || 22;
 	const sftpUsername = body.sftp_username;
 	const sftpPassword = body.sftp_password;
-	const sftpPrivateKey = body.sftp_private_key;
+	const sftpPrivateKeyInput = body.sftp_private_key;
+	const sftpPrivateKeyClear = body.sftp_private_key_clear;
 	const sftpPassphrase = body.sftp_passphrase;
 	const sftpRemoteDirectory = body.sftp_remote_directory;
 
@@ -116,13 +122,18 @@ async function updateConfig(req, res) {
 
 	let sftpEnabled = convertBoolean(sftp, false);
 	let telegramEnabled = convertBoolean(telegram, false);
-	let ollamaEnabled = convertBoolean(ollama, false);
 	let signals3CQSEnabled = convertBoolean(signals3CQS, false);
 	let cronBackupEnabled = convertBoolean(cronBackup, false);
+
+	// Provider dropdown is the single source of truth for which AI provider is active
+	const aiProvider = (aiProviderSelected === 'openai' || aiProviderSelected === 'ollama') ? aiProviderSelected : 'none';
+	const ollamaEnabled = aiProvider === 'ollama';
+	const openaiEnabled = aiProvider === 'openai';
 
 	let dbErr;
 	let sftpPasswordFinal;
 	let sftpPassphraseFinal;
+	let sftpPrivateKeyFinal;
 	let cronBackupPasswordFinal;
 	let hubInstance = false;
 	let dataMessage = 'Configuration Updated';
@@ -176,6 +187,45 @@ async function updateConfig(req, res) {
 			const dataPassNew = await genPasswordHash({ 'data': passwordNew });
 
 			const passwordHashed = dataPassNew['salt'] + ':' + dataPassNew['hash'];
+
+			// Re-encrypt all existing SFTP secrets under the new password before
+			// updating shareData.appData.password. The old password hash is still
+			// in shareData.appData.password at this point — that is the same key
+			// material used when the secrets were originally stored. The new hash
+			// (passwordHashed) is what decrypt/encrypt will use going forward.
+			const secretsToReEncrypt = [
+				{ key: ['cron_backup', 'password'] },
+				{ key: ['cron_backup', 'sftp', 'password'] },
+				{ key: ['cron_backup', 'sftp', 'passphrase'] },
+				{ key: ['cron_backup', 'sftp', 'private_key'] },
+			];
+
+			const oldPasswordKey = shareData.appData.password;
+
+			for (const secret of secretsToReEncrypt) {
+
+				const encryptedValue = secret.key.reduce((obj, k) => obj?.[k], appConfig);
+
+				if (encryptedValue) {
+
+					// Decrypt with the current (old) password hash
+					const decObj = await shareData.System.decrypt(encryptedValue, oldPasswordKey);
+
+					if (decObj.success) {
+
+						// Re-encrypt with the new password hash
+						const reEncObj = await shareData.System.encrypt(decObj.data, passwordHashed);
+
+						if (reEncObj.success) {
+
+							// Write re-encrypted value back into appConfig
+							const keys = secret.key;
+							const target = keys.slice(0, -1).reduce((obj, k) => obj[k], appConfig);
+							target[keys[keys.length - 1]] = reEncObj.data;
+						}
+					}
+				}
+			}
 
 			appConfig['password'] = passwordHashed;
 			shareData['appData']['password'] = passwordHashed;
@@ -233,6 +283,21 @@ async function updateConfig(req, res) {
 			sftpPassphraseFinal = '';
 		}
 
+		if (sftpPrivateKeyInput) {
+
+			// Encrypt the pasted private key content and store the encrypted blob.
+			// If the field was submitted empty the existing encrypted value in
+			// appConfig is preserved below — the key is never cleared by accident.
+			const sftpPrivateKeyEncObj = await shareData.System.encrypt(sftpPrivateKeyInput, shareData.appData.password);
+
+			if (sftpPrivateKeyEncObj.success) {
+
+				sftpPrivateKeyFinal = sftpPrivateKeyEncObj.data;
+			}
+		}
+		// If sftpPrivateKeyInput is empty, sftpPrivateKeyFinal stays undefined
+		// and the appConfig write below preserves the existing encrypted value.
+
 		const cronBackupPasswordEncObj = await shareData.System.encrypt(cronBackupPassword, shareData.appData.password);
 
 		if (cronBackupPasswordEncObj.success) {
@@ -267,14 +332,32 @@ async function updateConfig(req, res) {
 		appConfig['cron_backup']['sftp']['port'] = sftpPort;
 		appConfig['cron_backup']['sftp']['username'] = sftpUsername;
 		appConfig['cron_backup']['sftp']['password'] = sftpPasswordFinal;
-		appConfig['cron_backup']['sftp']['private_key'] = sftpPrivateKey;
+		// Private key write logic:
+		// - Clear flag set → explicitly erase the stored key
+		// - New key submitted → store the newly encrypted value
+		// - Neither → leave the existing stored value untouched
+		if (sftpPrivateKeyClear === '1') {
+
+			appConfig['cron_backup']['sftp']['private_key'] = '';
+		}
+		else if (sftpPrivateKeyFinal !== undefined) {
+
+			appConfig['cron_backup']['sftp']['private_key'] = sftpPrivateKeyFinal;
+		}
 		appConfig['cron_backup']['sftp']['passphrase'] = sftpPassphraseFinal;
 		appConfig['cron_backup']['sftp']['remote_directory'] = sftpRemoteDirectory;
+
+		appConfig['ai']['provider'] = aiProvider;
 
 		appConfig['ai']['ollama']['enabled'] = ollamaEnabled;
 		appConfig['ai']['ollama']['host'] = ollamaHost;
 		appConfig['ai']['ollama']['api_key'] = ollamaApiKey;
 		appConfig['ai']['ollama']['model'] = ollamaModel;
+
+		appConfig['ai']['openai']['enabled'] = openaiEnabled;
+		appConfig['ai']['openai']['api_key'] = openaiApiKey;
+		appConfig['ai']['openai']['model'] = openaiModel;
+		appConfig['ai']['openai']['base_url'] = openaiBaseUrl;
 
 		shareData['appData']['telegram_id'] = telegramUserId;
 		shareData['appData']['telegram_enabled'] = telegramEnabled;
@@ -324,12 +407,24 @@ async function updateConfig(req, res) {
 
 			await saveConfig(appConfigFile, appConfig);
 
-			// Stop / Restart Ollama
-			shareData.Ollama.stop();
+			// Stop / Restart AI client
+			shareData.AIClient.stop();
 
-			if (ollamaEnabled) {
+			if (openaiEnabled) {
 
-				shareData.Ollama.start(ollamaHost, ollamaApiKey, ollamaModel);
+				shareData.AIClient.start('openai', {
+					api_key: openaiApiKey,
+					model: openaiModel,
+					base_url: openaiBaseUrl,
+				});
+			}
+			else if (ollamaEnabled) {
+
+				shareData.AIClient.start('ollama', {
+					host: ollamaHost,
+					api_key: ollamaApiKey,
+					model: ollamaModel,
+				});
 			}
 
 			// Restart Signals
@@ -756,7 +851,7 @@ async function showFiles(type = 'logs', req, res, isHub) {
 	const instanceName = await getInstanceName();
 	const files = await listFiles(type);
 
-	if (instanceName) {
+	if (instanceName && !isHub) {
 
 		const ext = type === 'logs' ? '.log' : '.enc';
 		const regex = new RegExp(`${instanceName}.*\\${ext}$`);

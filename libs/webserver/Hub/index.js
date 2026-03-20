@@ -259,6 +259,14 @@ async function initSocket(sessionMiddleware, server) {
 					client.join(room);
 					//console.log(`Client joined room: ${room}`);
 				});
+
+				// If the client is joining the memory room, fire an immediate poll
+				// so instance status and memory data appear right away rather than
+				// waiting for the next scheduled interval to elapse
+				if (data.rooms.includes('memory')) {
+
+					shareData.Hub.logMemoryUsage();
+				}
 			});
 
 			client.on('leaveRoom', (room) => {
