@@ -516,17 +516,17 @@
 						This is the password used to login to the <%- appData.name %> web interface.
 					</span></span>
 				</label>
-				<input type="password" name="password" id="password" class="form-field" style="width: 250px;" required> <span id="configChangePass" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Change</span>
+				<input type="password" autocomplete="off" name="password" id="password" class="form-field" style="width: 250px;" required> <span id="configChangePass" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Change</span>
 			</div>
 
 			<div style="padding-bottom: 5px; display: none;" id="configNewPass">
 				<label for="passwordnew"><b>New Password</b></label>
-				<input type="password" name="passwordnew" id="passwordnew" class="form-field" style="width: 250px;">
+				<input type="password" autocomplete="off" name="passwordnew" id="passwordnew" class="form-field" style="width: 250px;">
 			</div>
 
 			<div style="padding-bottom: 5px; display: none;" id="configConfirmPass">
 				<label for="passwordnew2"><b>New Password Again</b></label>
-				<input type="password" name="passwordnew2" id="passwordnew2" class="form-field" style="width: 250px;">
+				<input type="password" autocomplete="off" name="passwordnew2" id="passwordnew2" class="form-field" style="width: 250px;">
 			</div>
 
 			<div style="padding-bottom: 5px; display: none;" id="configMongoDb">
@@ -595,7 +595,7 @@
 					</td>
 
 					<td>
-					<input type="password" name="signals_3cqs_api_key" id="signals_3cqs_api_key" class="form-field" style="width: 250px; margin-bottom: 5px;" value="<%= services['signals']['3CQS']['api_key'] %>">
+					<input type="password" autocomplete="off" name="signals_3cqs_api_key" id="signals_3cqs_api_key" class="form-field" style="width: 250px; margin-bottom: 5px;" value="<%= services['signals']['3CQS']['api_key'] %>">
 					<br>
 					Register at <a href="https:///www.3cqs.com" target=_blank>3CQS.com</a> to get your API key
 					</td>
@@ -629,7 +629,7 @@
 					</td>
 
 					<td>
-					<input type="password" name="telegram_token_id" id="telegram_token_id" class="form-field" style="width: 250px;" value="<%= services['telegram']['token_id'] %>">
+					<input type="password" autocomplete="off" name="telegram_token_id" id="telegram_token_id" class="form-field" style="width: 250px;" value="<%= services['telegram']['token_id'] %>">
 					</td>
 				</tr>
 
@@ -709,7 +709,7 @@
 					</td>
 
 					<td>
-						<input type="password" name="ollama_api_key" id="ollama_api_key" class="form-field" style="width: 250px;" value="<%= services['ai']['ollama']['api_key'] %>">
+						<input type="password" autocomplete="off" name="ollama_api_key" id="ollama_api_key" class="form-field" style="width: 250px;" value="<%= services['ai']['ollama']['api_key'] %>">
 					</td>
 				</tr>
 
@@ -739,7 +739,7 @@
 					</td>
 
 					<td>
-						<input type="password" name="openai_api_key" id="openai_api_key" class="form-field" style="width: 250px;" value="<%= services['ai']['openai']['api_key'] %>">
+						<input type="password" autocomplete="off" name="openai_api_key" id="openai_api_key" class="form-field" style="width: 250px;" value="<%= services['ai']['openai']['api_key'] %>">
 					</td>
 				</tr>
 
@@ -871,7 +871,7 @@
 					</td>
 
 					<td style="width: 325px;">
-						<input type="password" id="backup_password" class="form-field" style="width: 200px;" placeholder="">
+						<input type="password" autocomplete="off" id="backup_password" class="form-field" style="width: 200px;" placeholder="">
 						<span id="showPassword" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Show</span>
 					</td>
 				</tr>
@@ -945,7 +945,7 @@
 					</td>
 
 					<td>
-						<input type="password" name="sftp_password" id="sftp_password" class="form-field" style="width: 250px;" value="">
+						<input type="password" autocomplete="off" name="sftp_password" id="sftp_password" class="form-field" style="width: 250px;" value="">
 						<span id="showSftpPassword" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Show</span>
 					</td>
 				</tr>
@@ -980,7 +980,7 @@
 					</td>
 
 					<td>
-						<input type="password" name="sftp_passphrase" id="sftp_passphrase" class="form-field" style="width: 250px;" value="">
+						<input type="password" autocomplete="off" name="sftp_passphrase" id="sftp_passphrase" class="form-field" style="width: 250px;" value="">
 						<span id="showSftpPassphrase" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Show</span>
 					</td>
 				</tr>

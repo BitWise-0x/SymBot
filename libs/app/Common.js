@@ -347,6 +347,21 @@ async function updateConfig(req, res) {
 		appConfig['cron_backup']['sftp']['passphrase'] = sftpPassphraseFinal;
 		appConfig['cron_backup']['sftp']['remote_directory'] = sftpRemoteDirectory;
 
+		// Ensure ai sub-objects exist before writing — app.json files on the old
+		// schema may be missing 'provider' or the 'openai' sub-object entirely,
+		// which would throw a TypeError when trying to set properties on undefined.
+		if (!appConfig['ai']) {
+			appConfig['ai'] = {};
+		}
+
+		if (!appConfig['ai']['ollama']) {
+			appConfig['ai']['ollama'] = {};
+		}
+
+		if (!appConfig['ai']['openai']) {
+			appConfig['ai']['openai'] = {};
+		}
+
 		appConfig['ai']['provider'] = aiProvider;
 
 		appConfig['ai']['ollama']['enabled'] = ollamaEnabled;
