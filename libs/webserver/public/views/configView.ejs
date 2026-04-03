@@ -326,6 +326,277 @@
 			$(this).text(type === 'password' ? 'Show' : 'Hide');
 		});
 
+		function setBotCredStatus(field, isSet) {
+
+			const $status = $('#bot_' + field + '_status');
+
+			if (isSet) {
+
+				$status.html('&#10003; Set &nbsp;<span class="bot-cred-clear" data-field="' + field + '" style="cursor: pointer; color: var(--link-color); font-size: 12px;">[Clear]</span>');
+				$status.css('color', 'var(--green-color, #2ecc71)').show();
+			}
+			else {
+
+				$status.hide();
+				$('#bot_' + field + '_clear').val('0');
+			}
+		}
+
+		$(document).on('click', '.bot-cred-clear', function() {
+
+			const field = $(this).data('field');
+
+			$('#bot_' + field).val('');
+			$('#bot_' + field + '_clear').val('1');
+			$('#bot_' + field + '_status').html('Will be cleared on save').css('color', 'var(--warning-color, #e67e22)');
+		});
+
+		// Load exchanges dropdown, then load bot config and select current exchange
+		$.ajax({
+			type: 'GET',
+			url: './api/exchanges',
+			dataType: 'json',
+			success: function(exData) {
+
+				const $sel = $('#bot_exchange');
+				$sel.empty().append($('<option>', { value: '', text: '-- Select Exchange --' }));
+
+				if (exData.success) {
+
+					exData.data.forEach(function(ex) {
+
+						$sel.append($('<option>', { value: ex, text: ex }));
+					});
+				}
+
+				$.ajax({
+					type: 'GET',
+					url: './api/bot-config',
+					dataType: 'json',
+					success: function(data) {
+
+						if (data.success) {
+
+							const cfg = data.data;
+
+							$('#bot_exchange').val(cfg.exchange || '');
+							$('#bot_exchangeFee').val(cfg.exchangeFee || '');
+							$('#bot_sandBoxWallet').val(cfg.sandBoxWallet || '');
+
+							// Show set status with clear link for each credential field
+							['apiKey', 'apiSecret', 'apiPassphrase', 'apiPassword'].forEach(function(field) {
+
+								if (cfg[field]) {
+
+									setBotCredStatus(field, true);
+								}
+							});
+
+							updateSandboxUI(cfg.sandBox);
+						}
+					}
+				});
+			}
+		});
+
+		function updateSandboxUI(isSandbox) {
+
+			if (isSandbox) {
+
+				$('#sandboxModeLabel').html('<span style="color: #e67e22; font-weight: 600;">&#9888; Sandbox Mode (Paper Trading)</span>');
+				$('#sandboxModeToggle').text('Switch to Live Trading');
+				$('#sandboxModeDesc').text('No real trades will be placed. Safe for testing.');
+			}
+			else {
+
+				$('#sandboxModeLabel').html('<span style="color: #2ecc71; font-weight: 600;">&#9654; Live Trading</span>');
+				$('#sandboxModeToggle').text('Switch to Sandbox Mode');
+				$('#sandboxModeDesc').text('Real trades are active on this exchange.');
+			}
+
+			$('#sandboxModeToggle').data('current', isSandbox);
+		}
+
+		$('#sandboxModeToggle').on('click', function() {
+
+			const currentlySandbox = $(this).data('current') === true;
+			const goingToSandbox = !currentlySandbox;
+			const goingTo = goingToSandbox ? 'SANDBOX MODE' : 'LIVE TRADING';
+			const warning = goingToSandbox
+				? '<b>WARNING:</b> You are switching to <b>SANDBOX MODE</b>. No real trades will be placed. Existing active deals are not affected.'
+				: '<b>WARNING:</b> You are switching to <b>LIVE TRADING</b>. Real orders will be placed on the exchange. Ensure your credentials and settings are correct before proceeding.';
+
+			$.confirm({
+				title: false,
+				boxWidth: '50%',
+				useBootstrap: false,
+				content: '<div style="font-size: 1.2rem; text-align: left;">' + warning + '</div>',
+				buttons: {
+					confirm: {
+						btnClass: 'btn-default',
+						text: '<div style="color: #c62828;">Switch to ' + goingTo + '</div>',
+						action: function() {
+
+							const newSandbox = goingToSandbox;
+
+							$.confirm({
+								title: false,
+								boxWidth: '40%',
+								useBootstrap: false,
+								content: '<div style="font-size: 1.2rem;">Enter your current password to confirm:</div><br><input type="password" id="sandboxConfirmPassword" class="form-field" style="width: 250px;" placeholder="Password">',
+								buttons: {
+									confirm: {
+										btnClass: 'btn-default',
+										text: '<div style="color: #c62828;">Confirm</div>',
+										action: function() {
+
+											const pw = $('#sandboxConfirmPassword').val();
+
+											if (!pw) {
+
+												alertBox('Please enter your password');
+												return false;
+											}
+
+											$('#spinner-overlay').fadeIn(100);
+
+											$.ajax({
+												type: 'POST',
+												url: './api/bot-config/sandbox',
+												data: { password: pw, sandBox: newSandbox },
+												dataType: 'json',
+												success: function(data) {
+
+													$('#spinner-overlay').fadeOut(100);
+
+													if (data.success) {
+
+														updateSandboxUI(newSandbox);
+														alertBox(data.data);
+													}
+													else {
+
+														alertBox(data.data);
+													}
+												},
+												error: function() {
+
+													$('#spinner-overlay').fadeOut(100);
+													alertBox('Error updating trading mode');
+												}
+											});
+										}
+									},
+									cancel: {
+										btnClass: 'btn-default',
+										text: '<div style="color: #000;">Cancel</div>',
+										action: function() {}
+									}
+								}
+							});
+						}
+					},
+					cancel: {
+						btnClass: 'btn-default',
+						text: '<div style="color: #000;">Cancel</div>',
+						action: function() {}
+					}
+				}
+			});
+		});
+
+		$('#botConfigSave').on('click', function() {
+
+			$.confirm({
+				title: false,
+				boxWidth: '40%',
+				useBootstrap: false,
+				content: '<div style="font-size: 1.2rem;">Enter your current password to save exchange settings:</div><br><input type="password" id="botConfigPassword" class="form-field" style="width: 250px;" placeholder="Password">',
+				buttons: {
+					confirm: {
+						btnClass: 'btn-default',
+						text: '<div style="color: #4aa602;">Save</div>',
+						action: function() {
+
+							const pw = $('#botConfigPassword').val();
+
+							if (!pw) {
+
+								alertBox('Please enter your password');
+								return false;
+							}
+
+							const payload = {
+								password:        pw,
+								exchange:        $('#bot_exchange').val().trim(),
+								apiKey:              $('#bot_apiKey').val().trim(),
+								apiKey_clear:        $('#bot_apiKey_clear').val(),
+								apiSecret:           $('#bot_apiSecret').val().trim(),
+								apiSecret_clear:     $('#bot_apiSecret_clear').val(),
+								apiPassphrase:       $('#bot_apiPassphrase').val().trim(),
+								apiPassphrase_clear: $('#bot_apiPassphrase_clear').val(),
+								apiPassword:         $('#bot_apiPassword').val().trim(),
+								apiPassword_clear:   $('#bot_apiPassword_clear').val(),
+								exchangeFee:     $('#bot_exchangeFee').val().trim(),
+								sandBoxWallet:   $('#bot_sandBoxWallet').val().trim(),
+							};
+
+							$('#spinner-overlay').fadeIn(100);
+
+							$.ajax({
+								type: 'POST',
+								url: './api/bot-config',
+								data: payload,
+								dataType: 'json',
+								success: function(data) {
+
+									$('#spinner-overlay').fadeOut(100);
+									alertBox(data.data);
+
+									if (data.success) {
+
+										// Clear input fields and reset clear flags, then re-fetch to get fresh status
+										['apiKey', 'apiSecret', 'apiPassphrase', 'apiPassword'].forEach(function(field) {
+
+											$('#bot_' + field).val('');
+											$('#bot_' + field + '_clear').val('0');
+											$('#bot_' + field + '_status').hide();
+										});
+
+										$.ajax({
+											type: 'GET',
+											url: './api/bot-config',
+											dataType: 'json',
+											success: function(refreshed) {
+
+												if (refreshed.success) {
+
+													['apiKey', 'apiSecret', 'apiPassphrase', 'apiPassword'].forEach(function(field) {
+
+														if (refreshed.data[field]) setBotCredStatus(field, true);
+													});
+												}
+											}
+										});
+									}
+								},
+								error: function() {
+
+									$('#spinner-overlay').fadeOut(100);
+									alertBox('Error saving exchange settings');
+								}
+							});
+						}
+					},
+					cancel: {
+						btnClass: 'btn-default',
+						text: '<div style="color: #000;">Cancel</div>',
+						action: function() {}
+					}
+				}
+			});
+		});
+
 		$('#showSftpPassword').on('click', function () {
 
 			const input = $('#sftp_password');
@@ -1012,7 +1283,130 @@
 			</div>
 
 
-			<button style="margin-top: 20px" type="button" id="checkUpdates" class="btn" style="cursor: pointer;">
+			<div class="divHr"></div>
+
+			<div style="padding-top: 10px; padding-bottom: 5px;">
+
+				<b>Exchange Settings</b>
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+
+				<tr>
+					<td>
+						<label for="bot_exchange">Name:
+							<span class="toolTip">?<span class="toolTipText">
+								The exchange this instance will trade on
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<select name="bot_exchange" id="bot_exchange" class="form-field" style="width: 256px; cursor: pointer;">
+							<option value="">Loading exchanges...</option>
+						</select>
+					</td>
+				</tr>
+
+				<tr><td colspan="2" style="padding-top: 8px; padding-bottom: 2px; font-size: 0.9rem; opacity: 0.6;">API Credentials <i>(leave blank to keep existing)</i></td></tr>
+
+				<tr>
+					<td>
+						<label for="bot_apiKey">API Key:</label>
+					</td>
+
+					<td>
+						<input type="hidden" id="bot_apiKey_clear" value="0">
+						<input type="password" autocomplete="off" name="bot_apiKey" id="bot_apiKey" class="form-field" style="width: 250px;" placeholder="••••••••">
+						<div id="bot_apiKey_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="bot_apiSecret">API Secret:</label>
+					</td>
+
+					<td>
+						<input type="hidden" id="bot_apiSecret_clear" value="0">
+						<input type="password" autocomplete="off" name="bot_apiSecret" id="bot_apiSecret" class="form-field" style="width: 250px;" placeholder="••••••••">
+						<div id="bot_apiSecret_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="bot_apiPassphrase">Passphrase: <span style="font-size:0.9rem;"><i>(if required)</i></span></label>
+					</td>
+
+					<td>
+						<input type="hidden" id="bot_apiPassphrase_clear" value="0">
+						<input type="password" autocomplete="off" name="bot_apiPassphrase" id="bot_apiPassphrase" class="form-field" style="width: 250px;" placeholder="••••••••">
+						<div id="bot_apiPassphrase_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="bot_apiPassword">Password: <span style="font-size:0.9rem;"><i>(if required)</i></span></label>
+					</td>
+
+					<td>
+						<input type="hidden" id="bot_apiPassword_clear" value="0">
+						<input type="password" autocomplete="off" name="bot_apiPassword" id="bot_apiPassword" class="form-field" style="width: 250px;" placeholder="••••••••">
+						<div id="bot_apiPassword_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+					</td>
+				</tr>
+
+				<tr><td colspan="2" style="padding-top: 8px; padding-bottom: 2px; font-size: 0.9rem; opacity: 0.6;">Fees &amp; Sandbox</td></tr>
+
+				<tr>
+					<td>
+						<label for="bot_exchangeFee">Fee %:
+							<span class="toolTip">?<span class="toolTipText">
+								The fee percentage applied to both buys and sells on your exchange, e.g. 0.65
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="number" step="0.01" min="0" name="bot_exchangeFee" id="bot_exchangeFee" class="form-field" style="width: 100px;">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="bot_sandBoxWallet">Sandbox Wallet ($):
+							<span class="toolTip">?<span class="toolTipText">
+								Simulated wallet balance used when Sandbox mode is enabled
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="number" step="1" min="0" name="bot_sandBoxWallet" id="bot_sandBoxWallet" class="form-field" style="width: 100px;">
+					</td>
+				</tr>
+
+				</table>
+
+				<div style="margin-top: 15px;">
+					<button type="button" id="botConfigSave" class="btn" style="cursor: pointer;">Save Exchange Settings</button>
+				</div>
+
+				<div class="divHr" style="margin-top: 20px;"></div>
+
+				<div style="padding-top: 10px;">
+					<b>Trading Mode</b>
+					<div style="margin-top: 8px; display: flex; align-items: center; gap: 12px;">
+						<span id="sandboxModeLabel" style="font-size: 1.1rem;"></span>
+						<button type="button" id="sandboxModeToggle" class="btn" style="cursor: pointer;"></button>
+					</div>
+					<div style="margin-top: 6px; font-size: 0.95rem; color: var(--table-content-color); opacity: 0.7;" id="sandboxModeDesc"></div>
+				</div>
+
+			</div>
+
+
+		<button style="margin-top: 20px" type="button" id="checkUpdates" class="btn" style="cursor: pointer;">
 				Check for Updates
 			</button>
 
@@ -1027,5 +1421,134 @@
 
 </main>
 
+
+
+<script>
+(function() {
+
+	// Sections that start collapsed. Key is the exact bold text of the section header.
+	const COLLAPSED_BY_DEFAULT = new Set([
+		'3CQS Signals',
+		'Telegram Settings',
+		'Artificial Intelligence (AI)',
+		'Database Backups',
+		'SFTP Credentials For Backups'
+	]);
+
+	const STORAGE_KEY = 'symbot_config_sections';
+
+	function loadState() {
+		try {
+			return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+		} catch(e) {
+			return {};
+		}
+	}
+
+	function saveState(state) {
+		try {
+			localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+		} catch(e) {}
+	}
+
+	function initCollapsibleSections() {
+
+		const state = loadState();
+
+		// Find every bold tag that is a direct section header — i.e. the first
+		// element child of a padding-top div, not inside a table or label.
+		const candidates = document.querySelectorAll('#formConfig > div > b');
+
+		candidates.forEach(function(header) {
+
+			const title = header.textContent.trim();
+
+			if (!COLLAPSED_BY_DEFAULT.has(title)) {
+				return;
+			}
+
+			const sectionDiv = header.parentElement;
+
+			// Collect all siblings after the header <b> tag — these are the
+			// table rows and other elements to hide/show.
+			const siblings = [];
+			let node = header.nextSibling;
+
+			while (node) {
+				siblings.push(node);
+				node = node.nextSibling;
+			}
+
+			// Wrap siblings in a collapsible container
+			const body = document.createElement('div');
+			body.className = 'config-section-body';
+			siblings.forEach(function(n) { body.appendChild(n); });
+			sectionDiv.appendChild(body);
+
+			// Determine initial open/closed state
+			const savedOpen = state[title];
+			const isOpen = savedOpen === undefined
+				? false   // collapsed by default
+				: savedOpen;
+
+			body.style.display = isOpen ? '' : 'none';
+
+			// Build the clickable header row
+			const toggle = document.createElement('span');
+			toggle.className = 'config-section-toggle';
+			toggle.setAttribute('aria-expanded', String(isOpen));
+			toggle.style.cssText = [
+				'display: inline-flex',
+				'align-items: center',
+				'gap: 6px',
+				'cursor: pointer',
+				'user-select: none',
+				'width: 100%',
+				'padding: 2px 0 4px 0'
+			].join(';');
+
+			const arrow = document.createElement('span');
+			arrow.className = 'config-section-arrow';
+			arrow.textContent = isOpen ? '▾' : '▸';
+			arrow.style.cssText = [
+				'font-size: 0.85rem',
+				'opacity: 0.6',
+				'transition: transform 120ms ease',
+				'flex-shrink: 0'
+			].join(';');
+
+			// Move the <b> tag into the toggle wrapper
+			toggle.appendChild(arrow);
+			toggle.appendChild(header);
+
+			sectionDiv.insertBefore(toggle, sectionDiv.firstChild);
+
+			toggle.addEventListener('click', function() {
+
+				const open = body.style.display === 'none';
+
+				body.style.display = open ? '' : 'none';
+				arrow.textContent = open ? '▾' : '▸';
+				toggle.setAttribute('aria-expanded', String(open));
+
+				const s = loadState();
+				s[title] = open;
+				saveState(s);
+			});
+		});
+	}
+
+	// Run after the DOM is ready and after any existing $(document).ready
+	// handlers have finished, so toggles (e.g. toggleTelegram) are already set.
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', function() {
+			setTimeout(initCollapsibleSections, 0);
+		});
+	} else {
+		setTimeout(initCollapsibleSections, 0);
+	}
+
+})();
+</script>
 
 <%- include('./partialsFooterView'); %>

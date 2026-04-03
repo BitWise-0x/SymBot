@@ -14,35 +14,35 @@
 
 	const actionButtons = {
 							'add': {
-										'button': '<span class="disableButton">$+</span>',
+										'button': '<span class="pill-btn" title="Add funds to deal"><span class="icon icon-add" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Add funds to deal'
 									},
 							'ai': {
-										'button': '<span class="disableButton">&#9889;</span>',
+										'button': '<span class="pill-btn" title="AI Analyze deal"><span class="icon icon-ai" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'AI Analyze deal'
 									},
 							'cancel': {
-										'button': '<span class="disableButton">X</span>',
+										'button': '<span class="pill-btn pill-danger" title="Cancel deal"><span class="icon icon-cancel" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Cancel deal'
 									},
 							'edit': {
-										'button': '<span class="disableButton">&#9998;</span>',
+										'button': '<span class="pill-btn" title="Edit deal"><span class="icon icon-edit" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Edit deal'
 									},
 							'panic': {
-										'button': '<span class="disableButton" style="font-size: 1.0rem;">&#128176</span>',
+										'button': '<span class="pill-btn" title="Close deal"><span class="icon icon-close" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Close deal'
 									},
 							'pause': {
-										'button': '<span class="disableButton">&#8545;</span>',
+										'button': '<span class="pill-btn pill-warn" title="Pause deal"><span class="icon icon-pause" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Pause deal'
 									},
 							'resume': {
-										'button': '<span class="disableButton">&#9658;</span>',
+										'button': '<span class="pill-btn pill-warn" title="Resume deal"><span class="icon icon-resume" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Resume deal'
 									},
 							'stop': {
-										'button': '<span class="disableButton">&#9726;</span>',
+										'button': '<span class="pill-btn pill-danger" title="Stop bot"><span class="icon icon-stop" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Stop bot'
 									}
 						  };
@@ -790,7 +790,7 @@
 		const selectedBot = $('#active-bot-filter').val();
 
 		let msgBoxColor = '#386ec2';
-		let profitTotalColor = '#1a9f00';
+		let profitTotalClass = 'profit-positive';
 
 		let msgBox = '';
 
@@ -832,7 +832,7 @@
 			inDeals += dealVolume;
 
 			let dealBackground = '';
-			let profitPercColor = '#1a9f00';
+			let profitPercClass = 'profit-positive';
 			let pauseButtonId = 'pause';
 
 			let dealCount;
@@ -890,7 +890,7 @@
 
 			if (!botActive) {
 
-				stopButtonDeal = '';
+				stopButtonDeal = '<span class="pill-btn pill-disabled" title="Stop bot (bot inactive)"><span class="icon icon-stop" style="width:13px;height:13px;pointer-events:none;"></span></span>';
 			}
 
 			if (pause || pauseBuy || pauseSell) {
@@ -901,7 +901,7 @@
 
 			if (profitPerc <= 0) {
 
-				profitPercColor = '#d82715';
+				profitPercClass = 'profit-negative';
 			}
 
 			if (deal['info']['deal_max'] == 0) {
@@ -994,27 +994,22 @@
 			contentArr.push('<td>$' + convertNotation(deal['info']['price_last']) + '</td>');
 			contentArr.push('<td>$' + convertNotation(deal['info']['price_target']) + '</td>');
 			contentArr.push('<td>$' + dealVolume.toFixed(2) + '</td>')
-			contentArr.push('<td style="color: ' + profitPercColor+ '">$' + profit + '</td>');
-			contentArr.push('<td style="color: ' + profitPercColor+ '">' + profitBase + '</td>');
-			contentArr.push('<td style="color: ' + profitPercColor+ '">' + profitPerc + '%</td>');
+			contentArr.push('<td class="' + profitPercClass + '">$' + profit + '</td>');
+			contentArr.push('<td class="' + profitPercClass + '">' + profitBase + '</td>');
+			contentArr.push('<td class="' + profitPercClass + '">' + profitPerc + '%</td>');
 			contentArr.push('<td>$' + profitQuoteProjected + '</td>');
 			contentArr.push('<td>' + config['dcaTakeProfitPercent'] + '%</td>');
 			contentArr.push('<td>' + deal['info']['safety_orders_used'] + ' / ' + safetyOrdersTotalDisplay + '</td>');
 			contentArr.push('<td>$' + maxFunds + '</td>')
 			contentArr.push('<td>' + dealCount + '</td>');
-			contentArr.push('<td style="text-align: center;"><div id="ai' + dealId + i + '">' + aiButtonDeal + '</div></td>');
-			contentArr.push('<td style="text-align: center;"><div id="edit' + dealId + i + '">' + editButtonDeal + '</div></td>');
-			contentArr.push('<td style="text-align: center;"><div id="panic' + dealId + i + '">' + panicButtonDeal + '</div></td>');
-			contentArr.push('<td style="text-align: center;"><div id="add' + dealId + i + '">' + addFundsButtonDeal + '</div></td>');
-			contentArr.push('<td data-pause="' + pause + '" data-pausebuy="' + pauseBuy + '" data-pausesell="' + pauseSell + '" style="text-align: center;"><div id="' + pauseButtonId + dealId + i + '">' + pauseButtonDeal + '</div></td>');
-			contentArr.push('<td style="text-align: center;"><div id="cancel' + dealId + i + '">' + cancelButtonDeal + '</div></td>');
-			contentArr.push('<td data-botid="' + deal['info']['bot_id'] + '" data-botname="' + deal['info']['bot_name'] + '" style="text-align: center;"><div id="stop' + deal['info']['bot_id'] + i + '">' + stopButtonDeal + '</div></td>');
+			const pillContent = aiButtonDeal + editButtonDeal + panicButtonDeal + addFundsButtonDeal + pauseButtonDeal + cancelButtonDeal + (stopButtonDeal || '');
+			contentArr.push('<td style="text-align: center;" data-pause="' + pause + '" data-pausebuy="' + pauseBuy + '" data-pausesell="' + pauseSell + '" data-botid="' + deal['info']['bot_id'] + '" data-botname="' + deal['info']['bot_name'] + '"><div class="pill-group" id="actions' + dealId + i + '">' + pillContent + '</div></td>');
 			contentArr.push('</tr>');
 		}
 
 		if (totalProfit <= 0) {
 
-			profitTotalColor = '#d82715';
+			profitTotalClass = 'profit-negative';
 		}
 
 		$('#msgBox').empty();
@@ -1038,7 +1033,7 @@
 
 		$('#botsDeals tbody').append(contentArr.join(''));
 
-		$('#totalProfit').css('color', profitTotalColor);
+		$('#totalProfit').removeClass('profit-positive profit-negative').addClass(profitTotalClass);
 		$('#totalProfit').html('$' + totalProfit.toFixed(2));
 
 		$('#inDeals').html('$' + inDeals.toFixed(2));
@@ -1327,23 +1322,16 @@
 
 		$('#botDealSelectorShow').click(function() {
 
-			if ($('.botDealSelectorWrapper').is(':visible')) {
-
-				$('.botDealSelectorWrapper').fadeOut(300);
-			}
-			else {
-
-				$('.botDealSelectorWrapper').fadeIn(300);
-			}
+			$('.botDealSelectorWrapper').toggleClass('is-visible');
 		});
 
 
+		// Row click — data cols open order history or trading view
 		$(document).on('click', '#botsDeals tbody tr td', function() {
 
 			let col = $(this).index();
 			let row = $(this).closest('tr');
 			let content = $(this).text();
-
 			let colCount = $(row).find('td').length;
 
 			if (col == 2) {
@@ -1355,97 +1343,9 @@
 
 				showTradingView(modalId, 'modal', false, false, pair, exchange);
 			}
-			else if (col == (colCount - 1) && content != '') {
+			else if (col < colCount - 1) {
 
-				// Disable / Stop Bot
-				let data = { 'bot_id': '' };
-
-				let botId = $(this).data('botid');
-				let botName = $(this).data('botname');
-
-				if (botId) {
-
-					data.bot_id = botId;
-
-					stopBotConfirm(botName, $(this), data);
-				}
-			}
-			else if (col == (colCount - 2)) {
-
-				// Cancel Deal
-				let pair = row.data('pair');
-				let dealId = row.data('dealid');
-
-				if (dealId) {
-
-					cancelDeal(pair, dealId);	
-				}
-      		}
-			else if (col == (colCount - 3)) {
-
-				// Pause Deal
-				let pair = row.data('pair');
-				let dealId = row.data('dealid');
-
-				let pause = $(this).data('pause');
-				let pauseBuy = $(this).data('pausebuy');
-				let pauseSell = $(this).data('pausesell');
-
-				if (dealId) {
-
-					pauseDeal(pair, dealId, pause, pauseBuy, pauseSell);
-				}
-			}
-			else if (col == (colCount - 4)) {
-
-				// Add Funds
-				let pair = row.data('pair');
-				let dealId = row.data('dealid');
-
-				if (dealId) {
-
-					showAddFunds(pair, dealId);	
-				}
-			}
-			else if (col == (colCount - 5)) {
-
-				// Panic Sell / Close Deal
-				let dealId = row.data('dealid');
-
-				if (dealId) {
-
-					panicSellConfirm(dealId);
-				}
-			}
-			else if (col == (colCount - 6)) {
-
-				// Edit Deal
-				let data = { 'deal_id': '' };
-
-				let dealId = row.data('dealid');
-
-				if (dealId) {
-
-					data.deal_id = dealId;
-
-					dealEdit(dealId);
-				}
-			}
-			else if (col == (colCount - 7)) {
-
-				// AI Analyze Deal
-				let dealId = row.data('dealid');
-
-				if (dealTracker[dealId] == undefined || dealTracker[dealId] == null) {
-
-					return;
-				}
-
-				renderAIContent(dealId);
-			}
-			else {
-
-				// Order History
+				// Order History — any data column
 				let dealId = row.data('dealid');
 
 				if (dealTracker[dealId] == undefined || dealTracker[dealId] == null) {
@@ -1454,6 +1354,53 @@
 				}
 
 				showOrderHistory(modalId, dealId, dealTracker[dealId]['info']['active'], dealTracker[dealId]['orders']);
+			}
+		});
+
+		// Pill button clicks — identified by pill-btn class on the clicked span
+		$(document).on('click', '#botsDeals .pill-btn', function(e) {
+
+			e.stopPropagation();
+
+			let $btn = $(this);
+			let $td  = $btn.closest('td');
+			let row  = $btn.closest('tr');
+			let dealId   = row.data('dealid');
+			let pair     = row.data('pair');
+			let btnTitle = $btn.attr('title');
+
+			if (btnTitle === 'AI Analyze deal') {
+
+				if (dealTracker[dealId] == undefined || dealTracker[dealId] == null) return;
+
+				renderAIContent(dealId);
+			}
+			else if (btnTitle === 'Edit deal') {
+
+				if (dealId) dealEdit(dealId);
+			}
+			else if (btnTitle === 'Close deal') {
+
+				if (dealId) panicSellConfirm(dealId);
+			}
+			else if (btnTitle === 'Add funds to deal') {
+
+				if (dealId) showAddFunds(pair, dealId);
+			}
+			else if (btnTitle === 'Pause deal' || btnTitle === 'Resume deal') {
+
+				if (dealId) pauseDeal(pair, dealId, $td.data('pause'), $td.data('pausebuy'), $td.data('pausesell'));
+			}
+			else if (btnTitle === 'Cancel deal') {
+
+				if (dealId) cancelDeal(pair, dealId);
+			}
+			else if (btnTitle === 'Stop bot') {
+
+				let botId   = $td.data('botid');
+				let botName = $td.data('botname');
+
+				if (botId) stopBotConfirm(botName, $btn, { 'bot_id': botId });
 			}
 		});
 
@@ -1491,8 +1438,8 @@
 				<b class="contentHeader">Active DCA Bot Deals</b>
 
 				<span class="viewSettings">
-					<span id="csvDownload">&#8659;</span>
-					<span id="botDealSelectorShow">&#9881;</span>
+					<span id="csvDownload" class="viewIconBtn"><span class="icon icon-download" style="width:13px;height:13px;"></span></span>
+					<span id="botDealSelectorShow" class="viewIconBtn"><span class="icon icon-columns" style="width:13px;height:13px;"></span></span>
 				</span>
 
 				<div class="summary-bar">
@@ -1517,7 +1464,7 @@
 
 				<thead style="position: sticky; top: 0; z-index: 1000;">
 					<tr class="tableHeader">
-						<th>Bot Name</th> <th>Deal ID</th> <th>Pair</th> <th>Duration</th> <th>Price</th> <th>Price Target</th> <th>Volume</th> <th>Profit</th> <th>Profit &#x25C9;</th> <th>Profit %</th> <th>Profit &asymp;</th> <th>TP</th> <th>Safety Orders</th> <th>Max Funds</th> </th> <th>Deals</th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th>
+						<th>Bot Name</th> <th>Deal ID</th> <th>Pair</th> <th>Duration</th> <th>Price</th> <th>Price Target</th> <th>Volume</th> <th>Profit</th> <th>Profit &#x25C9;</th> <th>Profit %</th> <th>Profit &asymp;</th> <th>TP</th> <th>Safety Orders</th> <th>Max Funds</th> </th> <th>Deals</th> <th data-sorter="false" class="columnSelector-disable"></th>
 					</tr>
 				</thead>
 

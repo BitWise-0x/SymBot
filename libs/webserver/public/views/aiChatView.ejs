@@ -26,6 +26,9 @@
 			let canSendMessage = true;
 
 			const room = 'chat' + Math.random().toString(36).slice(2) + Math.floor(Date.now() / 1000);
+
+		// Expose room on container so pop-out button can read it
+		$('.aiChatContainer').data('room', room);
 			const content = <%- JSON.stringify(bodyData) %> || {};
 			const contentOrigObj = { ...content };
 

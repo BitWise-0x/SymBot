@@ -211,7 +211,17 @@ async function apiAiAnalyzeDeal(req, res, sendResponse = true) {
 						}
 					};
 
-		const aiOut = await shareData.AIClient.streamChat(JSON.stringify(aiBody));
+		let aiOut;
+
+		try {
+
+			aiOut = await shareData.AIClient.streamChat(JSON.stringify(aiBody));
+
+		}
+		catch (e) {
+
+			aiOut = { success: false, data: e.message };
+		}
 
 		if (aiOut.success) {
 
@@ -319,6 +329,7 @@ async function apiAiAnalyzeDealPrompt(req, res, sendResponse = true) {
 		const renderData = {
 			dealId,
 			dealInfo: dealTracker[dealId].info,
+			dealDate: deal.date,
 			config: deal.config,
 			pair,
 			orders: filledOrders,
@@ -462,7 +473,7 @@ async function apiGetMarkets(req, res, sendResponse = true) {
 }
 
 
-async function apiGetBots(req, res) {
+async function apiGetBots(req, res, sendResponse = true) {
 
 	let query = {};
 	let botsSort = [];
@@ -504,7 +515,16 @@ async function apiGetBots(req, res) {
 		botsSort = botsSort.reverse();
 	}
 
-	res.send( { 'date': new Date(), 'data': botsSort } );
+	const resObj = { 'date': new Date(), 'data': botsSort };
+
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+	else {
+
+		return resObj;
+	}
 }
 
 
@@ -554,7 +574,7 @@ async function apiGetDealsHistory(req, res, sendResponse) {
 }
 
 
-async function apiShowDeal(req, res, dealId) {
+async function apiShowDeal(req, res, dealId, sendResponse = true) {
 
 	let content;
 	let priceLast;
@@ -609,7 +629,16 @@ async function apiShowDeal(req, res, dealId) {
 		content = 'Invalid Deal ID';
 	}
 
-	res.send({ 'date': new Date(), 'success': success, 'data': content });
+	const resObj = { 'date': new Date(), 'success': success, 'data': content };
+
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+	else {
+
+		return resObj;
+	}
 }
 
 
@@ -1097,7 +1126,7 @@ async function apiAddFundsDeal(req, res) {
 }
 
 
-async function apiGetBalances(req, res) {
+async function apiGetBalances(req, res, sendResponse = true) {
 
 	let success = true;
 
@@ -1107,7 +1136,14 @@ async function apiGetBalances(req, res) {
 
 	shareData.Common.logger('API Get Balances: ' + JSON.stringify(resObj));
 
-	res.send(resObj);
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+	else {
+
+		return resObj;
+	}
 }
 
 
@@ -1223,36 +1259,28 @@ async function apiCreateUpdateBot(req, res) {
 					let pairCount = 0;
 					let notify = true;
 
-					let pairMax = configObj.pairMax;
-
-					if (pairMax == undefined || pairMax == null || pairMax == '') {
-
-						pairMax = 0;
-					}
-
-					// Start bot
+					// canStartDeal handles blacklist, pairMax, globalPairLimit
 					for (let i = 0; i < pairs.length; i++) {
 
-						if (pairMax == 0 || pairCount < pairMax) {
+						const pair = pairs[i];
 
-							let pair = pairs[i];
+						let config = JSON.parse(JSON.stringify(configObj));
+						config['pair'] = pair;
 
-							const isPairBlackListed = await shareData.Common.pairBlackListed(pair);
+						const { allowed } = await shareData.DCABot.canStartDeal({
+							pair,
+							config,
+							pairCount,
+							dealsActive: []
+						});
 
-							if (!isPairBlackListed) {
+						if (allowed) {
 
-								let config = JSON.parse(JSON.stringify(configObj));
-								config['pair'] = pair;
+							if (pairCount > 0) notify = false;
 
-								if (pairCount > 0) {
+							pairCount++;
 
-									notify = false;
-								}
-
-								pairCount++;
-
-								shareData.DCABot.startDelay({ 'config': config, 'delay': i + 1, 'notify': notify });
-							}
+							shareData.DCABot.startDelay({ 'config': config, 'delay': i + 1, 'notify': notify });
 						}
 					}
 				}
@@ -1307,26 +1335,22 @@ async function apiCreateUpdateBot(req, res) {
 
 						let pair = pairs[i];
 
-						const isPairBlackListed = await shareData.Common.pairBlackListed(pair);
+						const dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
 
-						if (!isPairBlackListed) {
+						let config = bot[0]['config'];
+						config['pair'] = pair;
+						config = await shareData.DCABot.applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
 
-							let dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
+						if (bot && bot.length > 0 && bot[0]['active'] && startCondition == 'asap') {
 
-							let config = bot[0]['config'];
+							const { allowed } = await shareData.DCABot.canStartDeal({
+								pair,
+								config,
+								pairCount,
+								dealsActive
+							});
 
-							let pairMax = config.pairMax;
-
-							if (pairMax == undefined || pairMax == null || pairMax == '') {
-
-								pairMax = 0;
-							}
-
-							config['pair'] = pair;
-							config = await shareData.DCABot.applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
-
-							// Start bot if active, no deals are currently running and start condition is now asap
-							if (bot && bot.length > 0 && bot[0]['active'] && dealsActive.length == 0 && (pairMax == 0 || pairCount < pairMax) && startCondition == 'asap') {
+							if (allowed) {
 
 								pairCount++;
 
@@ -1428,42 +1452,30 @@ async function apiEnableDisableBot(req, res) {
 
 			for (let i = 0; i < pairs.length; i++) {
 
-				let pair = pairs[i];
-				let dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
+				const pair = pairs[i];
+				const dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
 
 				let config = bot['config'];
+				config['pair'] = pair;
+				config = await shareData.DCABot.applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
 
-				let pairMax = config.pairMax;
+				const startCondition = config['startConditions']?.[0]?.toLowerCase() || 'asap';
 
-				if (pairMax == undefined || pairMax == null || pairMax == '') {
+				// Only start if first condition is asap
+				if (startCondition === 'asap') {
 
-					pairMax = 0;
-				}
+					const { allowed } = await shareData.DCABot.canStartDeal({
+						pair,
+						config,
+						pairCount,
+						dealsActive
+					});
 
-				const isPairBlackListed = await shareData.Common.pairBlackListed(pair);
+					if (allowed) {
 
-				// Start bot if active and no deals currently running and not blacklisted
-				if (dealsActive.length == 0 && !isPairBlackListed) {
+						pairCount++;
 
-					let startCondition;
-
-					config['pair'] = pair;
-					config = await shareData.DCABot.applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
-
-					if (config['startConditions'] != undefined && config['startConditions'] != null && config['startConditions'] != '') {
-
-						startCondition = config['startConditions'][0].toLowerCase();
-					}
-
-					// Only start bot if first condition is asap
-					if (startCondition == undefined || startCondition == null || startCondition == '' || startCondition == 'asap') {
-
-						if (pairMax == 0 || pairCount < pairMax) {
-
-							pairCount++;
-
-							shareData.DCABot.startDelay({ 'config': config, 'delay': i + 1, 'notify': false });
-						}
+						shareData.DCABot.startDelay({ 'config': config, 'delay': i + 1, 'notify': false });
 					}
 				}
 			}
@@ -1514,13 +1526,13 @@ async function apiEnableDisableBot(req, res) {
 
 async function apiStartDeal(req, res) {
 
-	const taskObj = { 'req': req, 'res': res, 'name': 'start_deal' };
-
-	queueStartDeal.add(taskObj, apiStartDealProcess);
+	// Enqueue the start — queue is serial so concurrent requests are
+	// processed one at a time, preventing limit-check race conditions.
+	queueStartDeal.enqueue(() => apiStartDealProcess(req, res));
 }
 
 
-async function apiStartDealProcess(req, res, taskObj) {
+async function apiStartDealProcess(req, res) {
 
 	let msg;
 	let dealId;
@@ -1595,63 +1607,29 @@ async function apiStartDealProcess(req, res, taskObj) {
 
 			if (success) {
 
-				let dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
-
-				// Get total active pairs currently running on bot
-				let botDealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'status': 0 });
-
-				let pairCount = botDealsActive.length;
+				const dealsActive    = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
+				const botDealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'status': 0 });
+				const pairCount      = botDealsActive.length;
 
 				let config = bot['config'];
+				config['pair'] = pair;
+				config = await shareData.DCABot.applyConfigData({ 'signal_id': signalId, 'bot_id': botId, 'bot_name': botName, 'config': config });
 
-				let pairMax = config.pairMax;
-				let pairDealsMax = config.pairDealsMax;
-				let pairBotsDealsMax = config.pairBotsDealsMax;
+				const { allowed, reason } = await shareData.DCABot.canStartDeal({
+					pair,
+					config,
+					pairCount,
+					dealsActive
+				});
 
-				// Check if this bot exceeds global pair limit
-				let globalPairLimitExceeded = await shareData.DCABot.checkGlobalPairLimit(pairBotsDealsMax, pair);
+				if (allowed) {
 
-				if (pairMax == undefined || pairMax == null || pairMax == '') {
-
-					pairMax = 0;
-				}
-
-				if (pairDealsMax == undefined || pairDealsMax == null || pairDealsMax == '') {
-
-					pairDealsMax = 0;
-				}
-
-				if (globalPairLimitExceeded) {
-
-					success = false;
-					msg = `${pair} global max of ${pairBotsDealsMax} deals already running across all bots`;
-				}
-				else if (dealsActive.length == 0 || dealsActive.length < pairDealsMax) {
-
-					if (pairMax == 0 || pairCount < pairMax) {
-
-						config['pair'] = pair;
-						config = await shareData.DCABot.applyConfigData({ 'signal_id': signalId, 'bot_id': botId, 'bot_name': botName, 'config': config });
-
-						startDelayConfig = config;
-					}
-					else {
-
-						success = false;
-						msg = 'Bot max ' + pairMax + ' pairs reached';
-					}
+					startDelayConfig = config;
 				}
 				else {
 
-					let displayMax = pairDealsMax;
-
-					if (displayMax < 2) {
-
-						displayMax = 1;
-					}
-
 					success = false;
-					msg = pair + ' pair max ' + displayMax + ' deals already running';
+					msg = reason;
 				}
 			}
 		}
@@ -1665,55 +1643,46 @@ async function apiStartDealProcess(req, res, taskObj) {
 
 	if (startDelayConfig != undefined && startDelayConfig != null) {
 
-		let delayMs = 500;
-		let maxRetries = 20;
-
-		let finished = false;
-
 		const startId = await shareData.DCABot.startDelay({ 'config': startDelayConfig, 'delay': startDelaySec, 'notify': false });
 
-		// Wait for start deal tracker to be removed to confirm deal started
-		while (!finished) {
+		// Poll until the startDealTracker entry is removed, which confirms the
+		// deal has been committed to the database and entered the deal tracker.
+		// Timeout after 30 seconds to avoid hanging the response indefinitely.
+		const maxWaitMs  = 30000;
+		const pollMs     = 250;
+		const startedAt  = Date.now();
 
-			let trackerData = await shareData.DCABot.getStartDealTracker(startId);
+		while (Date.now() - startedAt < maxWaitMs) {
+
+			const trackerData = await shareData.DCABot.getStartDealTracker(startId);
 
 			if (trackerData == undefined || trackerData == null) {
 
-				finished = true;
-			}
-			else {
+				// Start tracker removed — deal is live. Find the dealId from meta.
+				const dealTracker = await shareData.DCABot.getDealTracker();
 
-				await shareData.Common.delay(500);
-			}
-		}
+				if (dealTracker && typeof dealTracker === 'object') {
 
-		for (let i = 0; i < maxRetries; i++) {
+					dealId = Object.keys(dealTracker).find(id => dealTracker[id].meta?.start_id === startId);
+				}
 
-			const dealTracker = await shareData.DCABot.getDealTracker();
+				if (dealId) {
 
-			if (dealTracker && typeof dealTracker === 'object') {
-
-				dealId = Object.keys(dealTracker).find(id => dealTracker[id].meta?.start_id === startId);
-			}
-
-			if (dealId) {
-
-				msg = { 'deal_id': dealId };
+					msg = { 'deal_id': dealId };
+				}
 
 				break;
 			}
-			else {
 
-				await shareData.Common.delay(delayMs);
-			}
-  		}
+			await shareData.Common.delay(pollMs);
+		}
 	}
 
 	const resObj = { 'date': new Date(), 'success': success, 'data': msg };
 
 	shareData.Common.logger('API Start Deal: ' + JSON.stringify(resObj));
 
-	queueStartDeal.callBack(res, resObj, taskObj);
+	res.send(resObj);
 }
 
 
@@ -2110,7 +2079,7 @@ async function getDashboardData({ duration, timeZoneOffset }) {
 
 async function initApp() {
 
-	queueStartDeal = await shareData.Queue.create(1);
+	queueStartDeal = await shareData.Queue.create();
 }
 
 

@@ -193,6 +193,11 @@ function initSocket(sessionMiddleware, server) {
 		return next();
 	});
 
+	// Tracks number of in-flight api_action requests per client.
+	// Passed into routesWebSocket.api() so it can enforce the per-client
+	// concurrency limit without shared module-level state.
+	const inflightMap = new Map();
+
 	socket.on('connect', function (client) {
 
 		let clientId = client.id;
@@ -236,9 +241,20 @@ function initSocket(sessionMiddleware, server) {
 				client.join(query.room);
 			}
 
-			client.on('register_client', (data) => {
+			client.on('register_client', (data, ack) => {
 
 				client.join(API_ROOM);
+
+				// Acknowledge so the client knows the join succeeded
+				if (typeof ack === 'function') {
+
+					ack({ success: true });
+				}
+			});
+
+			client.on('disconnect', () => {
+
+				inflightMap.delete(client.id);
 			});
 
 			client.on('joinRooms', ({ rooms }) => {
@@ -273,7 +289,7 @@ function initSocket(sessionMiddleware, server) {
 
 			client.on('api_action', async (data) => {
 
-				Routes.processWebSocketApi(client, data);
+				Routes.processWebSocketApi(client, data, inflightMap);
 			});
 		}
 	});

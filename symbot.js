@@ -484,17 +484,19 @@ async function init() {
 		Telegram.start(appConfig['data']['telegram']['token_id'], appDataConfig['telegram_enabled']);
 		WebServer.start(appDataConfig['web_server_port']);
 
-		// Start AI client
-		const aiConfig = appConfig['data']['ai'];
+		// Start AI client — supports Ollama and OpenAI providers
+		const aiConfig = appConfig['data']['ai'] || {};
 		const aiProvider = aiConfig['provider'];
+		const ollamaEnabled = aiConfig['ollama']?.['enabled'];
+		const openaiEnabled = aiConfig['openai']?.['enabled'];
 
-		if (aiProvider === 'openai' && aiConfig['openai']['enabled']) {
+		if (aiProvider === 'openai' || openaiEnabled) {
 
-			AIClient.start('openai', aiConfig['openai']);
+			AIClient.start('openai', aiConfig['openai'] || {});
 		}
-		else if (aiProvider === 'ollama' && aiConfig['ollama']['enabled']) {
+		else if (aiProvider === 'ollama' || ollamaEnabled) {
 
-			AIClient.start('ollama', aiConfig['ollama']);
+			AIClient.start('ollama', aiConfig['ollama'] || {});
 		}
 
 		const TWELVE_HOURS = 12 * 60 * 60 * 1000;

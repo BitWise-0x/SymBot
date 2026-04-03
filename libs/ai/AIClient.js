@@ -475,10 +475,27 @@ function cleanupRooms() {
 }
 
 
+function getChatHistory(room) {
+
+	const roomData = conversationHistory.get(room);
+
+	if (!roomData) {
+
+		return [];
+	}
+
+	return roomData.messages.map(m => ({
+		role: m.role,
+		content: m.content
+	}));
+}
+
+
 module.exports = {
 	start,
 	stop,
 	streamChat,
+	getChatHistory,
 
 	init: function(obj) {
 		shareData = obj;

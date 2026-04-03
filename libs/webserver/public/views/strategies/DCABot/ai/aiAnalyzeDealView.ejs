@@ -31,25 +31,47 @@ const formatDate = (d) => {
     }
 };
 
-const currentPrice = Number(dealInfo.price_last) || 0;
-const baseTarget = Number(dealInfo.price_target) || 0;
-const profitPct = Number(dealInfo.profit_percentage) || 0;
-const currentNetProfit = Number(dealInfo.profit) || 0;
+const currentPrice      = Number(dealInfo.price_last)               || 0;
+const averagePrice      = Number(dealInfo.price_average)             || 0;
+const baseTarget        = Number(dealInfo.price_target)              || 0;
+const profitPct         = Number(dealInfo.profit_percentage)         || 0;
+const currentNetProfit  = Number(dealInfo.profit)                    || 0;
+const currentProfitBase = Number(dealInfo.profit_base)               || 0;
 const profitQuoteProjected = Number(dealInfo.profit_quote_projected) || 0;
+const safetyOrdersUsed  = Number(dealInfo.safety_orders_used)        || 0;
+const safetyOrdersMax   = Number(dealInfo.safety_orders_max)         || 0;
+const safetyOrdersLeft  = Math.max(safetyOrdersMax - safetyOrdersUsed, 0);
+const safetyOrdersPct   = safetyOrdersMax > 0
+    ? Math.round((safetyOrdersLeft / safetyOrdersMax) * 100)
+    : 0;
 
-const estimates = dealInfo.estimates || {};
-const addedAmount = Number(estimates.amount_net) || 0;
-const priceAverageNet = Number(estimates.price_average_net) || 0;
-const priceTargetNet = Number(estimates.price_target_net) || 0;
-const priceTargetChangePerc = Number(estimates.price_target_change_percent) || 0;
+const totalInvested        = orders.reduce((s, o) => s + Number(o.amount || 0), 0);
+const totalQuantity        = orders.reduce((s, o) => s + Number(o.qty    || 0), 0);
+const currentPositionValue = currentPrice * totalQuantity;
+const unrealizedPnL        = currentPositionValue - totalInvested;
+const deviationFromAvg     = averagePrice > 0
+    ? ((averagePrice - currentPrice) / averagePrice) * 100
+    : 0;
 
-// --- OHLCV Handling ---
+// Deal duration
+const dealOpenDate    = dealDate ? new Date(dealDate) : null;
+const dealOpenDisplay = dealOpenDate ? formatDate(dealOpenDate) : 'N/A';
+const dealAgeMs       = dealOpenDate ? (Date.now() - dealOpenDate.getTime()) : 0;
+const dealAgeDays     = dealAgeMs > 0 ? (dealAgeMs / (24 * 3600000)) : 0;
+
+const estimates             = dealInfo.estimates || {};
+const addedAmount           = Number(estimates.amount_net)                    || 0;
+const priceAverageNet       = Number(estimates.price_average_net)             || 0;
+const priceTargetNet        = Number(estimates.price_target_net)              || 0;
+const priceTargetChangePerc = Number(estimates.price_target_change_percent)   || 0;
+const canAddFunds           = addedAmount > 0 && priceTargetNet > 0;
+
 let avgDailyMove = null;
-let parsedOhlcv = [];
-let usedOhlcv = false;
+let parsedOhlcv  = [];
+let usedOhlcv    = false;
 
 try {
-    parsedOhlcv = JSON.parse(ohlcvData || "[]");
+    parsedOhlcv = JSON.parse(ohlcvData || '[]');
 } catch(e) {}
 
 if (Array.isArray(parsedOhlcv) && parsedOhlcv.length > 1) {
@@ -67,29 +89,26 @@ if (Array.isArray(parsedOhlcv) && parsedOhlcv.length > 1) {
     } catch(e) {}
 }
 
-// Last order timestamp
-let lastOrderTime = null;
-let lastOrderDisplay = formatDate(lastOrderTime);
+let lastOrderTime    = null;
+let lastOrderDisplay = 'N/A';
 orders.forEach(order => {
     const t = new Date(order.dateFilled || order.date).getTime();
     if (!isNaN(t) && t > lastOrderTime) {
-        lastOrderTime = t;
+        lastOrderTime    = t;
         lastOrderDisplay = formatDate(order.dateFilled || order.date);
     }
 });
 
 function calculateScenario(startPrice, targetPrice, startTimestamp, indicators = {}) {
 
-    let profitGap = 'N/A';
-    let closingDate = 'N/A';
-    let estimatedDays = 'N/A';
+    let profitGap      = 'N/A';
+    let closingDate    = 'N/A';
+    let estimatedDays  = 'N/A';
     let estimatedHours = 'N/A';
 
     const validInputs =
-        isFinite(startPrice) &&
-        isFinite(targetPrice) &&
-        startPrice > 0 &&
-        targetPrice > 0 &&
+        isFinite(startPrice)  && startPrice  > 0 &&
+        isFinite(targetPrice) && targetPrice > 0 &&
         startTimestamp;
 
     if (validInputs) {
@@ -98,9 +117,9 @@ function calculateScenario(startPrice, targetPrice, startTimestamp, indicators =
 
         if (requiredMove <= 0) {
 
-            profitGap = '0.00% (target already met)';
-            closingDate = formatDate(startTimestamp) + ' (immediate)';
-            estimatedDays = '0';
+            profitGap      = '0.00% (target already met)';
+            closingDate    = formatDate(startTimestamp) + ' (immediate)';
+            estimatedDays  = '0';
             estimatedHours = '0';
 
         } else {
@@ -121,130 +140,143 @@ function calculateScenario(startPrice, targetPrice, startTimestamp, indicators =
                 baseDays /= indicators.trendMultiplier;
             }
 
-            const baseHours = baseDays * 24;
-            const startTime = Number(startTimestamp);
-
             const now = Date.now();
-            const rawCompletionTime = startTime + baseDays * 24 * 3600000;
-
-            // If estimate has already elapsed, rebase from now
+            const rawCompletionTime = Number(startTimestamp) + baseDays * 24 * 3600000;
             const effectiveCompletionTime =
                 rawCompletionTime < now
                     ? now + baseDays * 24 * 3600000
                     : rawCompletionTime;
 
-            const completionDate = new Date(effectiveCompletionTime);
-
-            const remainingMs = effectiveCompletionTime - now;
+            const remainingMs   = effectiveCompletionTime - now;
             const remainingDays = remainingMs / (24 * 3600000);
-            const remainingHours = remainingDays * 24;
 
-            profitGap = fmt(requiredMove, 2) + '%';
-            closingDate = formatDate(completionDate);
-            estimatedDays = fmt(remainingDays, 1);
-            estimatedHours = fmt(remainingHours, 1);
+            profitGap      = fmt(requiredMove, 2) + '%';
+            closingDate    = formatDate(new Date(effectiveCompletionTime));
+            estimatedDays  = fmt(remainingDays, 1);
+            estimatedHours = fmt(remainingDays * 24, 1);
         }
     }
 
-    return {
-        profitGap,
-        closingDate,
-        estimatedDays,
-        estimatedHours,
-        indicators
-    };
+    return { profitGap, closingDate, estimatedDays, estimatedHours };
 }
 
 const scenarioIndicators = indicators || {};
-const scenario1 = calculateScenario(currentPrice, baseTarget, lastOrderTime, scenarioIndicators);
-const scenario2 = calculateScenario(currentPrice, priceTargetNet || baseTarget, lastOrderTime, scenarioIndicators);
+const scenario1 = calculateScenario(currentPrice, baseTarget,     lastOrderTime, scenarioIndicators);
+const scenario2 = calculateScenario(currentPrice, priceTargetNet, lastOrderTime, scenarioIndicators);
 
-const additionalQty = addedAmount > 0 ? addedAmount / currentPrice : 0;
-const totalInvested = orders.reduce((s,o)=>s+Number(o.amount||0),0);
-const totalQuantity = orders.reduce((s,o)=>s+Number(o.qty||0),0);
-const averagePrice = totalQuantity ? totalInvested / totalQuantity : 0;
-const pairName = pair || 'Unknown pair';
-const currentPositionValue = currentPrice * totalQuantity;
-
-// Context interpretation
 const contextScore = Number(scenarioIndicators.marketContextScore);
-let contextLabel = 'N/A';
+let contextLabel   = 'N/A';
 if (Number.isFinite(contextScore)) {
-    if (contextScore >= 70) contextLabel = 'Strong market conditions';
-    else if (contextScore >= 45) contextLabel = 'Neutral market conditions';
-    else contextLabel = 'Weak market conditions';
+    if      (contextScore >= 70) contextLabel = 'Strong';
+    else if (contextScore >= 45) contextLabel = 'Neutral';
+    else                         contextLabel = 'Weak';
+}
+
+const rsiValue   = Number(scenarioIndicators.rsi);
+const rsiDisplay = Number.isFinite(rsiValue) ? fmt(rsiValue, 1) : 'N/A';
+let   rsiLabel   = '';
+if (Number.isFinite(rsiValue)) {
+    if      (rsiValue > 70) rsiLabel = ' (overbought)';
+    else if (rsiValue < 30) rsiLabel = ' (oversold)';
 }
 
 const confidenceNotes = (scenarioIndicators.confidenceWarnings || []).map(w => {
-    if (w === 'low_timeframe_noise') return 'Short timeframe data may introduce market noise';
-    if (w === 'limited_candle_history') return 'Limited historical data reduces confidence';
+    if (w === 'low_timeframe_noise')    return 'Short timeframe data may introduce noise';
+    if (w === 'limited_candle_history') return 'Limited candle history reduces confidence';
     return w;
 });
+
+const pairName = pair || 'Unknown pair';
 %>
 
 ---
 
-## TRADING ANALYSIS REPORT  
-**Deal ID:** <%= dealId %>  
-**Trading Pair:** <%= pairName %>  
-**Report Date:** <%= formatDate(new Date()) %>  
-
-<% if (usedOhlcv) { %>
-**Data Source:** OHLCV market data with technical indicators  
-<% } else { %>
-**Data Source:** OHLCV market data not available. Fallback estimates (limited market data)  
-<% } %>
+## TRADING ANALYSIS REPORT
+**Deal ID:** <%= dealId %> | **Pair:** <%= pairName %> | **Date:** <%= formatDate(new Date()) %>
+**Bot:** <%= config.botName || 'N/A' %><% if (config.sandBox) { %> *(Sandbox)*<% } %>
 
 ---
 
-### MARKET SNAPSHOT
+### CURRENT POSITION
 
-- **Market Context Score:** <%= fmt(contextScore,0) %> / 100  
-- **Market Condition:** <%= contextLabel %>  
-- **Trend Direction:** <%= scenarioIndicators.trend || 'N/A' %>  
-- **Trend Multiplier:** <%= fmt(scenarioIndicators.trendMultiplier,2) %>  
-- **Indicator Timeframe:** <%= scenarioIndicators.timeframe || 'N/A' %>  
+| | |
+|---|---|
+| Deal Opened | <%= dealOpenDisplay %> (<%= fmt(dealAgeDays, 0) %> days ago) |
+| Invested | $<%= fmt(totalInvested, 2) %> |
+| Position Value | $<%= fmt(currentPositionValue, 2) %> |
+| Unrealized P&L | $<%= fmt(unrealizedPnL, 2) %> |
+| Current Price | $<%= fmt(currentPrice, 6) %> |
+| Average Entry | $<%= fmt(averagePrice, 6) %> |
+| Below Average | <%= fmt(deviationFromAvg, 2) %>% |
+| Take Profit Target | $<%= fmt(baseTarget, 6) %> |
+| Current P&L | $<%= fmt(currentNetProfit, 2) %> (<%= fmt(profitPct, 2) %>%) |
+| Projected Profit | $<%= fmt(profitQuoteProjected, 2) %> |
+| Safety Orders | <%= safetyOrdersUsed %> used / <%= safetyOrdersMax %> total (<%= safetyOrdersLeft %> remaining — <%= safetyOrdersPct %>%) |
+| Last Order | <%= lastOrderDisplay %> |
 
-**Volatility**
-- ATR (raw): <%= fmt(scenarioIndicators.atrPct,2) %>%  
-- ATR (daily-normalized): <%= fmt(scenarioIndicators.atrDailyPct,2) %>%  
-- Volatility State: <%= scenarioIndicators.volatilityState || 'N/A' %>  
+---
 
+### MARKET CONDITIONS
+<% if (usedOhlcv) { %>
+Data source: OHLCV with technical indicators (<%= scenarioIndicators.timeframe || '1d' %> timeframe)
+<% } else { %>
+Data source: Fallback estimates — OHLCV not available
+<% } %>
+
+| | |
+|---|---|
+| Market Score | <%= fmt(contextScore, 0) %> / 100 |
+| Condition | <%= contextLabel %> |
+| Trend | <%= scenarioIndicators.trend || 'N/A' %> |
+| RSI | <%= rsiDisplay %><%= rsiLabel %> |
+| Volatility | <%= scenarioIndicators.volatilityState || 'N/A' %> |
+| ATR (daily) | <%= fmt(scenarioIndicators.atrDailyPct, 2) %>% |
 <% if (confidenceNotes.length) { %>
-**Confidence Notes**
-<% confidenceNotes.forEach(n => { %>
-- <%= n %>
-<% }) %>
+| Confidence | <%= confidenceNotes.join('; ') %> |
 <% } %>
 
 ---
 
 ### SCENARIO 1 — HOLD CURRENT POSITION
-- Target Price: $<%= fmt(baseTarget,6) %>  
-- Required Move: <%= scenario1.profitGap %>  
-- Estimated Timeframe: <%= scenario1.estimatedDays %> days (~<%= scenario1.estimatedHours %> hours)  
-- Estimated Completion: <%= scenario1.closingDate %>  
+
+| | |
+|---|---|
+| Required Move | <%= scenario1.profitGap %> |
+| Estimated Time | <%= scenario1.estimatedDays %> days (~<%= scenario1.estimatedHours %> hours) |
+| Estimated Close | <%= scenario1.closingDate %> |
 
 ---
 
-### SCENARIO 2 — ADD ADDITIONAL FUNDS
-- Additional Capital: $<%= fmt(addedAmount,2) %>  
-- New Average Price: $<%= fmt(priceAverageNet,6) %>  
-- New Target Price: $<%= fmt(priceTargetNet,6) %>  
-- Estimated Timeframe: <%= scenario2.estimatedDays %> days (~<%= scenario2.estimatedHours %> hours)  
-- Estimated Completion: <%= scenario2.closingDate %>  
+### SCENARIO 2 — ADD FUNDS
+<% if (canAddFunds) { %>
+Adding **$<%= fmt(addedAmount, 2) %>** at current price reduces the average and lowers the target.
+
+| | |
+|---|---|
+| Additional Capital | $<%= fmt(addedAmount, 2) %> |
+| New Average Price | $<%= fmt(priceAverageNet, 6) %> |
+| New Target Price | $<%= fmt(priceTargetNet, 6) %> |
+| Target Reduction | <%= fmt(priceTargetChangePerc, 2) %>% |
+| Estimated Time | <%= scenario2.estimatedDays %> days (~<%= scenario2.estimatedHours %> hours) |
+| Estimated Close | <%= scenario2.closingDate %> |
+<% if (safetyOrdersLeft === 0) { %>
+**Note:** No safety orders remain. Adding funds manually increases exposure beyond the original bot configuration.
+<% } %>
+<% } else { %>
+Adding funds would not reduce the target price at current market price. This scenario is not applicable.
+<% } %>
 
 ---
 
 ### SUMMARY
 
-This report evaluates **Deal ID <%= dealId %>** using price action, volatility, and trend structure.
+Provide a concise analysis for Deal ID <%= dealId %> (<%= pairName %>) based on the structured data above. Cover:
+1. Current position status — is this deal healthy, underwater, or near target?
+2. Market conditions — what do the indicators suggest about near-term direction?
+3. Scenario comparison — use the following values verbatim in your response:
+   - Scenario 1 (Hold): <%= scenario1.estimatedDays %> days, closes <%= scenario1.closingDate %>
+<% if (canAddFunds) { %>   - Scenario 2 (Add Funds): $<%= fmt(addedAmount, 2) %> required, <%= scenario2.estimatedDays %> days, closes <%= scenario2.closingDate %>
+<% } %>   Which scenario looks more favorable given current conditions, and why?
+4. Any notable risks (safety orders running low, overbought/oversold RSI, weak market score, etc.)
 
-- Market conditions are assessed as **<%= contextLabel.toLowerCase() %>**
-- Estimates dynamically adjust for volatility and trend strength
-- Scenario 2 reduces recovery time at the cost of increased exposure
-- Time estimates are **probabilistic**, not guarantees
-
-This analysis is designed to support decision-making — not predict outcomes.
-
-Show a full analysis with bullet points for both scenarios, including the note whether OHCLV and indicators were used or not at the top, along with summary and describe it as a trading analysis report in simple terms with deal ID <%= dealId %> mentioned at the top. Do not show each order history.
+Keep the tone factual and brief. This is a DCA strategy where patience is the default — the goal is to identify the best path to profit, not to exit. End with a single clear recommendation: **Hold** or **Add Funds**.

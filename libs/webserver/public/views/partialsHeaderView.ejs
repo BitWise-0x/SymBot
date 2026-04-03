@@ -178,6 +178,8 @@
 
 			getPriceBTC();
 		}
+
+
 	});
 
 
@@ -206,14 +208,12 @@
 
 		if (mode != undefined && mode != null && mode == 'dark') {
 
-			$('#mode').html('&#127769;');
-			$('#mode').css('font-size', '1.4rem');
+			$('#mode').html('<span class="icon icon-moon" style="width:17px;height:17px;"></span>');
 			$('body').attr('data-theme', 'dark');
 		}
 		else {
 
-			$('#mode').html('&#9788;');
-			$('#mode').css('font-size', '1.7rem');
+			$('#mode').html('<span class="icon icon-sun" style="width:17px;height:17px;"></span>');
 			$('body').removeAttr('data-theme');
 		}
 
@@ -247,6 +247,37 @@
 					success: function(response) {
 						
 						$('#' + divId).html(response);
+
+						// Inject pop-out button into dialog titlebar (desktop only)
+						const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+						if (!isTouchDevice) {
+
+							const $titlebar = $('#' + divId).closest('.ui-dialog-content').siblings('.ui-dialog-titlebar');
+
+							const $aiContainer = $('#' + divId).find('.aiChatContainer');
+							if ($titlebar.length && $aiContainer.length && !$titlebar.find('.ai-popout-btn').length) {
+
+								const $popoutBtn = $('<span class="ai-popout-btn" title="Pop out chat"><span class="ui-icon ui-icon-newwin" style="display:inline-block;"></span></span>');
+
+								$popoutBtn.on('click', function() {
+
+									const room = $('#' + divId).find('.aiChatContainer').data('room');
+
+									if (!room) return;
+
+									const wsPath = encodeURIComponent('<%- appData.web_socket_path %>');
+									const bp = encodeURIComponent(basePath);
+									const titleText = $titlebar.find('.ui-dialog-title').text().trim();
+									const url = basePath + 'api/ai/chat/popout?room=' + encodeURIComponent(room) + '&bp=' + bp + '&wsp=' + wsPath + '&title=' + encodeURIComponent(titleText);
+
+									window.open(url, 'aiChatPopout_' + room, 'width=480,height=700,resizable=yes,scrollbars=no');
+
+									modalTracker[modalId].dialog('close');
+								});
+
+								$titlebar.prepend($popoutBtn);
+							}
+						}
 					}
 		});
 	}
@@ -668,10 +699,14 @@
 				}
 			},
 			close: function (event, ui) {
+
+				// Remove pop-out button so it doesn't persist into other modals
+				$(this).closest('.ui-dialog-content').siblings('.ui-dialog-titlebar').find('.ai-popout-btn').remove();
 			}
 		});
 
 		$(divModal).dialog('open');
+
 	}
 
 
@@ -874,7 +909,7 @@
 
 		let url = `./api/tradingview?jquery=${jquery}&script=${script}&exchange=${exchange}&pair=${pair.replace(/[^a-z0-9]/gi, "_")}`;
 
-		openModal(modalId, `#${divId}`, `<span id="tradingViewSettings">&#9881;</span> TradingView Chart ${pair}`, "Loading...");
+		openModal(modalId, `#${divId}`, `<span id="tradingViewSettings" style="display:inline-flex;align-items:center;vertical-align:middle;margin-right:6px;cursor:pointer;"><span class="ui-icon ui-icon-gear" style="display:inline-block;"></span></span>TradingView Chart ${pair}`, "Loading...");
 
 		$("#" + divId).load(url);
 	}
@@ -989,9 +1024,9 @@
 	</div>
 
 	<div class="headerButtons">
-		<div id="mode" class="modeButton"></div>
-		<div id="aiChat" class="modeButton">&#128172;</div>
-		<div id="notifications" class="notificationButton">&#128276;</div>
+		<div id="mode" class="headerIconBtn modeButton"></div>
+		<div id="aiChat" class="headerIconBtn modeButton"<% if (typeof isHub !== 'undefined' && isHub) { %> style="display:none"<% } %>><span class="icon icon-chat" style="width:17px;height:17px;"></span></div>
+		<div id="notifications" class="headerIconBtn notificationButton"><span class="icon icon-bell" style="width:17px;height:17px;"></span><span class="notif-dot"></span></div>
 	</div>
 </div>
 

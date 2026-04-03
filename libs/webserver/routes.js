@@ -575,6 +575,124 @@ function initRoutes(router, upload) {
 	});
 
 
+	router.get('/api/exchanges', (req, res) => {
+
+		res.set('Cache-Control', 'no-store');
+
+		if (req.session.loggedIn || validApiKey(req)) {
+
+			try {
+
+				const ccxt = require('ccxt');
+				const exchanges = ccxt.exchanges;
+				res.send({ success: true, data: exchanges });
+			}
+			catch (e) {
+
+				res.send({ success: false, data: e.message });
+			}
+		}
+		else {
+
+			res.redirect('/login');
+		}
+	});
+
+
+	router.get('/api/bot-config', (req, res) => {
+
+		res.set('Cache-Control', 'no-store');
+
+		if (req.session.loggedIn || validApiKey(req)) {
+
+			shareData.Common.getBotConfig(req, res);
+		}
+		else {
+
+			res.redirect('/login');
+		}
+	});
+
+
+	router.post('/api/bot-config', (req, res) => {
+
+		res.set('Cache-Control', 'no-store');
+
+		if (req.session.loggedIn) {
+
+			shareData.Common.updateBotConfig(req, res);
+		}
+		else {
+
+			res.redirect('/login');
+		}
+	});
+
+
+	router.post('/api/bot-config/sandbox', (req, res) => {
+
+		res.set('Cache-Control', 'no-store');
+
+		if (req.session.loggedIn) {
+
+			shareData.Common.updateBotConfigSandbox(req, res);
+		}
+		else {
+
+			res.redirect('/login');
+		}
+	});
+
+
+	router.get('/api/ai/chat/history', (req, res) => {
+
+		res.set('Cache-Control', 'no-store');
+
+		if (req.session.loggedIn || validApiKey(req)) {
+
+			const room = req.query.room;
+
+			if (!room) {
+
+				return res.status(400).json({ success: false, error: 'room required' });
+			}
+
+			const messages = shareData.AIClient.getChatHistory(room);
+
+			res.status(200).json({ success: true, messages });
+		}
+		else {
+
+			res.redirect('/login');
+		}
+	});
+
+
+	router.get('/api/ai/chat/popout', (req, res) => {
+
+		res.set('Cache-Control', 'no-store');
+
+		if (req.session.loggedIn || validApiKey(req)) {
+
+			// Redirect mobile browsers to main app — popout requires desktop
+			const ua = req.headers['user-agent'] || '';
+			const isMobile = /Mobile|Android|iPhone|iPad/i.test(ua);
+
+			if (isMobile) {
+
+				res.redirect('/');
+				return;
+			}
+
+			res.render('aiChatPopoutView', { 'appData': shareData.appData, 'query': req.query });
+		}
+		else {
+
+			res.redirect('/login');
+		}
+	});
+
+
 	router.all('*wildcard', (req, res) => {
 
 		redirectNotFound(res);
@@ -729,9 +847,9 @@ async function processWebHook(req, res, next) {
 }
 
 
-async function processWebSocketApi(client, data) {
+async function processWebSocketApi(client, data, inflightMap) {
 
-	routesWebSocket.api(client, data);
+	routesWebSocket.api(client, data, inflightMap);
 }
 
 

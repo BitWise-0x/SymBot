@@ -1965,6 +1965,214 @@ async function validateAppVersion() {
 
 
 
+async function getBotConfig(req, res) {
+
+	let success = false;
+	let data;
+
+	const botConfigFile = shareData.appData.bot_config;
+	const botConfig = await getConfig(botConfigFile);
+
+	if (!botConfig.success) {
+
+		data = 'Unable to read bot configuration file: ' + botConfigFile;
+	}
+	else {
+
+		const cfg = botConfig.data;
+
+		// Translate stored exchange name through the canonical alias map in DCABot
+		// so the UI always sees the current name (e.g. coinbasepro -> coinbaseexchange).
+		// Never send actual credential values to the browser — send boolean flags instead.
+		const exchangeCanonical = await shareData.DCABot.getExchangeAlias(cfg.exchange || '');
+
+		data = {
+			exchange:      exchangeCanonical,
+			apiKey:        !!cfg.apiKey,
+			apiSecret:     !!cfg.apiSecret,
+			apiPassphrase: !!cfg.apiPassphrase,
+			apiPassword:   !!cfg.apiPassword,
+			sandBox:       cfg.sandBox === true,
+			sandBoxWallet: cfg.sandBoxWallet || 0,
+			exchangeFee:   cfg.exchangeFee   || 0,
+		};
+
+		success = true;
+	}
+
+	res.send({ success, data });
+}
+
+
+async function updateBotConfig(req, res) {
+
+	let success = false;
+	let dataMessage;
+
+	const body = req.body;
+	const password = body.password;
+
+	const dataPass = shareData.appData.password.split(':');
+	const passwordOk = await verifyPasswordHash({ salt: dataPass[0], hash: dataPass[1], data: password });
+
+	if (!passwordOk) {
+
+		dataMessage = 'Password incorrect';
+	}
+	else {
+
+		const botConfigFile = shareData.appData.bot_config;
+		const botConfig = await getConfig(botConfigFile);
+
+		if (!botConfig.success) {
+
+			dataMessage = 'Unable to read bot configuration file: ' + botConfigFile;
+		}
+		else {
+
+			const cfg = botConfig.data;
+
+			// Exchange name
+			if (body.exchange && body.exchange.trim() !== '') {
+
+				cfg.exchange = body.exchange.trim().toLowerCase();
+			}
+
+			// Credentials — three possible states per field:
+			//   clear flag = '1' → explicitly erase the stored value
+			//   new value entered → update with the new value
+			//   blank with no clear flag → leave existing value untouched
+			const credFields = ['apiKey', 'apiSecret', 'apiPassphrase', 'apiPassword'];
+
+			for (const field of credFields) {
+
+				if (body[field + '_clear'] === '1') {
+
+					cfg[field] = '';
+				}
+				else if (body[field] && body[field].trim() !== '') {
+
+					cfg[field] = body[field].trim();
+				}
+			}
+
+			const sandBoxWallet = parseFloat(body.sandBoxWallet);
+			if (!isNaN(sandBoxWallet) && sandBoxWallet >= 0) cfg.sandBoxWallet = sandBoxWallet;
+
+			const exchangeFee = parseFloat(body.exchangeFee);
+			if (!isNaN(exchangeFee) && exchangeFee >= 0) cfg.exchangeFee = exchangeFee;
+
+			// sandBox toggle is handled separately via /api/bot-config/sandbox
+			// to enforce the confirmation step — do not allow it via this route.
+
+			// Validate the exchange name and credentials.
+			// If credentials are present, attempt fetchBalance to confirm they are accepted.
+			// If no credentials are set, just verify the exchange name is recognised.
+			try {
+
+				const testCfg = {
+					exchange:      cfg.exchange,
+					apiKey:        cfg.apiKey        || '',
+					apiSecret:     cfg.apiSecret     || '',
+					apiPassphrase: cfg.apiPassphrase || '',
+					apiPassword:   cfg.apiPassword   || '',
+				};
+
+				const exchange = await shareData.DCABot.connectExchange(testCfg);
+
+				if (!exchange) {
+
+					dataMessage = 'Could not connect to exchange. Please verify the exchange name.';
+				}
+				else {
+
+					const hasCredentials = cfg.apiKey || cfg.apiSecret;
+
+					if (hasCredentials) {
+
+						// Credentials provided — validate them with a balance fetch
+						await exchange.fetchBalance();
+					}
+
+					// Flush the exchange connection cache so the new credentials take effect
+					if (shareData.appData.exchanges) shareData.appData.exchanges = {};
+
+					const saveResult = await saveConfig(botConfigFile, cfg);
+
+					if (!saveResult.success) {
+
+						dataMessage = 'Failed to save bot configuration: ' + saveResult.data;
+					}
+					else {
+
+						dataMessage = 'Exchange configuration updated successfully';
+						success = true;
+					}
+				}
+			}
+			catch (e) {
+
+				dataMessage = 'Exchange validation failed: ' + e.message;
+			}
+		}
+	}
+
+	res.send({ success, data: dataMessage });
+}
+
+
+async function updateBotConfigSandbox(req, res) {
+
+	let success = false;
+	let dataMessage;
+
+	const body = req.body;
+	const password = body.password;
+	const sandBox = body.sandBox === 'true' || body.sandBox === true;
+
+	const dataPass = shareData.appData.password.split(':');
+	const passwordOk = await verifyPasswordHash({ salt: dataPass[0], hash: dataPass[1], data: password });
+
+	if (!passwordOk) {
+
+		dataMessage = 'Password incorrect';
+	}
+	else {
+
+		const botConfigFile = shareData.appData.bot_config;
+		const botConfig = await getConfig(botConfigFile);
+
+		if (!botConfig.success) {
+
+			dataMessage = 'Unable to read bot configuration file: ' + botConfigFile;
+		}
+		else {
+
+			const cfg = botConfig.data;
+			cfg.sandBox = sandBox;
+
+			const saveResult = await saveConfig(botConfigFile, cfg);
+
+			if (!saveResult.success) {
+
+				dataMessage = 'Failed to save bot configuration: ' + saveResult.data;
+			}
+			else {
+
+				// Flush exchange connection cache
+				if (shareData.appData.exchanges) shareData.appData.exchanges = {};
+
+				const modeLabel = sandBox ? 'Sandbox (paper trading)' : 'Live trading';
+				dataMessage = 'Trading mode changed to: ' + modeLabel;
+				success = true;
+			}
+		}
+	}
+
+	res.send({ success, data: dataMessage });
+}
+
+
 module.exports = {
 
 	delay,
@@ -2018,6 +2226,9 @@ module.exports = {
 	startSignals,
 	sendSocketMsg,
 	sendParentMsg,
+	getBotConfig,
+	updateBotConfig,
+	updateBotConfigSandbox,
 
 	init: function(obj) {
 

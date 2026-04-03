@@ -120,7 +120,7 @@
 	function populateDeals(deals) {
 
 		let totalProfit = 0;
-		let profitTotalColor = '#1a9f00';
+		let profitTotalClass = 'profit-positive';
 
 		let contentArr = [];
 
@@ -128,7 +128,7 @@
 
 		for (let i = 0; i < deals.length; i++) {
 
-			let profitPercColor = '#1a9f00';
+			let profitPercClass = 'profit-positive';
 
 			let deal = deals[i];
 			let dealId = deal['deal_id'];
@@ -141,7 +141,7 @@
 
 			if (profitPerc <= 0) {
 
-				profitPercColor = '#d82715';
+				profitPercClass = 'profit-negative';
 			}
 
 			contentArr.push('<tr data-dealid="' + dealId + '">');
@@ -150,9 +150,9 @@
 			contentArr.push('<td>' + deal['deal_id'] + '</td>');
 			contentArr.push('<td>' + deal['pair'] + '</td>');
 			contentArr.push('<td>' + duration + '</td>');
-			contentArr.push('<td style="color: ' + profitPercColor + '">$' + profit + '</td>');
-			contentArr.push('<td style="color: ' + profitPercColor + '">' + profitBase + '</td>');
-			contentArr.push('<td style="color: ' + profitPercColor + '">' + profitPerc + '%</td>');
+			contentArr.push('<td class="' + profitPercClass + '">$' + profit + '</td>');
+			contentArr.push('<td class="' + profitPercClass + '">' + profitBase + '</td>');
+			contentArr.push('<td class="' + profitPercClass + '">' + profitPerc + '%</td>');
 			contentArr.push('<td>' + deal['safety_orders'] + '</td>');
 			contentArr.push('</tr>');
 
@@ -183,13 +183,13 @@
 
 		if (totalProfit <= 0) {
 
-			profitTotalColor = '#d82715';
+			profitTotalClass = 'profit-negative';
 		}
 
 		$('#botsDeals tbody').empty();
 		$('#botsDeals tbody').append(contentArr.join(''));
 
-		$('#totalProfit').css('color', profitTotalColor);
+		$('#totalProfit').removeClass('profit-positive profit-negative').addClass(profitTotalClass);
 		$('#totalProfit').html('$' + totalProfit.toFixed(2));
 		$('#totalDeals').html(deals.length);
 
@@ -352,7 +352,7 @@
 				<b class="contentHeader">DCA Bot Deals History</b>
 
 				<span class="viewSettings">
-					<span id="csvDownload">&#8659;</span>
+					<span id="csvDownload" class="viewIconBtn"><span class="icon icon-download" style="width:13px;height:13px;"></span></span>
 				</span>
 
 				<span style="display: flex; justify-content: center; font-size: 1.2rem; gap: 20px; margin-top: 10px; margin-bottom: 0;">

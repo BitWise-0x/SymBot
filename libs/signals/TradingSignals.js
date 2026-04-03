@@ -202,13 +202,18 @@ const computeMarketIndicators = (ohlcv, config = {}) => {
 	const marketContextScore = computeMarketContextScore(modules);
 
 	let trendMultiplier = 1;
-	if (marketContextScore >= 70) trendMultiplier = 1.35;
-	else if (marketContextScore >= 60) trendMultiplier = 1.2;
-	else if (marketContextScore <= 40) trendMultiplier = 0.85;
-	else if (marketContextScore <= 30) trendMultiplier = 0.7;
+	if (marketContextScore >= 70) trendMultiplier = 1.6;
+	else if (marketContextScore >= 60) trendMultiplier = 1.3;
+	else if (marketContextScore <= 40) trendMultiplier = 0.75;
+	else if (marketContextScore <= 30) trendMultiplier = 0.5;
 
+	// Compressed volatility: market is coiling, progress will be slower
+	// Expanded volatility: market is already moving, progress will be faster
 	if (modules.volatility?.signals.volatilityState === 'compressed') {
 		trendMultiplier *= 0.9;
+	}
+	else if (modules.volatility?.signals.volatilityState === 'expanded') {
+		trendMultiplier *= 1.15;
 	}
 
 	/* --- Confidence Warnings --- */

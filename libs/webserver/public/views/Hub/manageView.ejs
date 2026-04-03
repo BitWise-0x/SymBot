@@ -594,14 +594,7 @@
 
 			$('#botDealSelectorShow').click(function() {
 
-				if ($('.botDealSelectorWrapper').is(':visible')) {
-
-					$('.botDealSelectorWrapper').fadeOut(300);
-				}
-				else {
-
-					$('.botDealSelectorWrapper').fadeIn(300);
-				}
+				$('.botDealSelectorWrapper').toggleClass('is-visible');
 			});
 
 			// Handle inline editing of fields
@@ -979,9 +972,11 @@
 		
 			<div id="contentBox" style="width: 90%; margin: 20px auto;">
 				<!-- Header -->
-				<div class="contentHeaderBox">
-					<span id="botDealSelectorShow">&#9881;</span>
+				<div class="contentHeaderBox" style="position: relative;">
 					<b id="headerText" class="contentHeader">Hub Instance Manager</b>
+					<span class="viewSettings">
+						<span id="botDealSelectorShow" class="viewIconBtn"><span class="icon icon-columns" style="width:13px;height:13px;"></span></span>
+					</span>
 				</div>
 				<!-- Add New Instance Form -->
 				<div class="hub-add-instance-form" style="text-align: left; width: 100%; max-width: 600px; margin: 20px 0;">
@@ -1131,11 +1126,11 @@
 										</td>
 										<td nowrap>
 											<span id="loginButton" style="display: inline-block; margin-right: 5px;">
-												<button class="hub-primary-btn">➥</button>
+												<button class="hub-primary-btn" style="display:flex;align-items:center;justify-content:center;"><span class="icon icon-login" style="width:13px;height:13px;"></span></button>
 											</span>
 
 											<span id="restartButton" style="display: inline-block; margin-right: 5px;">
-												<button class="hub-stop-btn" id="restartInstance" data-instanceid="<%= config.id %>">⟳</button>
+												<button class="hub-stop-btn" id="restartInstance" data-instanceid="<%= config.id %>" style="display:flex;align-items:center;justify-content:center;"><span class="icon icon-restart" style="width:13px;height:13px;"></span></button>
 											</span>
 											
 											<span style="display: inline-block; margin-right: 5px;">

@@ -23,6 +23,7 @@ SymBot is a user friendly, self-hosted and automated DCA (Dollar Cost Averaging)
 - [Advanced Setup](#advanced-setup)
 - [Reverse Proxy Setup](#reverse-proxy-setup)
 - [Artificial Intelligence (AI)](#artificial-intelligence-ai)
+  - [AI Chat](#ai-chat)
 - [API Information](#api-information)
 - [API Sample Usage](#api-sample-usage)
 - [WebSocket API](#websocket-api)
@@ -242,8 +243,14 @@ mongodb://localhost:27017/SymBot
 
 - **bot.json**
 
-	- This contains all default settings for your bot and exchange. Depending on your exchange, the API credentials you enter here usually include some of the following such as your exchange API key, secret, passphrase, or password. For testing purposes, often you can leave all of them empty but always leave `sandBox: true`.
-	- Valid exchanges include binance, binanceus, coinbase, and many others. SymBot uses the [CCXT](https://github.com/ccxt/ccxt)  library so if the exchange is supported, you should be able to connect to it
+	- This contains all default settings for your bot and exchange. Exchange credentials and trading mode can be managed directly from the web interface under **Configuration → Exchange**, so you do not need to edit this file manually. For a fresh install you can leave all credential fields empty and keep `sandBox: true` until you are ready to trade live.
+	- **Exchange settings via the web interface** — navigate to **Configuration → Exchange** to:
+		- Select your exchange from a full list of supported exchanges
+		- Enter or update your API Key, Secret, Passphrase, and Password (credentials are write-only and never displayed once saved)
+		- Set the exchange fee percentage
+		- Set the sandbox wallet balance used for paper trading
+		- Toggle between **Sandbox (paper trading)** and **Live trading** modes — switching modes requires password confirmation to prevent accidental changes
+	- Valid exchanges include binance, binanceus, coinbase, and many others. SymBot uses the [CCXT](https://github.com/ccxt/ccxt) library so if the exchange is supported, you should be able to connect to it. When saving exchange settings the credentials are validated against the exchange before being written to disk.
 	- Most bot settings do not need to be set here since they can be set when creating a bot in the web interface
 	- Set your exchange fee appropriately:
 		- The `exchangeFee` is used for multiple purposes including buying more of an asset to ensure accurate profitability when selling, and having enough additional quantity of the asset to sell. If you encounter sell errors, such as insufficient funds, you may want to increase this value even higher than your exchange's said fees. You may end up with slightly more assets or crypto "dust", but it will help prevent sell errors especially when trading the asset through repeated deals. Changing this value will only take affect on new deals.
@@ -560,6 +567,27 @@ The `ai` section of `config/app.json` stores all provider settings:
 - `provider` is set automatically by the **Active Provider** dropdown and determines which provider SymBot starts on launch. Valid values are `ollama`, `openai`, or `none`.
 - Only one provider can have `enabled` set to `true` at a time. The configuration screen enforces this automatically.
 - Changes to AI settings take effect immediately after saving — no restart required.
+
+---
+
+### AI Chat
+
+SymBot includes a built-in AI chat interface accessible from the header bar. Click the chat bubble icon to open a conversation window where you can ask questions, get trading advice, or continue a deal analysis in a free-form conversation. The AI retains the full conversation context for the duration of the session (up to 25 messages, with messages older than 2 hours automatically cleared).
+
+#### Analyzing a Deal
+
+The AI chat can also be opened in context from the Active Deals view. Click the bolt (⚡) icon on any deal row to open an AI analysis for that specific deal. The analysis includes current position status, market conditions, scenario comparisons, and a recommendation. You can then continue the conversation with follow-up questions in the same window.
+
+#### Pop-out Chat Window
+
+On desktop, an additional pop-out button appears in the top-left corner of the chat window title bar. Clicking it opens the current conversation in a separate browser window, which can be moved to a second monitor or resized independently while you continue navigating the main SymBot interface.
+
+- The full conversation history is preserved in the pop-out window — the AI retains all prior context
+- The pop-out connects to the same session room, so responses stream in exactly as they would in the modal
+- The pop-out respects the current light/dark theme and includes its own theme toggle
+- On mobile the pop-out button is hidden — the modal is used instead
+- Multiple pop-out windows can be open simultaneously, each maintaining its own independent conversation
+
 
 ## API Information
 
@@ -1069,17 +1097,71 @@ WebSocket APIs use the same parameters as the REST APIs, so the same requests ca
 
 WebSockets are useful when you want a continuous, live connection to the server. After connecting once, updates can be sent automatically in real time, instead of the client having to make repeated requests. This is especially helpful for live deal activity, market data, and notifications, and can be more efficient than using REST alone.
 
-Before using the WebSocket APIs, the application must first connect using your SymBot API key and register itself by emitting the `register_client` command. Only after successful registration can the client access the available APIs.
+### Registration
 
-Currently available WebSocket APIs are:
+Before using the WebSocket APIs, the application must first connect using your SymBot API key and register itself by emitting the `register_client` event. The server will acknowledge successful registration via a callback. Only after successful registration can the client send `api_action` events.
 
-- `deals`    
-- `markets`
-- `markets/ohlcv`
-
-Below is a simple Node.js example demonstrating how to connect to the server and use the WebSocket APIs.
-
+```js
+socket.emit("register_client", { appId }, (ack) => {
+  if (ack?.success) {
+    console.log("Registered — ready to use WebSocket APIs");
+  }
+});
 ```
+
+### Rate Limiting
+
+Each connected client is limited to **5 concurrent in-flight requests**. If a client sends more requests than this before previous ones have completed, the excess requests will be rejected immediately with an error response. This prevents a single client from overloading the server or exchange APIs.
+
+### Timeouts
+
+Each API request has a **15-second timeout**. If the server or exchange does not respond within this window, the request is rejected and an error is returned to the client. The client does not need to implement its own timeout.
+
+### Error Handling
+
+Every `api_action` is guaranteed a response — both successful results and errors use the same response structure. Always check the `error` field before using the `message` field.
+
+```js
+socket.on("data", (msg) => {
+  if (msg.type === "api") {
+    if (msg.error) {
+      console.error("API error:", msg.error);
+    } else {
+      console.log("Result:", msg.message);
+    }
+  }
+});
+```
+
+### Response Structure
+
+| Field | Description |
+|-------|-------------|
+| `type` | Always `"api"` for API responses |
+| `api` | The API name that was requested |
+| `app_id` | The `appId` sent by the client |
+| `message_id` | A unique server-generated ID for this response |
+| `message_id_client` | The `id` sent by the client in `meta`, for correlating responses to requests |
+| `message` | The result data, or `null` if an error occurred |
+| `error` | Error message string, or `null` if the request succeeded |
+
+### Available APIs
+
+| API | Description | Parameters |
+|-----|-------------|------------|
+| `deals` | Returns all active deals | — |
+| `deals/show` | Returns details for a single deal | `dealId` (string, required) |
+| `deals/completed` | Returns completed deals | `from` (string, optional), `to` (string, optional), `timeZoneOffset` (string, optional), `botId` (string, optional) |
+| `bots` | Returns all bots | `active` (boolean, optional) |
+| `balances` | Returns account balances for all configured exchanges | — |
+| `markets` | Returns market ticker data | `exchange` (string, required), `pair` (string, optional) |
+| `markets/ohlcv` | Returns OHLCV candle data | `exchange` (string, required), `pair` (string, required), `timeframe` (string, optional), `since` (integer, optional), `limit` (integer, optional) |
+
+### Example
+
+Below is a complete Node.js example demonstrating how to connect, register, and use the WebSocket APIs with proper error handling.
+
+```js
 const { io } = require("socket.io-client");
 const crypto = require("crypto");
 
@@ -1103,21 +1185,35 @@ const socket = io(host, {
 });
 
 socket.on("connect", () => {
-  socket.emit("register_client", { appId });
-  socket.emit("joinRooms", { rooms: ["logs", "notifications"] });
 
-  socket.emit("api_action", {
-    meta: {
-      id: crypto.randomUUID(),
-      appId,
-      api: "deals"
+  // Register before sending any api_action events.
+  // Wait for the acknowledgement before proceeding.
+  socket.emit("register_client", { appId }, (ack) => {
+
+    if (!ack?.success) {
+      console.error("Registration failed");
+      return;
     }
+
+    socket.emit("joinRooms", { rooms: ["logs", "notifications"] });
+
+    socket.emit("api_action", {
+      meta: {
+        id: crypto.randomUUID(),
+        appId,
+        api: "deals"
+      }
+    });
   });
 });
 
 socket.on("data", (msg) => {
   if (msg.type === "api") {
-    console.log(msg);
+    if (msg.error) {
+      console.error("API error [" + msg.api + "]:", msg.error);
+    } else {
+      console.log("API result [" + msg.api + "]:", msg.message);
+    }
   }
 });
 ```

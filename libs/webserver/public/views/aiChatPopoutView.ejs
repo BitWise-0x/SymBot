@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content" />
+	<title><%- appData.name %> AI Chat</title>
+
+	<%
+		// Render base href server-side so the HTML parser sees it before resolving
+		// any relative asset paths — JS-injected base tags fire too late.
+		const basePath = (query && query.bp) ? decodeURIComponent(query.bp) : '/';
+	%>
+	<base href="<%- basePath %>">
+
+	<link rel="stylesheet" href="css/style.css" />
+	<link href="https://fonts.googleapis.com/css?family=Heebo:400,600,300" rel="stylesheet" type="text/css">
+</head>
+
+<body class="popout-body">
+
+<div id="popoutHeader">
+	<span id="popoutTitle">AI Chat</span>
+	<div id="popoutHeaderBtns">
+		<div id="popoutMode" title="Toggle theme"></div>
+	</div>
+</div>
+
+<div id="aiChatSpinner" class="spinner-dynamic-container" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); display: none; z-index: 999;"><div class="spinner-dynamic"></div></div>
+
+<div class="aiChatContainer" id="popoutChatContainer">
+	<div id="aiChatBox"></div>
+</div>
+<div id="chatInputContainer">
+	<textarea id="chatInput" placeholder="Type your message here..." autocomplete="off" rows="1" style="resize:none;overflow:hidden;"></textarea>
+	<button id="chatSendButton">Send</button>
+</div>
+
+
+<script src="js/vendor/jquery/jquery.min.js"></script>
+<script src="js/vendor/marked/marked.min.js"></script>
+
+<script>
+
+	(function() {
+
+		const params    = new URLSearchParams(window.location.search);
+		const room      = params.get('room')  || '';
+		const basePath  = params.get('bp')    || '/';
+		const wsPath    = params.get('wsp')   || 'ws';
+		const chatTitle = params.get('title') || 'AI Chat';
+
+		$('#popoutTitle').text(chatTitle);
+		document.title = chatTitle;
+
+		// ── Theme ────────────────────────────────────────────────────────────
+
+		function applyMode(mode) {
+
+			if (mode === 'dark') {
+
+				document.body.setAttribute('data-theme', 'dark');
+				$('#popoutMode').html('<span class="icon icon-moon" style="width:15px;height:15px;"></span>');
+			}
+			else {
+
+				document.body.removeAttribute('data-theme');
+				$('#popoutMode').html('<span class="icon icon-sun" style="width:15px;height:15px;"></span>');
+			}
+		}
+
+		function getMode() {
+
+			try {
+
+				const dt = JSON.parse(localStorage.getItem('dataTracker'));
+				return dt && dt.mode ? dt.mode : 'light';
+			}
+			catch(e) {
+
+				return 'light';
+			}
+		}
+
+		function toggleMode() {
+
+			const current = getMode();
+			const next = current === 'dark' ? 'light' : 'dark';
+
+			try {
+
+				const dt = JSON.parse(localStorage.getItem('dataTracker')) || {};
+				dt.mode = next;
+				localStorage.setItem('dataTracker', JSON.stringify(dt));
+			}
+			catch(e) {}
+
+			applyMode(next);
+		}
+
+		// Sync theme when main app toggles it
+		window.addEventListener('storage', function(e) {
+
+			if (e.key === 'dataTracker') {
+
+				applyMode(getMode());
+			}
+		});
+
+		// ── Chat state ───────────────────────────────────────────────────────
+
+		let $currentMessageElement = null;
+		let messageBuffer = '';
+		let canSendMessage = false;
+		let socket;
+
+		const $chatBox    = $('#aiChatBox');
+		const $spinner    = $('#aiChatSpinner');
+		const $input      = $('#chatInput');
+		const $sendBtn    = $('#chatSendButton');
+
+		function toggleInputState(disable) {
+
+			$input.prop('disabled', disable);
+			$sendBtn.prop('disabled', disable);
+		}
+
+		function scrollToBottom() {
+
+			$chatBox.scrollTop($chatBox.prop('scrollHeight'));
+		}
+
+		function displayMessage(content) {
+
+			if (content === 'END_OF_CHAT') {
+
+				if ($currentMessageElement) {
+
+					messageBuffer = '';
+					$currentMessageElement = null;
+				}
+
+				canSendMessage = true;
+				toggleInputState(false);
+				$input[0].focus();
+			}
+			else {
+
+				if (!$currentMessageElement) {
+
+					$currentMessageElement = $('<div>', { class: 'message bot-message' });
+					$chatBox.append($currentMessageElement);
+				}
+
+				messageBuffer += content;
+				$currentMessageElement.html(marked.parse(messageBuffer, { breaks: true }));
+			}
+
+			scrollToBottom();
+		}
+
+		function renderHistory(messages) {
+
+			// Skip the first user message if it's long — it's a prompt template, not chat
+			const firstUserIdx = messages.findIndex(function(m) { return m.role === 'user'; });
+
+			messages.forEach(function(msg, idx) {
+
+				if (msg.role === 'user') {
+
+					// Hide first user message only if it looks like a prompt (> 200 chars)
+					if (idx === firstUserIdx && msg.content.length > 200) return;
+
+					$chatBox.append($('<div>', { class: 'message user-message', text: msg.content }));
+				}
+				else if (msg.role === 'assistant') {
+
+					const $msg = $('<div>', { class: 'message bot-message' });
+					$msg.html(marked.parse(msg.content, { breaks: true }));
+					$chatBox.append($msg);
+				}
+			});
+
+			scrollToBottom();
+		}
+
+		function postChatPrompt(userMessage) {
+
+			$spinner.show();
+			toggleInputState(true);
+
+			const payload = {
+				message: {
+					room: room,
+					content: userMessage
+				}
+			};
+
+			$.ajax({
+				type: 'POST',
+				url: basePath + 'api/ai/chat/prompt',
+				data: payload,
+				dataType: 'json',
+				error: function(data) {
+
+					$spinner.hide();
+					toggleInputState(false);
+					alert('Error sending message: ' + JSON.stringify(data));
+				}
+			});
+		}
+
+		function sendMessage() {
+
+			const userMessage = $input.val().trim();
+
+			if (!canSendMessage || !userMessage) return;
+
+			canSendMessage = false;
+
+			$chatBox.append($('<div>', { class: 'message user-message', text: userMessage }));
+			$input.val('');
+
+			postChatPrompt(userMessage);
+			scrollToBottom();
+		}
+
+		// ── Socket.IO ────────────────────────────────────────────────────────
+
+		function connectSocket() {
+
+			// Socket.IO client is served by the SymBot server itself
+			$.getScript(basePath + wsPath + '/socket.io.min.js', function() {
+
+				socket = io('/', {
+					path: basePath + wsPath,
+					transports: ['websocket', 'polling'],
+					reconnection: true,
+					reconnectionDelay: 10000
+				});
+
+				socket.on('connect', function() {
+
+					socket.emit('joinRooms', { rooms: [room] });
+				});
+
+				socket.on('data', function(data) {
+
+					if (data.type === 'message' && data.message) {
+
+						if (messageBuffer === '') {
+
+							$spinner.hide();
+						}
+
+						displayMessage(data.message);
+					}
+				});
+
+				socket.on('connect_error', function() {});
+				socket.on('disconnect', function() {});
+			});
+		}
+
+		// ── Load history then connect ─────────────────────────────────────
+
+		$(document).ready(function() {
+
+			// Apply theme immediately
+			applyMode(getMode());
+
+			if (!room) {
+
+				$spinner.hide();
+				$chatBox.html('<div style="padding:20px;color:var(--table-content-color);">No chat room specified.</div>');
+				return;
+			}
+
+			toggleInputState(true);
+
+			// Fetch conversation history from server
+			$.ajax({
+				type: 'GET',
+				url: basePath + 'api/ai/chat/history',
+				data: { room: room },
+				dataType: 'json',
+				success: function(data) {
+
+					$spinner.hide();
+
+					if (data.success && data.messages && data.messages.length > 0) {
+
+						renderHistory(data.messages);
+					}
+					else {
+
+						$chatBox.append($('<div>', {
+							class: 'message bot-message',
+							text: 'Conversation history could not be loaded. The session may have expired.'
+						}));
+					}
+
+					// Connect to socket after history is rendered
+					connectSocket();
+
+					canSendMessage = true;
+					toggleInputState(false);
+				},
+				error: function(xhr, status, err) {
+
+					$spinner.hide();
+					$chatBox.append($('<div>', {
+						class: 'message bot-message',
+						text: 'Could not connect to chat session.'
+					}));
+					canSendMessage = true;
+					toggleInputState(false);
+				}
+			});
+
+			// Event handlers
+			$('#popoutMode').on('click', toggleMode);
+
+
+			$sendBtn.on('click', sendMessage);
+
+			$input.on('keydown', function(e) {
+
+				if (e.which === 13 && !e.shiftKey && canSendMessage) {
+
+					e.preventDefault();
+					sendMessage();
+				}
+			});
+
+			// Firefox mobile: re-focus input on tap to ensure keyboard input registers
+			$input[0].addEventListener('touchend', function(e) {
+
+				e.stopPropagation();
+				setTimeout(function() { $input[0].focus(); }, 50);
+			}, { passive: true });
+
+			// Prevent container scroll from stealing touch events from input
+			document.getElementById('chatInputContainer').addEventListener('touchstart', function(e) {
+
+				e.stopPropagation();
+			}, { passive: true });
+
+			// Resize layout when mobile keyboard opens/closes
+			if (window.visualViewport) {
+
+				window.visualViewport.addEventListener('resize', function() {
+
+					document.body.style.height = window.visualViewport.height + 'px';
+					$('#chatInput')[0].scrollIntoView({ block: 'nearest' });
+				});
+			}
+
+			// Leave room on close
+			window.addEventListener('beforeunload', function() {
+
+				if (socket) {
+
+					socket.emit('leaveRoom', room);
+				}
+			});
+		});
+
+	})();
+
+</script>
+
+</body>
+</html>

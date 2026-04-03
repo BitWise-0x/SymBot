@@ -680,8 +680,6 @@ async function start(dataObj, startId) {
 
 	// Refresh bot config in case any settings changed
 
-	const isPairBlackListed = await Common.pairBlackListed(pair);
-
 	try {
 
 		const bot = await getBots({ 'botId': botIdMain });
@@ -751,43 +749,46 @@ async function start(dataObj, startId) {
 	// Check for any resuming deals before continuing
 	await processResumeDealTracker({ 'deal_id': dealIdMain });
 
-	// Check if this bot exceeds global pair limit
-	let globalPairLimitExceeded = await checkGlobalPairLimit(pairBotsDealsMax, pair);
+	// Get active deals for limit checks
+	const pairDealsActive = await getDeals({ 'botId': botIdMain, 'pair': pair, 'status': 0 });
+	const botDealsActive  = await getDeals({ 'botId': botIdMain, 'status': 0 });
+	const pairCount       = botDealsActive.length;
 
-	// Get total active same pairs currently running on bot
-	let pairDealsActive = await getDeals({ 'botId': botIdMain, 'pair': pair, 'status': 0 });
-
+	// pairDealsLast — too many deals on this pair already
 	if (pairDealsMax > 1 && pairDealsActive.length >= pairDealsMax) {
 
 		pairDealsLast = true;
 	}
 
-	// Get total active pairs currently running on bot
-	let botDealsActive = await getDeals({ 'botId': botIdMain, 'status': 0 });
-
-	let pairCount = botDealsActive.length;
-
-	// Check if last deal flag is set
-	let botDealCurrent = await getDeals({ 'botId': botIdMain, 'dealId': dealIdMain });
+	// dealLast — this deal was flagged as the last one for the pair
+	const botDealCurrent = await getDeals({ 'botId': botIdMain, 'dealId': dealIdMain });
 
 	if (botDealCurrent && botDealCurrent.length > 0) {
 
-		for (let i = 0; i < botDealCurrent.length; i++) {
+		for (const deal of botDealCurrent) {
 
-			let deal = botDealCurrent[i];
-
-			let dealId = deal['dealId'];		
-			let config = deal['config'];
-
-			if (config['dealLast']) {
+			if (deal['config']['dealLast']) {
 
 				dealLast = true;
 			}
 		}
 	}
 
-	// Start another bot deal if max deals, max pairs have not been reached, and pair is not blacklisted
-	if (!globalPairLimitExceeded && !isPairBlackListed && !pairDealsLast && !dealStop && botFoundDb && botActive && !dealLast && (pairCount < pairMax || pairMax == 0)) {
+	// Centralised permission check — blacklist, globalPairLimit, pairMax
+	// dealsActive is passed as [] because dcaFollow handles pairDealsLast separately above
+	// and the pair's current deal is already closed (status:1) before this point
+	// Guard: only call canStartDeal when bot is active and config is available
+	const { allowed: canStart } = (botFoundDb && botActive && botConfigDb)
+		? await canStartDeal({
+			pair,
+			config: botConfigDb,
+			pairCount,
+			dealsActive: []
+		})
+		: { allowed: false, reason: '' };
+
+	// Start another bot deal if all conditions are met
+	if (canStart && !pairDealsLast && !dealStop && botFoundDb && botActive && !dealLast) {
 
 		let configObj = JSON.parse(JSON.stringify(config));
 
@@ -1948,6 +1949,71 @@ const filterPrice = async (exchange, pair, price) => {
 
 		return false;
 	}
+};
+
+
+
+// Centralised start-permission check.
+// Runs only the checks specified in the `checks` object and returns
+// { allowed: bool, reason: string } so every callsite has one place
+// to consult for limit logic.
+//
+// Normalisation (pairMax / pairDealsMax → 0 when blank/null/undefined)
+// is always applied regardless of which checks are requested.
+//
+// checks:
+//   blacklist        – pair must not be on the blacklist
+//   pairMax          – active pairs on this bot must be below pairMax
+//   pairDealsMax     – active deals for this pair must be below pairDealsMax
+//   globalPairLimit  – same pair across all bots must be below pairBotsDealsMax
+//   dealsActiveZero  – no active deals for this pair (asap / enable / update paths)
+//
+const canStartDeal = async ({ pair, config, pairCount = 0, dealsActive = [] }) => {
+
+	const pairMax          = Number(config.pairMax)          || 0;
+	const pairDealsMax     = Number(config.pairDealsMax)     || 0;
+	const pairBotsDealsMax = Number(config.pairBotsDealsMax) || 0;
+
+	let allowed = true;
+	let reason  = '';
+
+	const isPairBlackListed        = await Common.pairBlackListed(pair);
+	const globalPairLimitExceeded  = await checkGlobalPairLimit(pairBotsDealsMax, pair);
+
+	if (isPairBlackListed) {
+
+		allowed = false;
+		reason  = 'Pair is blacklisted';
+	}
+	else if (globalPairLimitExceeded) {
+
+		allowed = false;
+		reason  = `${pair} global max of ${pairBotsDealsMax} deals already running across all bots`;
+	}
+	else if (pairMax > 0 && pairCount >= pairMax) {
+
+		allowed = false;
+		reason  = 'Bot max ' + pairMax + ' pairs reached';
+	}
+	else if (dealsActive.length > 0) {
+
+		// Per-pair deals max check:
+		// - If pairDealsMax > 1: block when that limit is reached
+		// - If pairDealsMax <= 1 (default): block if any active deal exists for this pair
+		//   (only enforced when dealsActive is explicitly passed — dcaFollow passes [] to skip this)
+		if (pairDealsMax > 1 && dealsActive.length >= pairDealsMax) {
+
+			allowed = false;
+			reason  = pair + ' pair max ' + pairDealsMax + ' deals already running';
+		}
+		else if (pairDealsMax <= 1) {
+
+			allowed = false;
+			reason  = pair + ' already has an active deal';
+		}
+	}
+
+	return { allowed, reason };
 };
 
 
@@ -5351,49 +5417,37 @@ async function createDeal(pair, pairMax, dealCount, dealMax, config, orders) {
 
 async function startVerify(config, startId) {
 
-	// Verify bot is still enabled / active
+	// Re-verify start conditions at execution time — config may have changed
+	// while this start was queued or delayed.
 
-	const pair = config.pair;
-	const botId = config.botId;
+	const pair      = config.pair;
+	const botId     = config.botId;
 	const dealCount = config.dealCount;
 
-	if (botId != undefined && botId != null && botId != '') {
+	if (botId == undefined || botId == null || botId == '') return;
 
-		// Reload bot config from db in case any changes were made
-		const bot = await getBots({ 'botId': botId });
+	const bot = await getBots({ 'botId': botId });
 
-		if (bot && bot.length > 0) {
+	if (!bot || bot.length === 0 || !bot[0].active) return;
 
-			if (bot[0].active) {
+	const botConfigDb    = bot[0].config;
+	const botDealsActive = await getDeals({ 'botId': botId, 'status': 0 });
+	const pairCount      = botDealsActive.length;
 
-				// Get total active pairs currently running on bot
-				let botDealsActive = await getDeals({ 'botId': botId, 'status': 0 });
+	const { allowed } = await canStartDeal({
+		pair,
+		config: botConfigDb,
+		pairCount,
+		dealsActive: [] // startVerify only gates on pairMax + globalPairLimit
+	});
 
-				let pairCount = botDealsActive.length;
+	if (allowed) {
 
-				let botConfigDb = bot[0].config;
+		botConfigDb['pair']      = pair;
+		botConfigDb['botId']     = botId;
+		botConfigDb['dealCount'] = dealCount;
 
-				let pairMax = botConfigDb.pairMax;
-				let pairBotsDealsMax = botConfigDb.pairBotsDealsMax;
-
-				if (pairMax == undefined || pairMax == null || pairMax == '') {
-
-					pairMax = 0;
-				}
-
-				// Check if this bot exceeds global pair limit
-				let globalPairLimitExceeded = await checkGlobalPairLimit(pairBotsDealsMax, pair);
-
-				if (!globalPairLimitExceeded && (pairMax == 0 || pairCount < pairMax)) {
-
-					botConfigDb['pair'] = pair;
-					botConfigDb['botId'] = botId;
-					botConfigDb['dealCount'] = dealCount;
-
-					start({ 'create': true, 'config': botConfigDb }, startId);
-				}
-			}
-		}
+		start({ 'create': true, 'config': botConfigDb }, startId);
 	}
 }
 
@@ -5406,68 +5460,47 @@ async function startAsap(pairIgnore) {
 	// Start any active asap bots that have no deals running
 	const botsActive = await getBots({ 'active': true, 'config.startConditions': { '$eq': 'asap' } });
 
-	if (botsActive && botsActive.length > 0) {
+	if (!botsActive || botsActive.length === 0) return;
 
-		let count = 0;
+	let count = 0;
 
-		for (let i = 0; i < botsActive.length; i++) {
+	for (let i = 0; i < botsActive.length; i++) {
 
-			let bot = botsActive[i];
+		const bot     = botsActive[i];
+		const botId   = bot.botId;
+		const botName = bot.botName;
 
-			let config = bot['config'];
+		let config = bot['config'];
+		const pairs = config.pair;
 
-			let botId = bot.botId;
-			let botName = bot.botName;
+		// Get total active pairs on this bot once per bot (incremented locally as starts are queued)
+		const botDealsActive = await getDeals({ 'botId': botId, 'status': 0 });
+		let pairCount = botDealsActive.length;
 
-			let pairs = config.pair;
-			let pairMax = config.pairMax;
-			let pairBotsDealsMax = config.pairBotsDealsMax;
+		for (let x = 0; x < pairs.length; x++) {
 
-			if (pairMax == undefined || pairMax == null || pairMax == '') {
+			const pair = pairs[x];
 
-				pairMax = 0;
-			}
+			if (pairIgnore && pair.toUpperCase() === pairIgnore.toUpperCase()) continue;
 
-			// Get total active pairs currently running on bot
-			let botDealsActive = await getDeals({ 'botId': botId, 'status': 0 });
+			const dealsActive = await getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
 
-			let pairCount = botDealsActive.length;
+			config['pair'] = pair;
+			config = await applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
 
-			for (let x = 0; x < pairs.length; x++) {
+			const { allowed } = await canStartDeal({
+				pair,
+				config,
+				pairCount,
+				dealsActive
+			});
 
-				let pair = pairs[x];
+			if (allowed) {
 
-				if (pairIgnore != undefined && pairIgnore != null && pairIgnore != '') {
+				startDelay({ 'config': config, 'delay': count + 1, 'notify': false });
 
-					if (pair.toUpperCase() == pairIgnore.toUpperCase()) {
-
-						continue;
-					}
-				}
-
-				// Check if this bot exceeds global pair limit
-				let globalPairLimitExceeded = await checkGlobalPairLimit(pairBotsDealsMax, pair);
-
-				let dealsActive = await getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
-
-				config['pair'] = pair;
-				config = await applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
-
-				// Start bot if active, no deals are currently running and start condition is now asap
-				if (!globalPairLimitExceeded && dealsActive && dealsActive.length == 0) {
-
-					if (pairMax == 0 || pairCount < pairMax) {
-
-						startDelay({ 'config': config, 'delay': count + 1, 'notify': false });
-
-						count++;
-						pairCount++;
-					}
-					else {
-
-						//Common.logger('Bot max pairs of ' + pairMax + ' reached');
-					}
-				}
+				count++;
+				pairCount++;
 			}
 		}
 	}
@@ -6360,6 +6393,7 @@ module.exports = {
 	getSymbolsAll,
 	getBalanceTracker,
 	checkGlobalPairLimit,
+	canStartDeal,
 	applyConfigData,
 	startDelay,
 	resumeDeal,
@@ -6369,6 +6403,7 @@ module.exports = {
 	calculateMaxFunds,
 	removeDbKeys,
 	convertDataToSandBox,
+	getExchangeAlias,
 
 	init: function(obj) {
 
