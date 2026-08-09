@@ -1,5 +1,8 @@
 <script>
 
+let socketGlobal;
+const removeNotifsSec = 12;
+
 function removeNotificationDisplay(id) {
 
 	$('#' + id).fadeOut(1000, function() {
@@ -8,11 +11,24 @@ function removeNotificationDisplay(id) {
 	});
 }
 
+
 $(document).ready(function() {
 
 	const maxRows = 10;
-	const removeSec = 12;
+	const room = 'notifications';
 	const modalNotifyId = '#modalNotifications';
+
+	let wsTranports = ['websocket', 'polling'];
+
+	const webSocketPath = basePath + '<%- appData['web_socket_path'] %>';
+
+	let wslastPart = webSocketPath.split('/').pop();
+
+	if (wslastPart !== 'ws') {
+
+		// Use polling only to avoid potential WebSocket conflicts for instances
+		// wsTranports = wsTranports.filter(transport => transport !== 'websocket');
+	}
 
 	try {
 
@@ -24,25 +40,32 @@ $(document).ready(function() {
 			$('.notificationButton').addClass('notificationButtonAlert');
 		}
 	}
-	catch(e) {
+	catch (e) {
 
 	}
 
 	const socket = io('/', {
 
 		query: {
-			'room': 'notifications'
+			'room': room
 		},
 		extraHeaders: {
 			'user-agent': '<%- appData.name %>/<%- appData.version %>'
 		},
-		transports: ['websocket', 'polling'],
-		path: '/ws',
+		transports: wsTranports,
+		path: webSocketPath,
 		reconnection: true,
 		reconnectionDelay: 10000
 	});
 
-	socket.on('connect', (data) => {});
+	socketGlobal = socket;
+
+	socket.on('connect', (data) => {
+
+		socket.emit('joinRooms', {
+			rooms: [room]
+		});
+	});
 
 	socket.on('connect_error', (data) => {});
 
@@ -67,7 +90,7 @@ $(document).ready(function() {
 
 			for (let i = 0; i < dataArr.length; i++) {
 
-				let msg = dataArr[i]['message'];
+				let msg = (dataArr[i]['message'] || '').replace(/\n/g, '<br>');
 				let typeMsg = dataArr[i]['type'];
 				let dateMsg = dataArr[i]['date'];
 
@@ -93,38 +116,9 @@ $(document).ready(function() {
 
 	socket.on('data', (data) => {
 
-		let id = 'notifs-' + Math.random().toString(36).slice(2, 10) + Math.floor(1000 + Math.random() * 9000);
+		if (data.type === 'notification') {
 
-		let msg = '<div id="' + id + '" class="notificationsRow">' + data + '</div>';
-
-		if (dataTracker['notifications'] == undefined || dataTracker['notifications'] == null) {
-
-			dataTracker['notifications'] = {};
-		}
-
-		dataTracker['notifications']['date'] = new Date();
-		dataTracker['notifications']['alert'] = true;
-
-		updateDataTracker();
-
-		$('.notificationButton').addClass('notificationButtonAlert');
-
-		$('#notificationsBox').append(msg);
-
-		$('#' + id).hide();
-		$('#' + id).fadeIn(500);
-
-		let currentRows = $('.notificationsRow').length;
-
-		setTimeout(() => {
-
-			removeNotificationDisplay(id);
-
-		}, (removeSec * 1000));
-
-		if (currentRows > maxRows) {
-
-			//$('.notificationsRow').slice((maxRows - currentRows)).remove();
+			processNotificationData(data.message);
 		}
 	});
 
@@ -133,6 +127,20 @@ $(document).ready(function() {
 		let id = $(this).attr('id');
 
 		removeNotificationDisplay(id);
+	});
+
+	$(document).on('change', '#hideNotifs', function() {
+
+		if ($('#hideNotifs').prop('checked')) {
+
+			dataTracker['hideNotifs'] = true;
+		}
+		else {
+
+			delete dataTracker['hideNotifs'];
+		}
+
+		updateDataTracker();
 	});
 
 	$(document).on('change', '#notificationsList', function() {
@@ -167,24 +175,79 @@ $(document).ready(function() {
 
 				showModal = false;
 			}
-		}
-		catch (e) {
+		} catch (e) {
 
 			showModal = true;
 		}
 
 		if (showModal) {
 
-			let titleExtra = '<span style="padding-left: 10px;"><select id="notificationsList"><option value="">Show All</select></span>';
+			let titleExtra = '<span style="padding-left: 10px;">';
+
+			titleExtra += '<select id="notificationsList"><option value="">Show All</select>';
+			titleExtra += ' &nbsp; <b>Hide</b> <input id="hideNotifs" name="hideNotifs" type=checkbox class="form-field">';
+
+			titleExtra += '</span>';
 
 			let content = '<div class="spinner-dynamic-container"><div class="spinner-dynamic"></div></div>';
 
 			openModal('notificationsView', modalNotifyId, 'Notification Center History ' + titleExtra, content);
 
+			$('#hideNotifs').simpleSwitch();
+			$('#hideNotifs').prop('checked', false);
+
+			if (dataTracker['hideNotifs']) {
+
+				$('#hideNotifs').click();
+			}
+
 			socket.emit('notifications_history', {});
 		}
 	});
-
 });
+
+
+function processNotificationData(data) {
+
+	let id = 'notifs-' + Math.random().toString(36).slice(2, 10) + Math.floor(1000 + Math.random() * 9000);
+
+	let msg = '<div id="' + id + '" class="notificationsRow">' + (data || '').replace(/\n/g, '<br>') + '</div>';
+
+	if (dataTracker['notifications'] == undefined || dataTracker['notifications'] == null) {
+
+		dataTracker['notifications'] = {};
+	}
+
+	dataTracker['notifications']['date'] = new Date();
+	dataTracker['notifications']['alert'] = true;
+
+	updateDataTracker();
+
+	$('.notificationButton').addClass('notificationButtonAlert');
+
+	// Don't display if notifications are hidden
+	if (dataTracker['hideNotifs']) {
+
+		return;
+	}
+
+	$('#notificationsBox').append(msg);
+
+	$('#' + id).hide();
+	$('#' + id).fadeIn(500);
+
+	let currentRows = $('.notificationsRow').length;
+
+	setTimeout(() => {
+
+		removeNotificationDisplay(id);
+
+	}, (removeNotifsSec * 1000));
+
+	if (currentRows > maxRows) {
+
+		//$('.notificationsRow').slice((maxRows - currentRows)).remove();
+	}
+}
 
 </script>

@@ -17,6 +17,42 @@
 					"token_id": "",
 					"notify_user_id": ""
 				},
+	"cron_backup": {
+					"enabled": false,
+					"include_chats": true,
+					"schedule": "",
+					"password": "",
+					"max": "",
+					"sftp": {
+								"host": "",
+								"port": 22,
+								"username": "",
+								"password": "",
+								"private_key": "",
+								"passphrase": "",
+								"remote_directory": "",
+								"enabled": false
+							}
+	},
+   "circuit_breaker": {
+        "enabled": true,
+        "deal_ratio_threshold": 0.5,
+        "deal_ratio_window_secs": 30,
+        "price_drop_percent": 5.0,
+        "price_drop_window_secs": 60,
+        "pause_duration_secs": 60,
+        "repeat_alert_window_secs": 3600,
+        "price_zero_alert_count": 4,
+		"price_drop_enabled": true
+    },
+	"security": {
+    	"login_throttle": {
+        "max_failures": 5,
+        "window_ms": 900000,
+        "block_ms": 900000,
+        "max_tracked_ips": 5000
+    	}
+	},
 	"bots": {
 				"start_conditions": {
 										"asap": {
@@ -28,7 +64,7 @@
 									},
 				"exchange": {
 								"default": {
-											"account_balance_currencies": [ "USDT", "USD" ],
+											"account_balance_currencies": [ "USDC", "USDT", "USD" ],
 											"orders": {
 														"buy": {
 																"slippage_percent": 0
@@ -40,7 +76,7 @@
 											}
 				},
 				"pair_buttons": [ "USD", "USDT", "USDC", "BUSD" ],
-				"pair_blacklist": [ "BTC/*", "WBTC/*", "ETH/*", "CBETH/*", "UST/*", "USD/*", "USDC/*", "USDD/*", "USDT/*", "BUSD/*", "GUSD/*", "TUSD/*", "PYUSD/*", "DAI/*", "EURC/*", "EUROC/*", "PAX/*" ]
+				"pair_blacklist": [ "BTC/*", "WBTC/*", "ETH/*", "CBETH/*", "UST/*", "USD/*", "USD1/*", "USDC/*", "USDD/*", "USDS/*", "USDT/*", "BUSD/*", "GUSD/*", "TUSD/*", "PYUSD/*", "DAI/*", "EURC/*", "EUROC/*", "PAX/*" ]
 			},
 	"signals": {
 				 	"3CQS": {
@@ -48,5 +84,32 @@
 					 			"api_key": ""
 				 			}
 			   },
+	"ai": {
+				"ollama": {
+					"enabled": false,
+					"host": "",
+					"api_key": "",
+					"model": ""
+				},
+				"openai": {
+					"enabled": false,
+					"api_key": "",
+					"model": "",
+					"base_url": ""
+        		},
+				"provider": "",
+				"max_history": 25,
+				"context_compression": {
+					"enabled": true,
+            		"threshold_chars": 80000,
+            		"protect_last_n": 10
+        		},
+				"deal_context": {
+					"enabled": false,
+					"use_router": true,
+					"router_model": "",
+					"router_timeout_ms": 12000
+				}
+			},		
 	"verbose_log": true
 }

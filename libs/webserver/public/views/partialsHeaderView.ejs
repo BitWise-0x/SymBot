@@ -13,6 +13,7 @@
 
 	<link rel="stylesheet" href="/css/vendor/jquery-ui/jquery-ui.min.css" />
 	<link rel="stylesheet" href="/css/vendor/jquery-confirm/jquery-confirm.min.css" />
+	<link rel="stylesheet" href="/css/vendor/jquery-ui-timepicker-addon/jquery-ui-timepicker-addon.min.css" />
 	<link rel="stylesheet" href="/css/vendor/select2/select2.min.css" />
 	<link rel="stylesheet" href="/css/vendor/simple-switch/simple-switch.css" />
 	<link rel="stylesheet" href="/css/vendor/tablesorter/filter.formatter.min.css" />
@@ -20,18 +21,22 @@
 
 	<link href="https://fonts.googleapis.com/css?family=Heebo:400,600,300" rel="stylesheet" type="text/css">
 
-	<script src="/js/vendor/socket.io/socket.io.min.js"></script>
+	<script src="/<%- appData.web_socket_path %>/socket.io.min.js"></script>
 	<script src="/js/vendor/jquery/jquery.min.js"></script>
 	<script src="/js/vendor/jquery-ui/jquery-ui.min.js"></script>
+	<script src="/js/vendor/jquery-ui-timepicker-addon/jquery-ui-timepicker-addon.min.js"></script>
+	<script src="/js/vendor/ejs/ejs.min.js"></script>
 	<script src="/js/vendor/jquery-confirm/jquery-confirm.min.js"></script>
 	<script src="/js/vendor/select2/select2.full.min.js"></script>
 	<script src="/js/vendor/simple-switch/jquery.simpleswitch.min.js"></script>
 
 	<script src="/js/vendor/tablesorter/jquery.tablesorter.combined.min.js"></script>
+	<script src="/js/vendor/marked/marked.min.js?v=<%- appData.version %>"></script>
 	<script src="/js/vendor/tablesorter/parsers/parser-duration.min.js"></script>
 	<script src="/js/vendor/tablesorter/parsers/parser-named-numbers.min.js"></script>
 	<script src="/js/vendor/tablesorter/widgets/widget-columnSelector.min.js"></script>
 	<script src="/js/vendor/tablesorter/widgets/widget-filter-formatter-jui.min.js"></script>
+	<script src="/js/symbot-ui.js?v=<%- appData.version %>"></script>
 
 	<script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
 
@@ -40,14 +45,35 @@
 	const maxRows = 1000;
 	const offsetBottom = -225;
 
+	let basePath;
 	let dataTracker = {};
 	let modalTracker = {};
 	let pairBTC = 'BTC/USD';
 	let exchangeBTC = 'bitstamp';
-	let buffer = []; // buffer - incoming log
-	let countdownTimer;
+
+	let isHub = <%- (typeof isHub !== 'undefined' && isHub !== '') ? isHub : false %>;
 
 	$(document).ready(function() {
+
+		basePath = setBasePath();
+
+		if (isHub) {
+
+			const hubSuperscript = $('<sup>').text('HUB').addClass('hub-superscript');
+
+			$('#divLogo').css('position', 'relative');
+
+			$('#divLogo').append(hubSuperscript);
+
+			const hideElements = [ '#btcPrice', '#aiChat', '#notifications', '#liveLogs' ];
+
+			for (let i = 0; i < hideElements.length; i++) {
+
+				let id = hideElements[i];
+
+				$(id).hide();
+			}
+		}
 
 		const modalTvId = '#modalTvSettings';
 
@@ -80,6 +106,47 @@
 			}
 		}));
 
+
+		$('#aiChat').on('click', function () {
+
+			const modalId = 'aiChatView';
+			const header = 'AI Chat';
+
+			const dialog = modalTracker?.[modalId];
+
+			if (dialog && dialog.dialog('isOpen')) {
+
+				$.confirm({
+					title: false,
+					boxWidth: '50%',
+					useBootstrap: false,
+					content:
+						'<div style="font-size: 1.2rem; text-align: left;">' +
+						'Do you want to close chat?' +
+						'</div>',
+					buttons: {
+							ok: {
+								btnClass: 'btn-default',
+								text: '<div style="color:#c62828;">Close Chat</div>',
+								action: function () {
+									dialog.dialog('close');
+								}
+							},
+							cancel: {
+								btnClass: 'btn-default',
+								text: '<div style="color:#000;">Cancel</div>',
+								action: function () {}
+							}
+					}
+				});
+
+				return;
+			}
+
+			openAiChat(modalId, 'modal', header);
+		});
+
+
 		$('#mode').on('click', function() {
 
 			let mode = dataTracker['mode'];
@@ -101,7 +168,7 @@
 
 		$('#logo').on('click', function() {
 
-			window.location.href = '/';
+			window.location.href = './';
 		});
 
 		$('#btcPrice').on('click', function() {
@@ -109,22 +176,46 @@
 			showTradingView('homeView', 'modal', false, false, pairBTC, exchangeBTC);
 		});
 
-		getPriceBTC();
+		if (!isHub) {
+
+			getPriceBTC();
+		}
+
+
 	});
+
+
+	function setBasePath() {
+
+		let basePath = '/';
+
+	    const currentUrl = window.location.href; // Get the full current URL
+
+		const url = new URL(currentUrl);
+    
+		const segments = url.pathname.split('/').filter(segment => segment);
+
+		if (segments.length >= 2 && segments[0] === 'instance') {
+
+			basePath = '/instance/' + segments[1] + '/';
+		}
+
+		$('head').append('<base href="' + url.origin + basePath + '">');
+
+		return basePath;
+	}
 
 
 	function changeMode(mode) {
 
 		if (mode != undefined && mode != null && mode == 'dark') {
 
-			$('#mode').html('&#127769;');
-			$('#mode').css('font-size', '1.4rem');
+			$('#mode').html('<span class="icon icon-moon" style="width:17px;height:17px;"></span>');
 			$('body').attr('data-theme', 'dark');
 		}
 		else {
 
-			$('#mode').html('&#9788;');
-			$('#mode').css('font-size', '1.7rem');
+			$('#mode').html('<span class="icon icon-sun" style="width:17px;height:17px;"></span>');
 			$('body').removeAttr('data-theme');
 		}
 
@@ -134,9 +225,98 @@
 	}
 
 
+	function openAiChat(modalId, divId, header, content) {
+
+		let url = './api/ai/chat/view';
+		let data;
+
+		openModal(modalId, '#' + divId, header, 'Processing...');
+
+		if (content) {
+
+			data = {
+						'message': {
+										'content': content,
+										'title': header || ''
+									}
+			};
+		}
+
+		$.ajax({
+					url: url,
+				    method: 'POST',
+					contentType: 'application/json',
+					data: JSON.stringify(data),
+					success: function(response) {
+						
+						// Use $.parseHTML to avoid synchronous script execution warning
+					// that occurs when injecting HTML containing <script> tags via .html()
+					const $target = $('#' + divId);
+					$target.empty();
+					const nodes = $.parseHTML(response, document, true);
+					const scripts = [];
+					$(nodes).each(function() {
+						if (this.nodeName === 'SCRIPT') {
+							scripts.push(this);
+						} else {
+							$target.append(this);
+						}
+					});
+					// Execute scripts after DOM is ready, outside the injection call stack
+					setTimeout(function() {
+						scripts.forEach(function(script) {
+							if (script.src) {
+								// External script — only load if not already loaded
+								if (!$('script[src="' + script.src + '"]').length) {
+									$.getScript(script.src);
+								}
+							} else {
+								// Inline script
+								$.globalEval(script.textContent);
+							}
+						});
+					}, 0);
+
+						// Inject pop-out button into dialog titlebar (desktop only)
+						const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+						if (!isTouchDevice) {
+
+							const $titlebar = $('#' + divId).closest('.ui-dialog-content').siblings('.ui-dialog-titlebar');
+
+							const $aiContainer = $('#' + divId).find('.aiChatContainer');
+							if ($titlebar.length && $aiContainer.length && !$titlebar.find('.ai-popout-btn').length) {
+
+								const $popoutBtn = $('<span class="ai-popout-btn" title="Pop out chat"><span class="ui-icon ui-icon-newwin" style="display:inline-block;"></span></span>');
+
+								$popoutBtn.on('click', function() {
+
+									const room = $('#' + divId).find('.aiChatContainer').data('room');
+
+									if (!room) return;
+
+									const wsPath = encodeURIComponent('<%- appData.web_socket_path %>');
+									const bp = encodeURIComponent(basePath);
+									const titleText = $titlebar.find('.ui-dialog-title').text().trim();
+									const convId  = $aiContainer.data('convId')  || '';
+								const dealId  = $aiContainer.data('dealId')  || '';
+								const url = basePath + 'api/ai/chat/popout?room=' + encodeURIComponent(room) + '&bp=' + bp + '&wsp=' + wsPath + '&title=' + encodeURIComponent(titleText) + (convId ? '&conv_id=' + encodeURIComponent(convId) : '') + (dealId ? '&deal_id=' + encodeURIComponent(dealId) : '');
+
+									window.open(url, 'aiChatPopout_' + room, 'width=480,height=700,resizable=yes,scrollbars=no');
+
+									modalTracker[modalId].dialog('close');
+								});
+
+								$titlebar.prepend($popoutBtn);
+							}
+						}
+					}
+		});
+	}
+
+
 	function getTradingViewData() {
 
-		fetch('/data/tradingViewData.json')
+		fetch('./data/tradingViewData.json')
 		.then(response => response.json())
 		.then(function(json) {
 
@@ -256,6 +436,91 @@
 
 			updateDataTracker();
 		});
+	}
+
+
+	function convertNotation(input, maxDecimals = null) {
+
+		let str = String(input).trim();
+
+		if (/e/i.test(str)) {
+
+			let [base, exp] = str.split('e');
+			let exponent = parseInt(exp, 10);
+			let [intPart, fracPart = ''] = base.split('.');
+
+			if (exponent < 0) {
+
+				let zeros = Math.abs(exponent) - intPart.length;
+
+				str = zeros >= 0 ?
+					'0.' + '0'.repeat(zeros) + intPart + fracPart :
+					intPart.slice(0, exponent) + '.' + intPart.slice(exponent) + fracPart;
+			}
+			else {
+
+				if (fracPart.length <= exponent) {
+
+					str = intPart + fracPart + '0'.repeat(exponent - fracPart.length);
+				}
+				else {
+
+					str = intPart + fracPart.slice(0, exponent) + '.' + fracPart.slice(exponent);
+				}
+			}
+		}
+
+		str = str.replace(/(\.\d*?[1-9])0+$/, '$1').replace(/\.0+$/, '').replace(/\.$/, '');
+
+		if (maxDecimals !== null && str.includes('.')) {
+
+			const [whole, frac] = str.split('.');
+			str = whole + '.' + frac.slice(0, maxDecimals);
+		}
+
+		return str;
+	}
+
+
+	function getTimeZone(date) {
+
+		let timeZoneOffset;
+
+		if (date == undefined || date == null) {
+
+			date = new Date();
+		}
+
+		const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+		try {
+
+			timeZoneOffset = Intl.DateTimeFormat('ia', {
+
+									timeZone: tz,
+									timeZoneName: 'longOffset'
+								})
+								.formatToParts(date)
+								.find((i) => i.type === 'timeZoneName').value
+								.slice(3);
+		}
+		catch(e) {
+
+		}
+
+		if (timeZoneOffset == undefined || timeZoneOffset == null) {
+
+			timeZoneOffset = date.getTimezoneOffset();
+
+			let sign = (timeZoneOffset < 0) ? '+' : '-';
+			let mins = Math.abs(timeZoneOffset);
+			let hours = Math.floor(mins / 60);
+			mins = mins - 60 * hours;
+
+			timeZoneOffset = sign + ('0' + hours).slice(-2) + ':' + ('0' + mins).slice(-2);
+		}
+ 
+		return ({ 'timezone': tz, 'offset': timeZoneOffset });
 	}
 
 
@@ -465,10 +730,14 @@
 				}
 			},
 			close: function (event, ui) {
+
+				// Remove pop-out button so it doesn't persist into other modals
+				$(this).closest('.ui-dialog-content').siblings('.ui-dialog-titlebar').find('.ai-popout-btn').remove();
 			}
 		});
 
 		$(divModal).dialog('open');
+
 	}
 
 
@@ -508,7 +777,7 @@
 			res = await $.ajax({
 		
 						type: 'GET',
-						url: '/api/markets',
+						url: './api/markets',
 						data: { 'exchange': exchange, 'pair': pair },
 						dataType: 'json',
 						success: function(data) {
@@ -589,8 +858,9 @@
 	}
 
 
-	function showOrderHistory(modalId, dealId, active, dealOrders) {
+	function showOrderHistory(modalId, dealId, active, dealOrders, pair) {
 
+		const orderSym = (typeof getCurrencySymbol === 'function') ? getCurrencySymbol((pair || '').split('/')[1] || 'USD') : '$';
 		let orders = JSON.parse(JSON.stringify(dealOrders)).reverse();
 		let ordersFilled = orders.filter(item => item.filled);
 
@@ -600,7 +870,7 @@
 		let table = $('<table id="ordersTable" style="width: 100%;" cellspacing=0 cellpadding=0>');
 
 		let row = $('<tr />');
-		row.append($('<th></th> <th>Date</th> <th>Price</th> <th>Qty</th> <th>Amount</th> <th>Sum(Qty)</th> <th>Sum($)</th>'));
+		row.append($('<th></th> <th>Date</th> <th>Price</th> <th>Qty</th> <th>Amount</th> <th>Sum(Qty)</th> <th>Sum</th>'));
 		table.append(row);
 
 		for (let i = orders.length - 1; i >= 0; i--) {
@@ -631,11 +901,11 @@
 
 			row.append($('<td style="' + style + '">' + count + '.</td>'));
 			row.append($('<td>' + dateFilled + '</td>'));
-			row.append($('<td>$' + data['price'] + '</td>'));
+			row.append($('<td>' + orderSym + convertNotation(data['price']) + '</td>'));
 			row.append($('<td>' + data['qty'] + '</td>'));
-			row.append($('<td>$' + data['amount'] + '</td>'));
+			row.append($('<td>' + orderSym + data['amount'] + '</td>'));
 			row.append($('<td>' + data['qtySum'] + '</td>'));
-			row.append($('<td>$' + data['sum'] + '</td>'));
+			row.append($('<td>' + orderSym + data['sum'] + '</td>'));
 
 			if (dateFilled != '') {
 
@@ -651,100 +921,124 @@
 
 	function showTradingView(modalId, divId, jquery, script, pair, exchange) {
 
-		if (exchange == undefined || exchange == null || exchange == '') {
+		if (!exchange) {
 
 			return;
 		}
 
-		exchange = exchange.toUpperCase();
+		const ccxtToTradingView = {
 
-		if (exchange.startsWith('COINBASE')) {
-			if (pair.includes('USDC')) {
-				// Replace "USDC" with "USD"
-				pair = pair.replace(/USDC/g, 'USD');
-			}
-			exchange = 'COINBASE';
+			"coinbasepro": "COINBASE",
+			"coinbaseexchange": "COINBASE",
+			"coinbaseinternational": "COINBASE",
+			"binanceus": "BINANCEUS",
+			"gate": "GATEIO",
+			"myokx": "OKX"
+		};
+
+		exchange = exchange.toLowerCase();
+
+		exchange = ccxtToTradingView[exchange] || exchange.toUpperCase();
+
+		let url = `./api/tradingview?jquery=${jquery}&script=${script}&exchange=${exchange}&pair=${pair.replace(/[^a-z0-9]/gi, "_")}`;
+
+		openModal(modalId, `#${divId}`, `<span id="tradingViewSettings" style="display:inline-flex;align-items:center;vertical-align:middle;margin-right:6px;cursor:pointer;"><span class="ui-icon ui-icon-gear" style="display:inline-block;"></span></span>TradingView Chart ${pair}`, "Loading...");
+
+		$("#" + divId).load(url);
+	}
+
+
+	function reorderProperties(obj, firstKey, secondKey) {
+
+		const propertiesArray = Object.entries(obj);
+
+		const firstIndex = propertiesArray.findIndex(([key]) => key === firstKey);
+		const secondIndex = propertiesArray.findIndex(([key]) => key === secondKey);
+
+		if (firstIndex !== -1 && secondIndex !== -1) {
+
+			// Remove the secondKey from the array
+			const [secondEntry] = propertiesArray.splice(secondIndex, 1);
+
+			// Insert the secondKey directly after the firstKey
+			const firstKeyIndex = propertiesArray.findIndex(([key]) => key === firstKey);
+			propertiesArray.splice(firstKeyIndex + 1, 0, secondEntry);
 		}
 
-		let url = '/api/tradingview?jquery=' + jquery + '&script=' + script + '&exchange=' + exchange + '&pair=' + pair.replace(/[^a-z0-9]/gi, '_');
+		// Convert the array back to an object
+		const reorderedObj = Object.fromEntries(propertiesArray);
 
-		openModal(modalId, '#' + divId, '<span id="tradingViewSettings">&#9881;</span> TradingView Chart ' + pair, 'Loading...');
-
-		$('#' + divId).load(url);
+		return reorderedObj;
 	}
 
 
-	function startCountdown(duration) {
+	function jsonToCsv(fileName, title, download, headers, jsonData) {
 
-		let remaining = duration;
+		const data = typeof jsonData !== 'object' ? JSON.parse(jsonData) : jsonData;
 
-		$('#countdown').text(`(${remaining}s)`);
+		let rowCount = 0;
+		let csvContent = '';
 
-		countdownTimer = setInterval(() => {
+		csvContent += title + '\r\n\n';
 
-			remaining--;
+		const now = new Date();
+		const dateNow = now.toISOString().split('T')[0].replace(/[^a-zA-Z0-9]/g, '');
+		const timeNow = now.toISOString().split('T')[1].split('.')[0].replace(/[^a-zA-Z0-9]/g, '');
+		const timeStamp = dateNow + '_' + timeNow;
 
-			$('#countdown').text(`(${remaining}s)`);
+		if (headers) {
+	
+			let headerRow = '';
 
-			if (remaining <= 0) {
+			for (const key in data[0]) {
 
-				clearInterval(countdownTimer);
-
-				$('#countdown').text('');
-
-				setLiveState();
+				headerRow += key + ',';
 			}
-		}, 1000);
-	}	
 
-
-	function stopCountdown() {
-
-    	clearInterval(countdownTimer);
-
-    	$('#countdown').text('');
-	}
-
-
-	function displayLog(data) {
-
-		let msg = '<div class="logRow">' + data + '</div>';
-
-		$('#dataBox').prepend(msg);
-
-		let currentRows = $('.logRow').length;
-
-		if (currentRows > maxRows) {
-
-			$('.logRow').slice(maxRows).remove(); // better suited for prepending
+			headerRow = headerRow.slice(0, -1);
+			csvContent += headerRow + '\r\n';
 		}
 
-		resizeBotsDeals(offsetBottom);
+		data.forEach(rowData => {
+
+			let row = '';
+
+			for (const key in rowData) {
+
+				row += `"${rowData[key]}",`;
+			}
+
+			row = row.slice(0, -1);
+			rowCount++;
+
+			csvContent += row + '\r\n';
+		});
+
+		if (rowCount == 0) {
+
+			alertBox('Invalid data');
+			return;
+		}
+
+		const fileUri = 'data:text/csv;charset=utf-8,%EF%BB%BF' + encodeURIComponent(csvContent);
+
+		let link = document.createElement('a');
+
+		link.href = fileUri;
+		link.style.visibility = 'hidden';
+		link.download = `${fileName}_${timeStamp}.csv`;
+
+		if (!download) {
+
+			return { 'link': link, 'csv': escape(csvContent) };
+		}
+		else {
+
+			document.body.appendChild(link);
+			link.click();
+			document.body.removeChild(link);
+		}
 	}
-
-
-	function setLiveState() {
-
-		$('#simple-switch').switchToggle(true);
-
-    	$('#dataBox').css('overflow-y', 'auto');
-
-    	$('#status-text').text('Live');
-
-    	flushBuffer();
-		
-    	stopCountdown();
-	}
-
-
-    function flushBuffer() {
-
-    	// Prepend buffered entries in order & flush
-        buffer.forEach(displayLog);
-
-        buffer = [];
-    }
-
 
 	</script>
 
@@ -758,13 +1052,14 @@
 
 	<div id="btcPrice"></div>
 
-	<div style="position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);">
+	<div id="divLogo" style="position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); display: inline-block;">
 		<img id="logo" src="/images/SymBot-Logo.png" style="width: auto; height: 55px; vertical-align: middle;" />
 	</div>
 
 	<div class="headerButtons">
-		<div id="mode" class="modeButton"></div>
-		<div id="notifications" class="notificationButton">&#128276;</div>
+		<div id="mode" class="headerIconBtn modeButton"></div>
+		<div id="aiChat" class="headerIconBtn modeButton"<% if (typeof isHub !== 'undefined' && isHub) { %> style="display:none"<% } %>><span class="icon icon-chat" style="width:17px;height:17px;"></span></div>
+		<div id="notifications" class="headerIconBtn notificationButton"><span class="icon icon-bell" style="width:17px;height:17px;"></span><span class="notif-dot"></span></div>
 	</div>
 </div>
 

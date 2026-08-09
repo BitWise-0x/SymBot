@@ -1,20 +1,21 @@
 'use strict';
 
-const fs = require('fs');
+const fs   = require('fs');
+const fsp  = require('fs').promises;
 const path = require('path');
+const os   = require('os');
+const multer = require('multer');
 
-let pathRoot = path.dirname(fs.realpathSync(__dirname)).split(path.sep).join(path.posix.sep);
-pathRoot = pathRoot.substring(0, pathRoot.lastIndexOf('/'));
+const pathRoot = path.resolve(__dirname, ...Array(2).fill('..'));
 
 const crypto = require('crypto');
 const Convert = require('ansi-to-html');
 const fetch = require('node-fetch-commonjs');
-const { v4: uuidv4 } = require('uuid');
 const packageJson = require(pathRoot + '/package.json');
 
 const convertAnsi = new Convert();
 
-const logNotifications = pathRoot + '/logs/services/notifications/notifications.log';
+const logNotifications = pathRoot + '/logs/services/notifications/notifications{INSTANCE_NAME}.log';
 
 let shareData;
 
@@ -44,13 +45,22 @@ async function getConfig(fileName) {
 }
 
 
-async function saveConfig(fileName, data) {
+async function saveConfig(fileName, data, updated) {
 
 	let err;
 	let success = false;
 
+	if ((updated == undefined || updated == null || updated == '') && updated !== false) {
+
+		updated = true;
+	}
+
 	try {
-		data.updated = new Date().toISOString();
+
+		if (updated) {
+
+			data.updated = new Date().toISOString();
+		}
 
 		fs.writeFileSync(
 			pathRoot + '/config/' + fileName,
@@ -73,14 +83,94 @@ async function updateConfig(req, res) {
 
 	const body = req.body;
 	const sessionId = req.session.id;
+	const mongodburl = body.mongodburl;
 	const password = body.password;
 	const passwordNew = body.passwordnew;
 	const apiKey = body.apikey;
-	const telegram = body.telegram;
+
+	const telegram = body.telegram_enabled;
+	const telegramTokenId = body.telegram_token_id;
+	const telegramUserId = body.telegram_user_id;
+
+	const signals3CQS = body.signals_3cqs_enabled;
+	const signals3CQSApiKey = body.signals_3cqs_api_key;
+
+	const ollamaHost = body.ollama_host;
+	const ollamaApiKey = body.ollama_api_key;
+	const ollamaModel = body.ollama_model;
+
+	const openaiApiKey = body.openai_api_key;
+	const openaiModel = body.openai_model;
+	const openaiBaseUrl = body.openai_base_url;
+
+	const aiProviderSelected = body.ai_provider;
+
+	const cronBackup = body.cron_backup_enabled;
+	const cronBackupSchedule = body.cron_backup_schedule;
+	const cronBackupPassword = body.cron_backup_password;
+	const cronBackupMax = Number(body.cron_backup_max ?? 1) || 1;
+	const cronBackupIncludeChats = convertBoolean(body.cron_backup_include_chats, true);
+
+	const ctxCompEnabled    = convertBoolean(body.ctx_compression_enabled, true);
+	const ctxCompThreshold  = parseInt(body.ctx_compression_threshold) || 80000;
+	const ctxCompProtectN   = parseInt(body.ctx_compression_protect_n)  || 10;
+
+	const dealCtxEnabled    = convertBoolean(body.deal_context_enabled, false);
+	const dealCtxUseRouter  = convertBoolean(body.deal_context_use_router, true);
+	const dealCtxModel      = typeof body.deal_context_router_model === 'string' ? body.deal_context_router_model.trim() : '';
+	const dealCtxTimeout    = Math.min(Math.max(parseInt(body.deal_context_router_timeout_ms) || 12000, 1000), 60000);
+
+	const cbEnabled        = convertBoolean(body.cb_enabled, true);
+
+
+	const cbDealRatio      = Math.min(Math.max(parseFloat(body.cb_deal_ratio_threshold)   || 0.5,  0.1), 1.0);
+	const cbDealWindow     = Math.min(Math.max(parseInt(body.cb_deal_ratio_window_secs)   || 30,   5),   300);
+	const cbPriceDrop      = Math.min(Math.max(parseFloat(body.cb_price_drop_percent)     || 5.0,  0.5), 50.0);
+	const cbPriceWindow    = Math.min(Math.max(parseInt(body.cb_price_drop_window_secs)   || 60,   10),  600);
+	const cbPriceDropEnabled = convertBoolean(body.cb_price_drop_enabled, true);
+	const cbPauseDuration  = Math.min(Math.max(parseInt(body.cb_pause_duration_secs)      || 60,   10),  600);
+	const cbRepeatWindow   = Math.min(Math.max(parseInt(body.cb_repeat_alert_window_secs) || 3600, 60),  86400);
+	const cbPriceZeroAlert = Math.min(Math.max(parseInt(body.cb_price_zero_alert_count)   || 4,    2),   20);
+
+	const sftp = body.sftp_enabled;
+ 	const sftpHost = body.sftp_host;
+	const sftpPort = Number(body.sftp_port ?? 22) || 22;
+	const sftpUsername = body.sftp_username;
+	const sftpPassword = body.sftp_password;
+	const sftpPrivateKeyInput = body.sftp_private_key;
+	const sftpPrivateKeyClear = body.sftp_private_key_clear;
+	const sftpPassphrase = body.sftp_passphrase;
+	const sftpRemoteDirectory = body.sftp_remote_directory;
 
 	let pairButtons = body.pairbuttons;
 	let pairBlacklist = body.pairblacklist;
-	let telegramEnabled = false;
+
+	let sftpEnabled = convertBoolean(sftp, false);
+	let telegramEnabled = convertBoolean(telegram, false);
+	let signals3CQSEnabled = convertBoolean(signals3CQS, false);
+	let cronBackupEnabled = convertBoolean(cronBackup, false);
+
+	// Provider dropdown is the single source of truth for which AI provider is active
+	const aiProvider = (aiProviderSelected === 'openai' || aiProviderSelected === 'ollama') ? aiProviderSelected : 'none';
+	const ollamaEnabled = aiProvider === 'ollama';
+	const openaiEnabled = aiProvider === 'openai';
+
+	let dbErr;
+	let sftpPasswordFinal;
+	let sftpPassphraseFinal;
+	let sftpPrivateKeyFinal;
+	let cronBackupPasswordFinal;
+	let hubInstance = false;
+	let dataMessage = 'Configuration Updated';
+
+	const instanceName = await getInstanceName();
+
+	if (instanceName && instanceName.trim() !== '') {
+
+		hubInstance = true;
+	}
+
+	const appConfigFile = shareData.appData.app_config;
 
 	if (pairButtons == undefined || pairButtons == null || pairButtons == '') {
 
@@ -109,15 +199,58 @@ async function updateConfig(req, res) {
 
 	if (success) {
 
-		let data = await getConfig('app.json');
+		let disconnectClients = false;
+
+		let data = await getConfig(appConfigFile);
 
 		let appConfig = data.data;
 
 		if (passwordNew != undefined && passwordNew != null && passwordNew != '') {
 
+			disconnectClients = true;
+
 			const dataPassNew = await genPasswordHash({ 'data': passwordNew });
 
 			const passwordHashed = dataPassNew['salt'] + ':' + dataPassNew['hash'];
+
+			// Re-encrypt all existing SFTP secrets under the new password before
+			// updating shareData.appData.password. The old password hash is still
+			// in shareData.appData.password at this point — that is the same key
+			// material used when the secrets were originally stored. The new hash
+			// (passwordHashed) is what decrypt/encrypt will use going forward.
+			const secretsToReEncrypt = [
+				{ key: ['cron_backup', 'password'] },
+				{ key: ['cron_backup', 'sftp', 'password'] },
+				{ key: ['cron_backup', 'sftp', 'passphrase'] },
+				{ key: ['cron_backup', 'sftp', 'private_key'] },
+			];
+
+			const oldPasswordKey = shareData.appData.password;
+
+			for (const secret of secretsToReEncrypt) {
+
+				const encryptedValue = secret.key.reduce((obj, k) => obj?.[k], appConfig);
+
+				if (encryptedValue) {
+
+					// Decrypt with the current (old) password hash
+					const decObj = await shareData.System.decrypt(encryptedValue, oldPasswordKey);
+
+					if (decObj.success) {
+
+						// Re-encrypt with the new password hash
+						const reEncObj = await shareData.System.encrypt(decObj.data, passwordHashed);
+
+						if (reEncObj.success) {
+
+							// Write re-encrypted value back into appConfig
+							const keys = secret.key;
+							const target = keys.slice(0, -1).reduce((obj, k) => obj[k], appConfig);
+							target[keys[keys.length - 1]] = reEncObj.data;
+						}
+					}
+				}
+			}
 
 			appConfig['password'] = passwordHashed;
 			shareData['appData']['password'] = passwordHashed;
@@ -131,6 +264,8 @@ async function updateConfig(req, res) {
 
 		if (apiKey != undefined && apiKey != null && apiKey != '') {
 
+			disconnectClients = true;
+
 			const apiKeyHashed = await genApiKey(apiKey);
 
 			appConfig['api']['key'] = apiKeyHashed;
@@ -140,10 +275,63 @@ async function updateConfig(req, res) {
 			await setToken();
 		}
 
-		if (telegram != undefined && telegram != null && telegram != '') {
+		if (disconnectClients) {
 
-			telegramEnabled = true;
+			await shareData.WebServer.disconnectAllClients();
 		}
+
+		if (sftpPassword) {
+
+			const sftpPasswordEncObj = await shareData.System.encrypt(sftpPassword, shareData.appData.password);
+
+			if (sftpPasswordEncObj.success) {
+
+				sftpPasswordFinal = sftpPasswordEncObj.data;
+			}
+		}
+		else {
+
+			sftpPasswordFinal = '';
+		}
+
+		if (sftpPassphrase) {
+
+			const sftpPassphraseEncObj = await shareData.System.encrypt(sftpPassphrase, shareData.appData.password);
+
+			if (sftpPassphraseEncObj.success) {
+
+				sftpPassphraseFinal = sftpPassphraseEncObj.data;
+			}
+		}
+		else {
+
+			sftpPassphraseFinal = '';
+		}
+
+		if (sftpPrivateKeyInput) {
+
+			// Encrypt the pasted private key content and store the encrypted blob.
+			// If the field was submitted empty the existing encrypted value in
+			// appConfig is preserved below — the key is never cleared by accident.
+			const sftpPrivateKeyEncObj = await shareData.System.encrypt(sftpPrivateKeyInput, shareData.appData.password);
+
+			if (sftpPrivateKeyEncObj.success) {
+
+				sftpPrivateKeyFinal = sftpPrivateKeyEncObj.data;
+			}
+		}
+		// If sftpPrivateKeyInput is empty, sftpPrivateKeyFinal stays undefined
+		// and the appConfig write below preserves the existing encrypted value.
+
+		const cronBackupPasswordEncObj = await shareData.System.encrypt(cronBackupPassword, shareData.appData.password);
+
+		if (cronBackupPasswordEncObj.success) {
+
+			cronBackupPasswordFinal = cronBackupPasswordEncObj.data;
+		}
+
+		const telegramEnabledOrig = shareData['appData']['telegram_enabled'];
+		const signals3CQSEnabledOrig = shareData['appData']['signals_3cqs_enabled'];
 
 		appConfig['bots']['pair_buttons'] = pairButtonsUC;
 		shareData['appData']['bots']['pair_buttons'] = pairButtonsUC;
@@ -151,12 +339,236 @@ async function updateConfig(req, res) {
 		appConfig['bots']['pair_blacklist'] = pairBlacklistUC;
 		shareData['appData']['bots']['pair_blacklist'] = pairBlacklistUC;
 
+		appConfig['signals']['3CQS']['api_key'] = signals3CQSApiKey;
+		appConfig['signals']['3CQS']['enabled'] = signals3CQSEnabled;
+		shareData['appData']['signals_3cqs_enabled'] = signals3CQSEnabled;
+
 		appConfig['telegram']['enabled'] = telegramEnabled;
+		appConfig['telegram']['token_id'] = telegramTokenId;
+		appConfig['telegram']['notify_user_id'] = telegramUserId;
+
+		appConfig['cron_backup']['enabled'] = cronBackupEnabled;
+		appConfig['cron_backup']['schedule'] = cronBackupSchedule;
+		appConfig['cron_backup']['password'] = cronBackupPasswordFinal;
+		appConfig['cron_backup']['max'] = cronBackupMax;
+		appConfig['cron_backup']['include_chats'] = cronBackupIncludeChats;
+
+		if (!appConfig['circuit_breaker']) appConfig['circuit_breaker'] = {};
+		appConfig['circuit_breaker']['enabled']               = cbEnabled;
+		appConfig['circuit_breaker']['deal_ratio_threshold']  = cbDealRatio;
+		appConfig['circuit_breaker']['deal_ratio_window_secs']= cbDealWindow;
+		appConfig['circuit_breaker']['price_drop_percent']    = cbPriceDrop;
+		appConfig['circuit_breaker']['price_drop_window_secs']= cbPriceWindow;
+		appConfig['circuit_breaker']['price_drop_enabled']    = cbPriceDropEnabled;
+		appConfig['circuit_breaker']['pause_duration_secs']   = cbPauseDuration;
+		appConfig['circuit_breaker']['repeat_alert_window_secs'] = cbRepeatWindow;
+		appConfig['circuit_breaker']['price_zero_alert_count']   = cbPriceZeroAlert;
+
+		// Context compression settings
+		if (!appConfig['ai'])                      appConfig['ai'] = {};
+		if (!appConfig['ai']['context_compression']) appConfig['ai']['context_compression'] = {};
+		appConfig['ai']['context_compression']['enabled']         = ctxCompEnabled;
+		appConfig['ai']['context_compression']['threshold_chars'] = ctxCompThreshold;
+		appConfig['ai']['context_compression']['protect_last_n']  = ctxCompProtectN;
+		if (!shareData.appData.ai)                 shareData.appData.ai = {};
+		shareData.appData.ai.context_compression = appConfig['ai']['context_compression'];
+
+		// Deal context settings (AI access to deal records and logs)
+		if (!appConfig['ai']['deal_context']) appConfig['ai']['deal_context'] = {};
+		appConfig['ai']['deal_context']['enabled']            = dealCtxEnabled;
+		appConfig['ai']['deal_context']['use_router']         = dealCtxUseRouter;
+		appConfig['ai']['deal_context']['router_model']       = dealCtxModel;
+		appConfig['ai']['deal_context']['router_timeout_ms']  = dealCtxTimeout;
+		shareData.appData.ai.deal_context = appConfig['ai']['deal_context'];
+
+		// Update live appData so circuit breaker takes effect immediately without restart
+		shareData.appData.circuit_breaker = appConfig['circuit_breaker'];
+
+
+		appConfig['cron_backup']['sftp']['enabled'] = sftpEnabled;
+		appConfig['cron_backup']['sftp']['host'] = sftpHost;
+		appConfig['cron_backup']['sftp']['port'] = sftpPort;
+		appConfig['cron_backup']['sftp']['username'] = sftpUsername;
+		appConfig['cron_backup']['sftp']['password'] = sftpPasswordFinal;
+		// Private key write logic:
+		// - Clear flag set → explicitly erase the stored key
+		// - New key submitted → store the newly encrypted value
+		// - Neither → leave the existing stored value untouched
+		if (sftpPrivateKeyClear === '1') {
+
+			appConfig['cron_backup']['sftp']['private_key'] = '';
+		}
+		else if (sftpPrivateKeyFinal !== undefined) {
+
+			appConfig['cron_backup']['sftp']['private_key'] = sftpPrivateKeyFinal;
+		}
+		appConfig['cron_backup']['sftp']['passphrase'] = sftpPassphraseFinal;
+		appConfig['cron_backup']['sftp']['remote_directory'] = sftpRemoteDirectory;
+
+		// Ensure ai sub-objects exist before writing — app.json files on the old
+		// schema may be missing 'provider' or the 'openai' sub-object entirely,
+		// which would throw a TypeError when trying to set properties on undefined.
+		if (!appConfig['ai']) {
+			appConfig['ai'] = {};
+		}
+
+		if (!appConfig['ai']['ollama']) {
+			appConfig['ai']['ollama'] = {};
+		}
+
+		if (!appConfig['ai']['openai']) {
+			appConfig['ai']['openai'] = {};
+		}
+
+		appConfig['ai']['provider'] = aiProvider;
+
+		appConfig['ai']['ollama']['enabled'] = ollamaEnabled;
+		appConfig['ai']['ollama']['host'] = ollamaHost;
+		appConfig['ai']['ollama']['api_key'] = ollamaApiKey;
+		appConfig['ai']['ollama']['model'] = ollamaModel;
+
+		appConfig['ai']['openai']['enabled'] = openaiEnabled;
+		appConfig['ai']['openai']['api_key'] = openaiApiKey;
+		appConfig['ai']['openai']['model'] = openaiModel;
+		appConfig['ai']['openai']['base_url'] = openaiBaseUrl;
+
+		shareData['appData']['telegram_id'] = telegramUserId;
 		shareData['appData']['telegram_enabled'] = telegramEnabled;
+		shareData['appData']['telegram_enabled_config'] = telegramEnabled;
 
-		await saveConfig('app.json', appConfig);
+		shareData['appData']['cron_backup'] = appConfig['cron_backup'];
 
-		let obj = { 'success': true, 'data': 'Configuration Updated' };
+		if (shareData.appData.config_mode) {
+
+			try {
+
+				const db = await shareData.System.connectDb(mongodburl);
+
+				await db.close();
+
+				if (db == undefined || db == null || db == '') {
+
+					dbErr = 'Unabled to connect to database';
+				}
+			}
+			catch(e) {
+
+				dbErr = e.message;
+			}
+
+			if (dbErr != undefined && dbErr != null && dbErr != '') {
+
+				success = false;
+				dataMessage = 'Database Error: ' + dbErr;
+			}
+			else {
+
+				let msg = 'Database URL modified. Shutting down. Please restart for changes to take effect.';
+
+				dataMessage = msg;
+
+				// Successful configuration. Shutdown to start fresh config.
+				appConfig['mongo_db_url'] = mongodburl;
+
+				logger(msg, true);
+
+				setTimeout(() => { shareData.System.shutDown(); }, 1500);
+			}
+		}
+
+		if (success) {
+
+			await saveConfig(appConfigFile, appConfig);
+
+			// Stop / Restart AI client
+			shareData.AIClient.stop();
+
+			if (openaiEnabled) {
+
+				shareData.AIClient.start('openai', {
+					api_key: openaiApiKey,
+					model: openaiModel,
+					base_url: openaiBaseUrl,
+				});
+			}
+			else if (ollamaEnabled) {
+
+				shareData.AIClient.start('ollama', {
+					host: ollamaHost,
+					api_key: ollamaApiKey,
+					model: ollamaModel,
+				});
+			}
+
+			// Restart Signals
+			startSignals();
+
+			// Restart Telegram based on if Hub in use as it may be overriding instance settings
+			if (!hubInstance || (hubInstance && telegramEnabledOrig)) {
+
+				shareData.Telegram.stop();
+
+				if (telegramEnabled) {
+
+					await delay(1000);
+					shareData.Telegram.start(telegramTokenId, telegramEnabled);
+				}
+			}
+
+			if (!cronBackupEnabled) {
+
+				await shareData.System.cronBackupStart('', false);
+			}
+
+			if (cronBackupEnabled && (cronBackupSchedule != undefined && cronBackupSchedule != null && cronBackupSchedule != '')) {
+
+				await shareData.System.cronBackupStart(cronBackupSchedule, true);
+			}
+
+			if (sftpEnabled && sftpHost && sftpPort) {
+
+				const tempDir = path.join(pathRoot, 'temp');
+
+				if (!fs.existsSync(tempDir)) {
+
+					fs.mkdirSync(tempDir, {
+						recursive: true
+					});
+				}
+
+				const tempFileName = `sftp-test-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.bin`;
+				const localFilePath = path.join(tempDir, tempFileName);
+
+				try {
+
+					const kBytes = 1;
+
+					const randomData = crypto.randomBytes(kBytes * 1024);
+
+					fs.writeFileSync(localFilePath, randomData);
+
+					const res = await shareData.System.sftpUploadFile(localFilePath, true);
+
+					if (!res.success) {
+						
+						dataMessage = 'WARNING (SFTP): ' + res.error;
+					}
+				}
+				catch (err) {
+
+					dataMessage = 'WARNING (SFTP): ' + err;
+				}
+				finally {
+
+					if (fs.existsSync(localFilePath)) {
+		
+						fs.unlinkSync(localFilePath);
+					}
+				}
+			}
+		}
+
+		let obj = { 'success': success, 'data': dataMessage };
 		
 		res.send(obj);
 	}
@@ -166,6 +578,20 @@ async function updateConfig(req, res) {
 		
 		res.send(obj);
 	}
+}
+
+
+async function startSignals() {
+
+	// Start signals after everything else is finished loading
+
+	const appConfigFile = shareData.appData.app_config;
+
+	const appConfig = await getConfig(appConfigFile);
+
+	let enabled = shareData.appData['signals_3cqs_enabled'];
+
+	const socket = await shareData.Signals3CQS.start(enabled, appConfig['data']['signals']['3CQS']['api_key']);
 }
 
 
@@ -375,6 +801,17 @@ async function sendNotification(data) {
 	let maxNotifications = 500;
 	let fileName = logNotifications;
 
+	const instanceName = await getInstanceName();
+
+	if (instanceName && instanceName.trim() !== '') {
+
+		fileName = fileName.replace('{INSTANCE_NAME}', `-${instanceName}`);
+	}
+	else {
+
+		fileName = fileName.replace('{INSTANCE_NAME}', '');
+	}
+
 	let msg = data['message'];
 	let msgType = data['type'];
 	let telegramId = data['telegram_id'];
@@ -399,7 +836,12 @@ async function sendNotification(data) {
 	}
 
 	// Relay message to WebSocket notifications room
-	shareData.WebServer.sendSocketMsg(msg, 'notifications');
+	sendSocketMsg({
+
+		'room': 'notifications',
+		'type': 'notification',
+		'message': msg
+	});
 
 	// Save notifications
 	saveData(fileName, JSON.stringify(historyArr));
@@ -409,6 +851,17 @@ async function sendNotification(data) {
 async function getNotificationHistory(client, data) {
 
 	let fileName = logNotifications;
+
+	const instanceName = await getInstanceName();
+
+	if (instanceName && instanceName.trim() !== '') {
+
+		fileName = fileName.replace('{INSTANCE_NAME}', `-${instanceName}`);
+	}
+	else {
+
+		fileName = fileName.replace('{INSTANCE_NAME}', '');
+	}
 
 	let historyArr = [];
 
@@ -436,67 +889,102 @@ async function getNotificationHistory(client, data) {
 }
 
 
-async function showLogs(req, res) {
-
-	const files = await getLogs();
-
-	res.render( 'logsView', { 'appData': shareData.appData, 'files': files } );
-}
-
-
-async function getLogs() {
+async function listFiles(type = 'logs') {
 
 	let allFiles = [];
-	let sortedFiles = [];
 
-	let dir = pathRoot + '/logs';
+	const dir = `${pathRoot}/${type}`;
+	const files = fs.readdirSync(dir);
 
-	let files = fs.readdirSync(dir);
+	for (let fileName of files) {
 
-	for (let i in files) {
-
-		let file = dir + '/' + files[i];
-
-		let stats = fs.statSync(file);
-
-		let created = stats.ctime;
-		let modified = stats.mtime;
-		let size = stats.size;
+		const filePath = `${dir}/${fileName}`;
+		const stats = fs.statSync(filePath);
 
 		if (!stats.isDirectory()) {
 
-			let obj = { 'name': file, 'created': created, 'modified': modified, 'size': size, 'size_human': numFormatter(size) };
-
-			allFiles.push(obj);
+			allFiles.push({
+				'name': fileName,
+				'created': stats.ctime,
+				'modified': stats.mtime,
+				'size': stats.size,
+				'size_human': numFormatter(stats.size)
+			});
 		}
 	}
 
-	if (allFiles.length > 0) {
-
-		sortedFiles = sortByKey(allFiles, 'created');
-	}
-
-	return sortedFiles.reverse();
+	return allFiles.length > 0 ? sortByKey(allFiles, 'created').reverse() : [];
 }
 
 
-async function downloadLog(file, req, res) {
+async function showFiles(type = 'logs', req, res, isHub) {
 
-	res.download(pathRoot + '/logs/' + file, function (err) {
+	let filesFiltered;
+
+	const instanceName = await getInstanceName();
+	const files = await listFiles(type);
+
+	if (instanceName && !isHub) {
+
+		const ext = type === 'logs' ? '.log' : '.enc';
+		const regex = new RegExp(`${instanceName}.*\\${ext}$`);
+
+		filesFiltered = files.filter(file => regex.test(file.name));
+	}
+	else {
+
+		filesFiltered = files;
+	}
+
+	res.render(`${type}View`, {
+		'appData': shareData.appData,
+		'files': filesFiltered,
+		isHub
+	});
+}
+
+
+async function downloadFile(fileName, type = 'logs', req, res) {
+
+	const filePath = path.join(pathRoot, type, fileName);
+
+	fs.access(filePath, fs.constants.F_OK, (err) => {
 
 		if (err) {
 
-			let obj = { 'error': err };
+			// File doesn't exist
+			if (!res.headersSent) {
 
-			let code = err['statusCode'];
+				return res.status(404).send({
 
-			res.status(code).send(obj);
+					error: 'File not found'
+				});
+			}
+
+			return;
 		}
-    });
+
+		res.download(filePath, (err) => {
+
+			if (err && !res.headersSent) {
+
+				res.status(err.statusCode || 500).send({
+					error: err.message
+				});
+			}
+			else if (err) {
+
+				// Headers already sent
+				//console.warn('Download error (after headers sent):', err.message);
+			}
+		});
+	});
 }
 
 
 async function logger(data, consoleLog) {
+
+	const instanceName = await getInstanceName();
 
 	if (typeof data !== 'string') {
 		data = JSON.stringify(data);
@@ -518,7 +1006,7 @@ async function logger(data, consoleLog) {
 
 	const dateObj = getDateParts(dateNow);
 
-	const fileName = pathRoot + '/logs/' + dateObj.date + '.log';
+	const fileName = pathRoot + '/logs/' + dateObj.date + (instanceName ? '-' + instanceName : '') + '.log';
 
 	const logDataOrig = logData;
 
@@ -533,7 +1021,12 @@ async function logger(data, consoleLog) {
 
 	if (shareData && shareData.WebServer) {
 
-		shareData.WebServer.sendSocketMsg(convertAnsi.toHtml(logDataOrig));
+		sendSocketMsg({
+
+			'room': 'logs',
+			'type': 'log',
+			'message': convertAnsi.toHtml(logDataOrig)
+		});
 	}
 }
 
@@ -553,8 +1046,9 @@ function logMonitor() {
 	setInterval(() => {
 
 		delFiles(pathRoot + '/logs', maxDays);
-		delFiles(pathRoot + '/backups', 1, true);
+		delFiles(pathRoot + '/temp', 1, true);
 		delFiles(pathRoot + '/uploads', 1, true);
+		delFiles(pathRoot + '/downloads', 1, true);
 
 	}, (hoursInterval * (60 * 60 * 1000)));
 }
@@ -566,6 +1060,23 @@ async function delay(msec) {
 
 		setTimeout(() => { resolve('') }, msec);
 	});
+}
+
+
+async function getInstanceName() {
+
+	let instanceName = '';
+
+	try {
+
+		if (shareData['appData']['worker_data'] && typeof shareData['appData']['worker_data'] === 'object') {
+
+			instanceName = shareData['appData']['worker_data']['name'];
+		}
+	}
+	catch(e) {}
+
+	return instanceName;
 }
 
 
@@ -884,6 +1395,26 @@ function dealDurationMinutes(dateStart, dateEnd) {
 }
 
 
+function freezeProperty(obj, keys) {
+
+	const list = Array.isArray(keys) ? keys : [keys];
+
+	for (const key of list) {
+
+		const value = obj[key];
+
+		Object.defineProperty(obj, key, {
+			value,
+			writable: false,
+			configurable: false,
+			enumerable: true
+		});
+	}
+
+	return obj;
+}
+
+
 function convertBoolean(param, defaultVal) {
 
 	let paramBool;
@@ -908,6 +1439,17 @@ function convertBoolean(param, defaultVal) {
 	}
 
 	return paramBool;
+}
+
+
+function convertToCamelCase(obj) {
+
+	return Object.fromEntries(
+		Object.entries(obj).map(([key, value]) => [
+			key.replace(/_([a-z])/g, (_, char) => char.toUpperCase()),
+			value
+		])
+	);
 }
 
 
@@ -993,6 +1535,53 @@ function roundAmount(amount) {
 }
 
 
+function adjustDecimals(value, ...arr) {
+
+	const numValue = Number(value);
+
+	if (isNaN(numValue)) {
+		return 0;
+	}
+
+	const flattenedArr = arr.flat();
+
+	const decimalPlaces = flattenedArr
+		.map(v => (isNaN(Number(v)) ? 0 : (String(v).split('.').length > 1 ? String(v).split('.')[1].length : 0)))
+		.filter(v => v > 0);
+
+	const maxDecimals = decimalPlaces.length > 0 ? Math.max(...decimalPlaces) : 0;
+
+	return numValue.toFixed(maxDecimals);
+}
+
+
+function getPrecision(arr) {
+
+	return 10 ** -Math.max(...arr.map(n => (n.toString().split('.')[1] || '').length));
+}
+
+
+function uuidv4() {
+
+	if (crypto.randomUUID) return crypto.randomUUID();
+
+	const bytes = crypto.randomBytes(16);
+
+	bytes[6] = (bytes[6] & 0x0f) | 0x40;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+	const hex = bytes.toString('hex');
+
+	return (
+		hex.substr(0, 8) + '-' +
+		hex.substr(8, 4) + '-' +
+		hex.substr(12, 4) + '-' +
+		hex.substr(16, 4) + '-' +
+		hex.substr(20, 12)
+	);
+}
+
+
 function numFormatter(num) {
 
 	num = Number(num);
@@ -1036,6 +1625,47 @@ function mergeObjects(origObj, newObj) {
 	let mergeObj = { ...newObj, ...origObj };
 
 	return mergeObj;
+}
+
+
+function deepCopy(obj, seen = new WeakMap()) {
+
+	if (obj === null || typeof obj !== 'object') return obj;
+	if (seen.has(obj)) return seen.get(obj);
+
+	if (obj instanceof Date) return new Date(obj);
+	if (obj instanceof RegExp) return new RegExp(obj);
+	if (obj instanceof Map) return new Map([...obj].map(([k, v]) => [deepCopy(k, seen), deepCopy(v, seen)]));
+	if (obj instanceof Set) return new Set([...obj].map(v => deepCopy(v, seen)));
+
+	// Preserve prototype chain
+	const copy = Array.isArray(obj) ? [] : Object.create(Object.getPrototypeOf(obj));
+	seen.set(obj, copy);
+
+	// Get all own property keys (string and symbol), including non-enumerable
+	const keys = [
+		...Object.getOwnPropertyNames(obj),
+		...Object.getOwnPropertySymbols(obj)
+	];
+
+	for (const key of keys) {
+
+		const desc = Object.getOwnPropertyDescriptor(obj, key);
+
+		if (desc.get || desc.set) {
+
+			// If there are getters/setters, just copy them directly (not invoking)
+			Object.defineProperty(copy, key, desc);
+		}
+		else {
+
+			// Otherwise, copy the value deeply
+			desc.value = deepCopy(desc.value, seen);
+			Object.defineProperty(copy, key, desc);
+		}
+	}
+
+	return copy;
 }
 
 
@@ -1111,42 +1741,243 @@ async function verifyPasswordHash(dataObj) {
 }
 
 
-async function verifyLogin(req, res) {
+// ---------------------------------------------------------------------------
+// Failed-login lockout / throttle (backlog #71)
+//
+// In-memory only, keyed by source IP. Counts consecutive failed logins in a
+// rolling window and temporarily blocks an IP once it crosses a threshold, so a
+// brute-force attempt is slowed to uselessness rather than merely notified.
+//
+// In-memory is deliberate: the state only needs to outlive an attack window,
+// not a restart, and this keeps it dependency-free with no schema change. A
+// process restart clears all counters (and any active block), which is an
+// acceptable trade for simplicity — an attacker cannot force a restart, and a
+// legitimate operator restarting simply gets a clean slate.
+//
+// Successful login clears the IP's record. Blocks fail closed: while an IP is
+// blocked, the password is not even checked.
+// ---------------------------------------------------------------------------
+
+const loginThrottleDefaults = {
+	// Consecutive failures from one IP before it is blocked.
+	'maxFailures': 5,
+	// Rolling window (ms) in which failures accumulate. Failures older than this
+	// are forgiven, so occasional typos by a legitimate user never build up.
+	'windowMs': 15 * 60 * 1000,
+	// How long an IP stays blocked once the threshold is crossed (ms).
+	'blockMs': 15 * 60 * 1000,
+	// Cap on tracked IPs, so the map cannot grow unbounded under a distributed
+	// attack. Oldest entries are evicted first.
+	'maxTrackedIps': 5000
+};
+
+// ip -> { failures: [timestamps], blockedUntil: ms|null }
+const loginAttempts = new Map();
+
+function getLoginThrottleConfig() {
+
+	// Allow overrides from appData.security.login_throttle if present, else defaults.
+	const cfg = shareData?.appData?.security?.login_throttle;
+
+	if (cfg == undefined || cfg == null) {
+
+		return loginThrottleDefaults;
+	}
+
+	return {
+		'maxFailures':   Number(cfg.max_failures)    > 0 ? Number(cfg.max_failures)    : loginThrottleDefaults['maxFailures'],
+		'windowMs':      Number(cfg.window_ms)        > 0 ? Number(cfg.window_ms)       : loginThrottleDefaults['windowMs'],
+		'blockMs':       Number(cfg.block_ms)         > 0 ? Number(cfg.block_ms)        : loginThrottleDefaults['blockMs'],
+		'maxTrackedIps': Number(cfg.max_tracked_ips)  > 0 ? Number(cfg.max_tracked_ips) : loginThrottleDefaults['maxTrackedIps']
+	};
+}
+
+// Returns { blocked: bool, retryAfterSec: number } without mutating counters.
+function checkLoginBlocked(ip) {
+
+	if (ip == undefined || ip == null || ip === '') {
+
+		// No usable IP — cannot throttle safely, so do not block (fail open on
+		// identification, never on the password check itself).
+		return { 'blocked': false, 'retryAfterSec': 0 };
+	}
+
+	const record = loginAttempts.get(ip);
+
+	if (record == undefined || record.blockedUntil == null) {
+
+		return { 'blocked': false, 'retryAfterSec': 0 };
+	}
+
+	const now = Date.now();
+
+	if (record.blockedUntil > now) {
+
+		return { 'blocked': true, 'retryAfterSec': Math.ceil((record.blockedUntil - now) / 1000) };
+	}
+
+	// Block has expired — clear it and let the attempt proceed with a clean slate.
+	loginAttempts.delete(ip);
+
+	return { 'blocked': false, 'retryAfterSec': 0 };
+}
+
+// Records a failed attempt; blocks the IP if it crosses the threshold.
+// Returns { blocked: bool, retryAfterSec: number, failures: number }.
+function recordLoginFailure(ip) {
+
+	if (ip == undefined || ip == null || ip === '') {
+
+		return { 'blocked': false, 'retryAfterSec': 0, 'failures': 0 };
+	}
+
+	const config = getLoginThrottleConfig();
+	const now = Date.now();
+
+	// Evict oldest entry if the map is at capacity and this IP is new.
+	if (!loginAttempts.has(ip) && loginAttempts.size >= config['maxTrackedIps']) {
+
+		const oldestKey = loginAttempts.keys().next().value;
+
+		if (oldestKey != undefined) {
+
+			loginAttempts.delete(oldestKey);
+		}
+	}
+
+	let record = loginAttempts.get(ip);
+
+	if (record == undefined) {
+
+		record = { 'failures': [], 'blockedUntil': null };
+	}
+
+	// Drop failures outside the rolling window, then add this one.
+	record.failures = record.failures.filter(ts => (now - ts) < config['windowMs']);
+	record.failures.push(now);
+
+	let blocked = false;
+	let retryAfterSec = 0;
+
+	if (record.failures.length >= config['maxFailures']) {
+
+		record.blockedUntil = now + config['blockMs'];
+		blocked = true;
+		retryAfterSec = Math.ceil(config['blockMs'] / 1000);
+	}
+
+	loginAttempts.set(ip, record);
+
+	return { 'blocked': blocked, 'retryAfterSec': retryAfterSec, 'failures': record.failures.length };
+}
+
+// Clears an IP's record on successful login.
+function recordLoginSuccess(ip) {
+
+	if (ip != undefined && ip != null && ip !== '') {
+
+		loginAttempts.delete(ip);
+	}
+}
+
+
+async function verifyLogin(req, res, isHub) {
 
 	let msg;
 
 	const body = req.body;
 	const password = body.password;
-	const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress || '';
 	const userAgent = req.headers['user-agent'];
+
+	const ip = getClientIp(req);
+
+	// Before checking the password, reject outright if this IP is currently
+	// blocked from too many recent failures. The password is not evaluated.
+	const blockStatus = checkLoginBlocked(ip);
+
+	if (blockStatus['blocked']) {
+
+		const blockMsg = 'Login BLOCKED (too many attempts) from: ' + ip + ' / Browser: ' + userAgent + ' / Retry after: ' + blockStatus['retryAfterSec'] + 's';
+
+		if (!isHub) {
+
+			logger(blockMsg);
+			sendNotification({ 'message': blockMsg, 'telegram_id': shareData.appData.telegram_id });
+		}
+
+		res.set('Retry-After', String(blockStatus['retryAfterSec']));
+		res.status(429).send('Too many login attempts. Try again in ' + blockStatus['retryAfterSec'] + ' seconds.');
+
+		return;
+	}
 
 	const dataPass = shareData.appData.password.split(':');
 
 	let success = await verifyPasswordHash( { 'salt': dataPass[0], 'hash': dataPass[1], 'data': password } );
 
+	let justBlocked = false;
+	let retryAfterSec = 0;
+
 	if (success) {
 
 		req.session.loggedIn = true;
+
+		// Clear this IP's failure record on any successful login.
+		recordLoginSuccess(ip);
 
 		msg = 'SUCCESS';
 	}
 	else {
 
-		msg = 'FAILED';
+		// Record the failure; may push this IP over the threshold into a block.
+		const failResult = recordLoginFailure(ip);
+
+		justBlocked = failResult['blocked'];
+		retryAfterSec = failResult['retryAfterSec'];
+
+		msg = 'FAILED' + (justBlocked ? ' (now blocked for ' + retryAfterSec + 's)' : '');
 	}
 
 	msg = 'Login ' + msg + ' from: ' + ip + ' / Browser: ' + userAgent;
 
-	logger(msg);
-	sendNotification({ 'message': msg, 'telegram_id': shareData.appData.telegram_id });
+	if (!isHub) {
+
+		logger(msg);
+		sendNotification({ 'message': msg, 'telegram_id': shareData.appData.telegram_id });
+	}
 
 	if (success) {
 
-		renderView('homeView', req, res);
+		if (isHub) {
+
+			renderView('Hub/homeView', req, res, isHub);
+		}
+		else {
+
+			// Redirect to config view if in config mode
+			if (shareData.appData.config_mode) {
+
+				res.redirect('/config');
+			}
+			else {
+
+				renderView('homeView', req, res);
+			}
+		}
 	}
 	else {
 
-		res.redirect('/login');
+		// If this failure triggered a block, tell the client with a 429 so the
+		// lockout is visible rather than looking like an ordinary bad password.
+		if (justBlocked) {
+
+			res.set('Retry-After', String(retryAfterSec));
+			res.status(429).send('Too many login attempts. Try again in ' + retryAfterSec + ' seconds.');
+		}
+		else {
+
+			res.redirect('/login');
+		}
 	}
 }
 
@@ -1183,87 +2014,612 @@ function validateApiKey(key) {
 }
 
 
-async function renderView(view, req, res) {
+function getClientIp(ctx) {
 
-	res.render( view, { 'appData': shareData.appData } );
+	const headers = ctx?.handshake?.headers || ctx?.headers || {};
+
+	const socket =
+		ctx?.request?.socket ||
+		ctx?.socket ||
+		ctx?.connection;
+
+	const rawIp = (
+			headers['cf-connecting-ip'] ||
+			headers['x-forwarded-for'] ||
+			socket?.remoteAddress ||
+			ctx?.handshake?.address ||
+			''
+		)
+		.split(',')[0]
+		.trim();
+
+	return rawIp.startsWith('::ffff:') ?
+		rawIp.substring(7) :
+		rawIp;
+}
+
+
+async function sendSocketMsg(data) {
+
+	const roomAuth = 'logs';
+
+	let room = data['room'];
+	let msg = data['message'];
+	let msgType = data['type'];
+
+	const socket = await shareData.WebServer.getSocket();
+
+	let sendRoom = roomAuth;
+
+	if (room != undefined && room != null && room != '') {
+
+		sendRoom = room;
+	}
+
+	if (msgType == undefined || msgType == null || msgType == '') {
+
+		msgType = sendRoom;
+	}
+
+	if (socket) {
+
+		socket.to(sendRoom).emit('data', { 'type': msgType, 'message': msg });
+	}
+}
+
+
+async function sendParentMsg(data) {
+
+	const parentPort = shareData.appData.parent_port;
+
+	let msg = data['data'];
+	let msgType = data['type'];
+
+	let success = false;
+
+	if (parentPort) {
+
+		success = true;
+
+		parentPort.postMessage({
+
+			'type': msgType,
+			'data': msg
+		});
+	}
+
+	return { 'success': success };
+}
+
+
+async function renderView(view, req, res, isHub) {
+
+	res.render( view, { 'isHub': isHub, 'appData': shareData.appData, 'getCurrencySymbol': getCurrencySymbol.toString() } );
 }
 
 
 const stripNonNumeric = (inputString) => inputString.replace(/[^0-9.]/g, '');
 
 
-async function getAppVersions() {
-
-    try {
-        let req = await fetch('https://raw.githubusercontent.com/3cqs-coder/SymBot/main/package.json');
-        let { version } = await req.json();
-        return { remote: stripNonNumeric(version), local: stripNonNumeric(packageJson.version) };
-    } catch (err) {
-        logger('Failed to retrieve remote application version', true);
-        return { remote: '0.0.0', local: '0.0.0' };
-    }
-}
-
-
 async function validateAppVersion() {
 
-    const { local, remote } = await getAppVersions();
-    const parseVersion = (version) => { return version.split(/[\.-]/); };
+	const owner = '3cqs-coder';
+	const repo = 'SymBot';
+	const url = `https://api.github.com/repos/${owner}/${repo}/tags`;
 
-    const localParts = parseVersion(local);
-    const remoteParts = parseVersion(remote);
+	let remoteVersion = '0.0.0';
+	let localVersion = '0.0.0';
+	let success = true;
+	let error = null;
+	let update_available = false;
 
-    let update_available = false;
+	try {
 
-    for (let i = 0; i < Math.max(localParts.length, remoteParts.length); i++) {
+		const response = await fetch(url);
 
-        const local_segment = i < localParts.length ? localParts[i] : '';
-        const remote_segment = i < remoteParts.length ? remoteParts[i] : '';
+		if (!response.ok) {
 
-        if (local_segment === '' && remote_segment !== '') {
-            // Local version has fewer segments than remote
-            update_available = true;
-            break;
-        }
+			success = false;
+			error = `Failed to fetch tags: ${response.statusText}`;
+		}
+		else {
 
-        if (local_segment < remote_segment) {
-            update_available = true;
-            break;
-        }
+			const tags = await response.json();
 
-        if (local_segment > remote_segment) {
-            // Current version is newer than remote
-            update_available = false;
-            break;
-        }
-    }
+			if (tags.length === 0) {
 
-    if (update_available) {
+				success = false;
+				error = 'No tags found for this repository.';
+			}
+			else {
 
-        logger('WARNING: Your app version is outdated. Please update to the latest version.', true);
-        logger('Current version: ' + local + ' Latest version: ' + remote, true);
+				const latestTag = tags[0].name;
 
-	} else {
+				localVersion = stripNonNumeric(packageJson.version);
+				remoteVersion = stripNonNumeric(latestTag);
 
-		if (local !== remote) {
+				const parseVersion = (version) => version.split(/[\.-]/);
 
-			logger('WARNING: Your app version is newer than the remote version. This should not happen.', true);
-            logger('Current version: ' + local + ' Latest version: ' + remote, true);
-        }
-    }
+				const localParts = parseVersion(localVersion);
+				const remoteParts = parseVersion(remoteVersion);
 
-    return { 'update_available': update_available };
+				for (let i = 0; i < Math.max(localParts.length, remoteParts.length); i++) {
+
+					const localSegment = i < localParts.length ? localParts[i] : '';
+					const remoteSegment = i < remoteParts.length ? remoteParts[i] : '';
+
+					if (localSegment === '' && remoteSegment !== '') {
+
+						update_available = true;
+						break;
+					}
+
+					if (localSegment < remoteSegment) {
+
+						update_available = true;
+						break;
+					}
+
+					if (localSegment > remoteSegment) {
+
+						update_available = false;
+						break;
+					}
+				}
+
+				if (!update_available && remoteVersion <= localVersion) {
+
+					success = false;
+					error = 'You already have the latest version';
+				}
+			}
+		}
+	}
+	catch (err) {
+
+		success = false;
+		error = 'Failed to retrieve remote application version';
+	}
+
+	if (update_available) {
+
+		logger('WARNING: Your app version is outdated. Please update to the latest version.', true);
+		logger(`Current version: ${localVersion} Latest version: ${remoteVersion}`, true);
+	}
+	else if (localVersion !== remoteVersion) {
+
+		logger('WARNING: Your app version is newer than the remote version. This should not happen.', true);
+		logger(`Current version: ${localVersion} Latest version: ${remoteVersion}`, true);
+	}
+
+	return {
+		owner,
+		repo,
+		remote: remoteVersion,
+		local: localVersion,
+		success,
+		error,
+		update_available
+	};
 }
 
+
+
+async function getBotConfig(req, res) {
+
+	let success = false;
+	let data;
+
+	const botConfigFile = shareData.appData.bot_config;
+	const botConfig = await getConfig(botConfigFile);
+
+	if (!botConfig.success) {
+
+		data = 'Unable to read bot configuration file: ' + botConfigFile;
+	}
+	else {
+
+		const cfg = botConfig.data;
+
+		// Translate stored exchange name through the canonical alias map in DCABot
+		// so the UI always sees the current name (e.g. coinbasepro -> coinbaseexchange).
+		// Never send actual credential values to the browser — send boolean flags instead.
+		const exchangeCanonical = await shareData.DCABot.getExchangeAlias(cfg.exchange || '');
+
+		data = {
+			exchange:      exchangeCanonical,
+			apiKey:        !!cfg.apiKey,
+			apiSecret:     !!cfg.apiSecret,
+			apiPassphrase: !!cfg.apiPassphrase,
+			apiPassword:   !!cfg.apiPassword,
+			sandBox:       cfg.sandBox === true,
+			sandBoxWallet: cfg.sandBoxWallet || 0,
+			exchangeFee:   cfg.exchangeFee   || 0,
+		};
+
+		success = true;
+	}
+
+	res.send({ success, data });
+}
+
+
+async function updateBotConfig(req, res) {
+
+	let success = false;
+	let dataMessage;
+
+	const body = req.body;
+	const password = body.password;
+
+	const dataPass = shareData.appData.password.split(':');
+	const passwordOk = await verifyPasswordHash({ salt: dataPass[0], hash: dataPass[1], data: password });
+
+	if (!passwordOk) {
+
+		dataMessage = 'Password incorrect';
+	}
+	else {
+
+		const botConfigFile = shareData.appData.bot_config;
+		const botConfig = await getConfig(botConfigFile);
+
+		if (!botConfig.success) {
+
+			dataMessage = 'Unable to read bot configuration file: ' + botConfigFile;
+		}
+		else {
+
+			const cfg = botConfig.data;
+
+			// Exchange name
+			if (body.exchange && body.exchange.trim() !== '') {
+
+				cfg.exchange = body.exchange.trim().toLowerCase();
+			}
+
+			// Credentials — three possible states per field:
+			//   clear flag = '1' → explicitly erase the stored value
+			//   new value entered → update with the new value
+			//   blank with no clear flag → leave existing value untouched
+			const credFields = ['apiKey', 'apiSecret', 'apiPassphrase', 'apiPassword'];
+
+			for (const field of credFields) {
+
+				if (body[field + '_clear'] === '1') {
+
+					cfg[field] = '';
+				}
+				else if (body[field] && body[field].trim() !== '') {
+
+					cfg[field] = body[field].trim();
+				}
+			}
+
+			const sandBoxWallet = parseFloat(body.sandBoxWallet);
+			if (!isNaN(sandBoxWallet) && sandBoxWallet >= 0) {
+
+				cfg.sandBoxWallet = sandBoxWallet;
+
+				// Keep Hub per-instance override in sync if it exists
+				if (shareData.appData.sandbox_wallet_override !== undefined) {
+
+					shareData.appData.sandbox_wallet_override = sandBoxWallet;
+				}
+			}
+
+			const exchangeFee = parseFloat(body.exchangeFee);
+			if (!isNaN(exchangeFee) && exchangeFee >= 0) cfg.exchangeFee = exchangeFee;
+
+			// Save sandBoxWallet and exchangeFee immediately — these fields
+			// do not require exchange connectivity and must not be blocked
+			// by a timeout during the exchange validation step below.
+			await saveConfig(botConfigFile, cfg);
+
+			const buySlippage  = parseFloat(body.exchange_buy_slippage);
+			const sellSlippage = parseFloat(body.exchange_sell_slippage);
+			let balanceCurrencies = body.exchange_balance_currencies;
+			if (!Array.isArray(balanceCurrencies)) {
+				balanceCurrencies = balanceCurrencies ? [balanceCurrencies] : [];
+			}
+			balanceCurrencies = balanceCurrencies.map(s => s.trim().toUpperCase()).filter(s => s.length > 0);
+
+			// sandBox toggle is handled separately via /api/bot-config/sandbox
+			// to enforce the confirmation step — do not allow it via this route.
+
+			// Validate the exchange name and credentials.
+			// If credentials are present, attempt fetchBalance to confirm they are accepted.
+			// If no credentials are set, just verify the exchange name is recognised.
+			try {
+
+				const testCfg = {
+					exchange:      cfg.exchange,
+					apiKey:        cfg.apiKey        || '',
+					apiSecret:     cfg.apiSecret     || '',
+					apiPassphrase: cfg.apiPassphrase || '',
+					apiPassword:   cfg.apiPassword   || '',
+				};
+
+				const exchange = await shareData.DCABot.connectExchange(testCfg);
+
+				if (!exchange) {
+
+					dataMessage = 'Could not connect to exchange. Please verify the exchange name.';
+				}
+				else {
+
+					const hasCredentials = cfg.apiKey || cfg.apiSecret;
+
+					if (hasCredentials) {
+
+						// Credentials provided — validate them with a balance fetch
+						await exchange.fetchBalance();
+					}
+
+					// Flush the exchange connection cache so the new credentials take effect
+					if (shareData.appData.exchanges) shareData.appData.exchanges = {};
+
+					const saveResult = await saveConfig(botConfigFile, cfg);
+
+					if (!saveResult.success) {
+
+						dataMessage = 'Failed to save bot configuration: ' + saveResult.data;
+					}
+					else {
+
+						dataMessage = 'Exchange configuration updated successfully';
+						success = true;
+
+						// Save order settings (slippage, balance currencies) to app.json
+						const appConfigFile = shareData.appData.app_config;
+						const appCfgResult = await getConfig(appConfigFile);
+						if (appCfgResult.success) {
+							const appCfg = appCfgResult.data;
+							const excDef = appCfg?.bots?.exchange?.default;
+							if (excDef) {
+								if (!isNaN(buySlippage)  && buySlippage  >= 0) excDef.orders.buy.slippage_percent  = buySlippage;
+								if (!isNaN(sellSlippage) && sellSlippage >= 0) excDef.orders.sell.slippage_percent = sellSlippage;
+								if (balanceCurrencies.length > 0) excDef.account_balance_currencies = balanceCurrencies;
+								await saveConfig(appConfigFile, appCfg);
+								shareData.appData.bots.exchange = appCfg.bots.exchange;
+							}
+						}
+					}
+				}
+			}
+			catch (e) {
+
+				dataMessage = 'Exchange validation failed: ' + e.message;
+			}
+		}
+	}
+
+	res.send({ success, data: dataMessage });
+}
+
+
+async function updateBotConfigSandbox(req, res) {
+
+	let success = false;
+	let dataMessage;
+
+	const body = req.body;
+	const password = body.password;
+	const sandBox = body.sandBox === 'true' || body.sandBox === true;
+
+	const dataPass = shareData.appData.password.split(':');
+	const passwordOk = await verifyPasswordHash({ salt: dataPass[0], hash: dataPass[1], data: password });
+
+	if (!passwordOk) {
+
+		dataMessage = 'Password incorrect';
+	}
+	else {
+
+		const botConfigFile = shareData.appData.bot_config;
+		const botConfig = await getConfig(botConfigFile);
+
+		if (!botConfig.success) {
+
+			dataMessage = 'Unable to read bot configuration file: ' + botConfigFile;
+		}
+		else {
+
+			const cfg = botConfig.data;
+			cfg.sandBox = sandBox;
+
+			const saveResult = await saveConfig(botConfigFile, cfg);
+
+			if (!saveResult.success) {
+
+				dataMessage = 'Failed to save bot configuration: ' + saveResult.data;
+			}
+			else {
+
+				// Flush exchange connection cache
+				if (shareData.appData.exchanges) shareData.appData.exchanges = {};
+
+				const modeLabel = sandBox ? 'Sandbox (paper trading)' : 'Live trading';
+				dataMessage = 'Trading mode changed to: ' + modeLabel;
+				success = true;
+			}
+		}
+	}
+
+	res.send({ success, data: dataMessage });
+}
+
+
+function getCurrencySymbol(code) {
+
+	if (!code) return '';
+
+	// Check known crypto symbols first — Intl won't handle these correctly
+	const crypto = {
+		'BTC':  '₿',
+		'ETH':  'Ξ',
+		'USDT': '$',
+		'USDC': '$',
+		'BUSD': '$',
+		'DAI':  '$'
+	};
+
+	if (crypto[code.toUpperCase()]) return crypto[code.toUpperCase()];
+
+	try {
+
+		// Intl handles all ISO 4217 fiat codes automatically
+		const sym = (0).toLocaleString('en', {
+			style: 'currency',
+			currency: code,
+			minimumFractionDigits: 0,
+			maximumFractionDigits: 0
+		}).replace(/\d/g, '').trim();
+
+		// Intl returns the code itself for unknown currencies — treat that as no symbol
+		if (sym.toUpperCase() === code.toUpperCase()) return '';
+
+		return sym;
+	}
+	catch (e) {
+
+		return '';
+	}
+}
+
+
+async function uploadAiChatFile(req, res) {
+
+	const chatUpload = multer({
+		storage: multer.diskStorage({
+			destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+			filename:    (_req, file, cb) => cb(null, 'symbot-chat-' + Date.now() + path.extname(file.originalname).toLowerCase())
+		}),
+		limits: { fileSize: 25 * 1024 * 1024 }
+	});
+
+	chatUpload.single('file')(req, res, async (err) => {
+
+		if (err) {
+			const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File too large (max 25 MB)' : err.message;
+			logger('AI chat upload multer error: ' + msg);
+			if (!res.headersSent) return res.status(400).json({ success: false, error: msg });
+			return;
+		}
+
+		if (!req.file) return res.status(400).json({ success: false, error: 'No file received' });
+
+		const file    = req.file;
+		const ext     = path.extname(file.originalname).toLowerCase();
+		const allowed = ['.pdf', '.docx', '.txt', '.md', '.csv'];
+
+		if (!allowed.includes(ext)) {
+			fs.unlink(file.path, () => {});
+			return res.status(400).json({ success: false, error: `Unsupported file type: ${ext}. Allowed: ${allowed.join(', ')}` });
+		}
+
+		try {
+
+			let text = '';
+
+			if (ext === '.pdf') {
+				// Run pdf-parse in a worker thread — keeps the event loop free
+				// during CPU-heavy parsing (large PDFs can take several seconds)
+				const { Worker } = require('worker_threads');
+				const buffer = await fsp.readFile(file.path);
+
+				const workerCode = `
+					const { parentPort, workerData } = require('worker_threads');
+					const { PDFParse } = require('pdf-parse');
+					(async () => {
+						try {
+							const buf = Buffer.from(workerData.buffer);
+							const parser = new PDFParse({ data: buf });
+							const data = await parser.getText();
+							await parser.destroy();
+							parentPort.postMessage({ success: true, text: data.text || '' });
+						} catch(e) {
+							parentPort.postMessage({ success: false, error: e.message });
+						}
+					})();
+				`;
+
+				text = await new Promise((resolve, reject) => {
+					const ab = buffer.buffer.slice(
+						buffer.byteOffset,
+						buffer.byteOffset + buffer.byteLength
+					);
+					const worker = new Worker(workerCode, {
+						eval: true,
+						workerData: { buffer: ab },
+						transferList: [ab]
+					});
+					worker.once('message', msg => {
+						if (msg.success) resolve(msg.text);
+						else reject(new Error(msg.error));
+					});
+					worker.once('error', reject);
+				});
+			}
+			else if (ext === '.docx') {
+				const mammoth = require('mammoth');
+				const result  = await mammoth.extractRawText({ path: file.path });
+				text = result.value || '';
+			}
+			else {
+				text = await fsp.readFile(file.path, 'utf-8');
+			}
+
+			// Delete temp file immediately — only extracted text is retained
+			fs.unlink(file.path, () => {});
+
+			text = text.trim();
+
+			if (!text) return res.status(400).json({ success: false, error: 'Could not extract text from file' });
+
+			// Store text server-side — never sent to client
+			if (!shareData.attachmentCache) shareData.attachmentCache = new Map();
+
+			const attachmentId = uuidv4();
+
+			shareData.attachmentCache.set(attachmentId, { name: file.originalname, text });
+
+			// Auto-expire after 1 hour
+			setTimeout(() => shareData.attachmentCache.delete(attachmentId), 60 * 60 * 1000);
+
+			res.status(200).json({
+				success:      true,
+				attachmentId: attachmentId,
+				name:         file.originalname,
+				type:         ext.slice(1),
+				size:         file.size,
+				charCount:    text.length,
+			});
+
+		}
+		catch (e) {
+
+			fs.unlink(file.path, () => {});
+			logger('AI chat upload error: ' + e.message);
+			if (!res.headersSent) {
+				res.status(500).json({ success: false, error: 'Extraction failed: ' + e.message });
+			}
+		}
+	});
+}
 
 
 module.exports = {
 
+	getCurrencySymbol,
 	delay,
 	uuidv4,
+	uploadAiChatFile,
 	makeDir,
 	convertBoolean,
+	convertToCamelCase,
 	convertStringToNumeric,
+	freezeProperty,
 	isNumeric,
 	sortByKey,
 	getConfig,
@@ -1271,12 +2627,16 @@ module.exports = {
 	saveConfig,
 	updateConfig,
 	pairBlackListed,
+	getInstanceName,
 	getData,
 	saveData,
 	getDateParts,
 	getTimeZone,
 	roundAmount,
+	adjustDecimals,
+	getPrecision,
 	mergeObjects,
+	deepCopy,
 	numToBase26,
 	numFormatter,
 	hashCode,
@@ -1286,21 +2646,30 @@ module.exports = {
 	genPasswordHash,
 	verifyPasswordHash,
 	verifyLogin,
+	checkLoginBlocked,
+	recordLoginFailure,
+	recordLoginSuccess,
 	validateApiKey,
 	renderView,
 	timeDiff,
 	logger,
 	logMonitor,
-	showLogs,
-	downloadLog,
+	showFiles,
+	downloadFile,
 	sendNotification,
 	getNotificationHistory,
 	showTradingView,
 	fetchURL,
+	getClientIp,
 	getProcessInfo,
-	getAppVersions,
 	validateAppVersion,
 	dealDurationMinutes,
+	startSignals,
+	sendSocketMsg,
+	sendParentMsg,
+	getBotConfig,
+	updateBotConfig,
+	updateBotConfigSandbox,
 
 	init: function(obj) {
 

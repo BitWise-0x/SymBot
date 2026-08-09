@@ -3,15 +3,16 @@
 const fs = require('fs');
 const path = require('path');
 
-let pathRoot = path.dirname(fs.realpathSync(__dirname)).split(path.sep).join(path.posix.sep);
-pathRoot = pathRoot.substring(0, pathRoot.lastIndexOf('/', pathRoot.lastIndexOf('/') - 1));
+const pathRoot = path.resolve(__dirname, ...Array(3).fill('..'));
 
+const crypto = require('crypto');
 const colors = require('colors');
 const ccxt = require('ccxt');
 const Table = require('easy-table');
 const Percentage = require('percentagejs');
 const Common = require(pathRoot + '/libs/app/Common.js');
 const Schema = require(pathRoot + '/libs/mongodb/DCABotSchema');
+const DbQueries = require(__dirname + '/DCABotDbQueries.js');
 
 const Bots = Schema.Bots;
 const Deals = Schema.Deals;
@@ -37,6 +38,111 @@ const sellErrorAddFeeMultiplier = 0.25;
 // Max additional percentage fee that will be applied if a sell error occurs for a deal
 const sellErrorAddFeeMaxPerc = 0.05;
 
+// Minimum shortfall percentage of requested sell quantity that triggers a partial fill retry
+// Shortfalls below this threshold are treated as dust and no retry is attempted
+const partialSellFillThresholdPercent = 1;
+
+// Maximum number of additional sell attempts when a partial fill is detected
+const maxPartialSellRetries = 10;
+
+// Delay in milliseconds between partial fill retry attempts
+const partialSellRetryDelayMs = 3000;
+
+// Tolerance (percent) by which an exchange-reported order cost may sit below
+// price * quantity before it is treated as fee-inclusive rather than display
+// rounding. Real taker fees are typically 0.1-1%, while rounding differences
+// observed on live fills are under 0.2%, so 0.25% separates the two without
+// discarding good data.
+const costFeeTolerancePercent = 0.25;
+
+
+// Quote-currency symbol for a pair, e.g. 'BTC/USD' -> '$'. Falls back to an
+// empty string when the pair is unusable so callers can concatenate safely.
+// Centralised here because several log lines and messages previously hardcoded
+// '$', which is wrong for any non-USD quote (EUR, GBP, BTC-quoted pairs, etc).
+function quoteSymbol(pair) {
+
+	const quote = (typeof pair === 'string' ? pair : '').split('/')[1] || '';
+
+	try {
+
+		return (Common.getCurrencySymbol(quote) || '');
+	}
+	catch (e) {
+
+		return ('');
+	}
+}
+
+
+// Format a price with its quote-currency symbol: formatPrice('BTC/USD', 1.5) -> '$1.5'
+function formatPrice(pair, value) {
+
+	return (quoteSymbol(pair) + value);
+}
+
+
+// Standard price/status log line shared by the sell, follow and safety-order
+// paths, which previously each built the same tab-separated string by hand with
+// a hardcoded '$'. Only the fields that differ are passed in; any field left
+// undefined is omitted so one helper covers all three call sites.
+function formatDealStatusLine({ pair, qty, lastPrice, dcaPrice, sellPrice, target, nextOrder, status, profit }) {
+
+	const parts = ['Pair: ' + pair];
+
+	if (qty        !== undefined) parts.push('Qty: ' + qty);
+	if (lastPrice  !== undefined) parts.push('Last Price: ' + formatPrice(pair, lastPrice));
+	if (dcaPrice   !== undefined) parts.push('DCA Price: ' + formatPrice(pair, dcaPrice));
+	if (sellPrice  !== undefined) parts.push('Sell Price: ' + formatPrice(pair, sellPrice));
+	if (target     !== undefined) parts.push('Target: ' + formatPrice(pair, target));
+	if (nextOrder  !== undefined) parts.push('Next Order: ' + formatPrice(pair, nextOrder));
+	if (status     !== undefined) parts.push('Status: ' + status);
+	if (profit     !== undefined) parts.push('Profit: ' + profit);
+
+	return (parts.join('\t'));
+}
+
+
+// Quantity actually executed on an order response, or 0 when the exchange
+// reported nothing usable. Centralises the `data_order.quantity` read that the
+// sell retry loops and the fill tracker both depend on.
+function orderFilledQty(orderResponse) {
+
+	const qty = Number(orderResponse?.['data_order']?.['quantity'] ?? 0);
+
+	return (isFinite(qty) && qty > 0 ? qty : 0);
+}
+
+
+// ── Loop-flow signals ─────────────────────────────────────────────────────────
+// dcaFollow (and the extracted handlers) return one of these to tell runFollowLoop
+// what to do next. The consumer reads two fields: `finished` (true = stop the loop)
+// and `success` (false = wait 1s before the next tick). Naming them removes the
+// ambiguity that caused the base-order stall bug (returning finished:true exited the
+// loop when the deal should have stayed alive). Four reachable states:
+//
+//   LOOP_CONTINUE : healthy tick — loop again immediately
+//   LOOP_RETRY    : transient issue (paused, verifying, guard) — loop again after 1s
+//   LOOP_DONE     : deal completed cleanly (sold out) — stop the loop
+//   LOOP_STOPPED  : deal stopped without a clean completion (user stop) — stop after 1s
+//
+// Frozen so a shared reference can never be mutated by a consumer.
+const LOOP_CONTINUE = Object.freeze({ 'success': true,  'finished': false });
+const LOOP_RETRY    = Object.freeze({ 'success': false, 'finished': false });
+const LOOP_DONE     = Object.freeze({ 'success': true,  'finished': true  });
+const LOOP_STOPPED  = Object.freeze({ 'success': false, 'finished': true  });
+
+// CONTINUE while also handing runFollowLoop a refreshed config to adopt for later ticks.
+const loopContinueWithConfig = (config) => ({ 'success': true, 'finished': false, 'config': config });
+
+// Maps a runtime (success, finished) pair to the matching named signal. Used at the few
+// return points where both values are computed at runtime rather than known statically.
+const loopSignal = (success, finished) => (
+	finished ? (success ? LOOP_DONE : LOOP_STOPPED)
+	         : (success ? LOOP_CONTINUE : LOOP_RETRY)
+);
+
+
 
 let dealTracker = {};
 let timerTracker = {};
@@ -44,6 +150,12 @@ let startDealTracker = {};
 let resumeDealTracker = {};
 let balanceTracker = {};
 let exchangeMarkets = {};
+
+// Serial queue for all new deal starts — single entry point, single path.
+// Ensures no two deal-creation attempts run concurrently regardless of
+// whether the trigger is an API call, a signal, or an internal ASAP/cooldown.
+let dealStartQueue = null;
+
 
 let shareData;
 
@@ -65,27 +177,17 @@ async function start(dataObj, startId) {
 	const config = Object.freeze(JSON.parse(JSON.stringify(data)));
 
 	let dealIdMain;
-	let botConfigDb;
-
-	let botActive = true;
-	let botFoundDb = false;
-	let pairFoundDb = false;
-	let dealLast = false;
-	let dealStop = false;
-	let pairDealsLast = false;
 	let checkActivePairOverride = false;
-
-	let totalOrderSize = 0;
-	let totalAmount = 0;
+	let isNewDeal = false;
 
 	let pair = '';
 	let pairConfig = config.pair;
 	let botIdMain = config.botId;
-	let botNameMain = config.botName;
 	let dealCount = config.dealCount;
 	let dealMax = config.dealMax;
 	let pairMax = config.pairMax;
 	let pairDealsMax = config.pairDealsMax;
+	let pairBotsDealsMax = config.pairBotsDealsMax;
 
 	if (dealCount == undefined || dealCount == null) {
 
@@ -107,6 +209,11 @@ async function start(dataObj, startId) {
 		pairDealsMax = 0;
 	}
 
+	if (pairBotsDealsMax == undefined || pairBotsDealsMax == null) {
+
+		pairBotsDealsMax = 0;
+	}
+
 	let exchange = await connectExchange(config);
 
 	if (exchange == undefined || exchange == null) {
@@ -119,6 +226,8 @@ async function start(dataObj, startId) {
 
 		//Load markets
 		//const markets = await exchange.loadMarkets();
+
+		let isDealResumeId = false;
 
 		if (pairConfig == undefined || pairConfig == null || pairConfig == '') {
 
@@ -141,18 +250,26 @@ async function start(dataObj, startId) {
 		const symbolData = await getSymbol(exchange, pair);
 		const symbol = symbolData.data;
 
+		// Check if this bot exceeds global pair limit
+		let globalPairLimitExceeded = await checkGlobalPairLimit(pairBotsDealsMax, pair);
+
+		if (dealResumeId != undefined && dealResumeId != null && dealResumeId != '') {
+
+			isDealResumeId = true;
+		}
+
 		// Verify number of same pairs running on bot before start to allow override
-		if (pairDealsMax > 1 && pairDealsActive.length < pairDealsMax) {
+		if (!globalPairLimitExceeded && pairDealsMax > 1 && pairDealsActive.length < pairDealsMax) {
 
 			// Only override if not resuming deal
-			if (dealResumeId == undefined || dealResumeId == null || dealResumeId == '') {
+			if (!isDealResumeId) {
 
 				checkActivePairOverride = true;
 			}
 		}
 
 		// Check for valid symbol data on start
-		if (symbolData.invalid) {
+		if (symbolData.invalid && !isDealResumeId) {
 
 			if (Object.keys(dealTracker).length == 0) {
 
@@ -163,35 +280,64 @@ async function start(dataObj, startId) {
 		}
 		else if (symbolData.error != undefined && symbolData.error != null) {
 
-			// Try again if resuming existing bot deal
-			if (dealResumeId != undefined && dealResumeId != null && dealResumeId != '') {
+			let resumeBypass = false;
 
-				const retryDelay = Number((1000 + (Math.random() * 5000)).toFixed(4));
+			// Try again if resuming existing bot deal
+			if (isDealResumeId) {
 
 				let configObj = JSON.parse(JSON.stringify(config));
 
-				// Reset dealResume flag
-				configObj['dealResumeId'] = dealResumeId;
+				const resumeTrackerData = await getResumeDealTracker(dealResumeId);
 
-				const msg = 'Unable to resume ' + configObj.botName + ' / Pair: ' + pair + ' / Error: ' + symbolData.error + ' Trying again in ' + retryDelay + ' seconds';
+				if (resumeTrackerData && typeof resumeTrackerData === 'object') {
 
-				if (shareData.appData.verboseLog) { Common.logger( colors.bgYellow.bold(msg) ); }
+					const maxMins = 2;
 
-				setTimeout(() => {
+					let diffSec = (new Date().getTime() - new Date(resumeTrackerData['date']).getTime()) / 1000;
 
-					start({ 'create': startBot, 'config': configObj });
+					if (diffSec > (60 * maxMins)) {
 
-				}, retryDelay);
+						resumeBypass = true;
+					}
+				}
+
+				if (!resumeBypass) {
+
+					const retryDelay = Number((1000 + (Math.random() * 5000)).toFixed(4));
+
+					// Reset dealResume flag
+					configObj['dealResumeId'] = dealResumeId;
+
+					const msg = 'Unable to resume ' + configObj.botName + ' / Pair: ' + pair + ' / Error: ' + symbolData.error + ' Trying again in ' + retryDelay + ' seconds';
+
+					if (shareData.appData.verboseLog) { Common.logger( colors.bgYellow.bold(msg) ); }
+
+					setTimeout(() => {
+
+						start({ 'create': startBot, 'config': configObj });
+
+					}, retryDelay);
+				}
+				else {
+
+					// Something is wrong trying to resume deal and get symbol data. Give up and allow user to cancel
+					const msg = 'Unable to resume ' + configObj.botName + ' / Pair: ' + pair + ' / Error: ' + symbolData.error + ' Giving up.';
+
+					if (shareData.appData.verboseLog) { Common.logger( colors.bgYellow.bold(msg)); }
+				}
 			}
 
-			return ( { 'success': false, 'data': JSON.stringify(symbolData.error) } );
+			if (!resumeBypass) {
+
+				return ( { 'success': false, 'data': JSON.stringify(symbolData.error) } );
+			}
 		}
 
 		// Remove from resumeDealTracker
 		await deleteResumeDealTracker(dealResumeId);
 
-		let askPrice = symbol.ask;
-
+		let askPrice = symbol?.ask ?? 0;
+		
 		// Override price if passed in
 		if (firstOrderPrice != undefined && firstOrderPrice != null && firstOrderPrice != 0) {
 
@@ -204,43 +350,12 @@ async function start(dataObj, startId) {
 
 			dealIdMain = isActive.dealId;
 
-			if (dealResumeId != undefined && dealResumeId != null && dealResumeId != '') {
+			if (isDealResumeId) {
 
 				dealIdMain = dealResumeId;
 			}
 
-			// Config reloaded from db so continue
-			//await Common.delay(1000);
-
-			let followSuccess = false;
-			let followFinished = false;
-			let followConfig = config;
-
-			while (!followFinished) {
-
-				let followRes = await dcaFollow(followConfig, exchange, dealIdMain);
-
-				let followConfigRes = followRes['config'];
-
-				// Refresh config without stopping bot
-				if (followConfigRes != undefined && followConfigRes != null && followConfigRes != '') {
-
-					followConfig = JSON.parse(JSON.stringify(followConfigRes));
-				}
-
-				followSuccess = followRes['success'];
-				followFinished = followRes['finished'];
-
-				if (!followSuccess) {
-
-					await Common.delay(1000);
-				}
-			}
-
-			if (followFinished) {
-
-				//break;
-			}
+			await runFollowLoop(config, exchange, dealIdMain);
 		}
 		else {
 
@@ -293,9 +408,6 @@ async function start(dataObj, startId) {
 					return false;
 				}
 				else {
-
-					totalOrderSize = firstOrderSize;
-					totalAmount = config.firstOrderAmount;
 
 					const price = await filterPrice(exchange, pair, askPrice);
 
@@ -432,38 +544,15 @@ async function start(dataObj, startId) {
 
 						let dcaOrderSize = amount / price;
 
-						// Get adjustments without exchange fee since already previously included
-						const adjustments = await calculateAdjustments({
-
-							'exchange': exchange,
-							'pair': pair,
-							'price': price,
-							'amount': amount,
-							'orderSize': dcaOrderSize,
-							'exchangeFee': 0,
-							'minMoveAmount': null
-						});
-
-						// Call again to get fees
-						const adjustmentsFees = await calculateAdjustments({
-
-							'exchange': exchange,
-							'pair': pair,
-							'price': price,
-							'amount': amount,
-							'orderSize': dcaOrderSize,
-							'exchangeFee': config.exchangeFee,
-							'minMoveAmount': minMoveAmount
-						});
-
-						// Set fees in original adjustments
-						for (let key in adjustments) {
-
-							if (adjustments[key] == undefined || adjustments[key] == null || adjustments[key] == 0) {
-
-								adjustments[key] = adjustmentsFees[key];
-							}
-						}
+						const adjustments = await getAdjustedOrder(
+							exchange, 
+							pair, 
+							price, 
+							amount, 
+							dcaOrderSize, 
+							config.exchangeFee, 
+							minMoveAmount
+						);
 
 						dcaOrderSize = adjustments['order_qty'];
 						amount = adjustments['order_amount'];
@@ -554,8 +643,8 @@ async function start(dataObj, startId) {
 
 				if (shareData.appData.verboseLog) {
 					
-					Common.logger(colors.bgWhite('Your Balance: $' + wallet));
-					Common.logger(colors.bgWhite('Max Funds: $' + lastDcaOrderSum));
+					Common.logger(colors.bgWhite('Your Balance: ' + formatPrice(pair, wallet)));
+					Common.logger(colors.bgWhite('Max Funds: ' + formatPrice(pair, lastDcaOrderSum)));
 				}
 
 				if (wallet < lastDcaOrderSum) {
@@ -569,7 +658,8 @@ async function start(dataObj, startId) {
 
 					let contentAdd = await ordersAddContent(wallet, lastDcaOrderSum, maxDeviation, balanceObj);
 
-					let ordersTable = await ordersToData(t.toString());
+					// Use structured data directly — no text parsing needed
+					const ordersTable = await ordersToStructuredData(orderData['structured']);
 
 					return ({
 								'success': true,
@@ -591,37 +681,23 @@ async function start(dataObj, startId) {
 
 					dealIdMain = dealId;
 
+					// Commit point — deal is now in the database. createDealTracker removes
+					// the startDealTracker entry, which signals the queue that the next
+					// requestDealStart task can safely run its canStartDeal check.
 					await createDealTracker({ 'deal_id': dealId, 'deal': deal, 'start_id': startId });
 
-					let followSuccess = false;
-					let followFinished = false;
-					let followConfig = config;
+					// Run the follow loop detached so start() returns after the commit
+					// point rather than holding the call stack for the entire deal lifetime.
+					// Set isNewDeal flag so the post-try section skips for this path —
+					// the setImmediate block runs its own post-deal logic after the loop.
+					isNewDeal = true;
+					setImmediate(async () => {
 
-					while (!followFinished) {
+						await runFollowLoop(config, exchange, dealId);
 
-						let followRes = await dcaFollow(followConfig, exchange, dealId);
-
-						let followConfigRes = followRes['config'];
-
-						// Refresh config without stopping bot
-						if (followConfigRes != undefined && followConfigRes != null && followConfigRes != '') {
-		
-							followConfig = JSON.parse(JSON.stringify(followConfigRes));
-						}
-
-						followSuccess = followRes['success'];
-						followFinished = followRes['finished'];
-
-						if (!followSuccess) {
-
-							await Common.delay(1000);
-						}
-					}
-
-					if (followFinished) {
-
-						//break;
-					}
+						// Follow loop finished — run post-deal logic
+						await onDealComplete({ dealId, botIdMain, pair, dealCount, config });
+					});
 				}
 				else {
 /*
@@ -645,124 +721,174 @@ async function start(dataObj, startId) {
 	}
 
 
+	// Post-deal logic — runs for the isActive path (existing deal followed to
+	// completion). Skipped for new deals — their setImmediate block calls this.
+	if (!isNewDeal) {
+
+		await onDealComplete({ dealId: dealIdMain, botIdMain, pair, dealCount, config });
+	}
+}
+
+
+// Drives the dcaFollow loop for a running deal until it finishes.
+// Used by both the isActive resume path and the new deal setImmediate path.
+async function runFollowLoop(config, exchange, dealId) {
+
+	let followSuccess = false;
+	let followFinished = false;
+	let followConfig = config;
+
+	while (!followFinished) {
+
+		const followRes = await dcaFollow(followConfig, exchange, dealId);
+
+		const followConfigRes = followRes['config'];
+
+		// Refresh config without stopping bot
+		if (followConfigRes != undefined && followConfigRes != null && followConfigRes != '') {
+
+			followConfig = JSON.parse(JSON.stringify(followConfigRes));
+		}
+
+		followSuccess = followRes['success'];
+		followFinished = followRes['finished'];
+
+		if (!followSuccess) {
+
+			await Common.delay(1000);
+		}
+	}
+}
+
+
+// Runs after a deal's follow loop finishes — refreshes bot config from the
+// database, handles deactivation/deal-stop/chain-restart decisions, and cleans
+// up the deal tracker. Called from both the new-deal setImmediate path and the
+// isActive inline path so the logic lives in exactly one place.
+async function onDealComplete({ dealId, botIdMain, pair, dealCount, config }) {
+
+	let botNameMain  = config.botName;
+	let botFoundDb   = false;
+	let pairFoundDb  = false;
+	let botActive    = true;
+	let botConfigDb  = null;
+	let dealMax      = Number(config.dealMax)      || 0;
+	let pairMax      = Number(config.pairMax)      || 0;
+	let pairDealsMax = Number(config.pairDealsMax) || 0;
+	let dealLast     = false;
+	let dealStop     = false;
+	let pairDealsLast = false;
+
 	// Refresh bot config in case any settings changed
-
-	const isPairBlackListed = await Common.pairBlackListed(pair);
-
 	try {
 
 		const bot = await getBots({ 'botId': botIdMain });
 
 		if (bot && bot.length > 0) {
 
-			botFoundDb = true;
-
+			botFoundDb  = true;
 			botNameMain = bot[0]['botName'];
 
-			let botPairsDb = bot[0]['config']['pair'];
+			const botPairsDb = bot[0]['config']['pair'];
 
-			// Make sure pair was not removed from bot configuration
-			for (let pairDb of botPairsDb) {
+			for (const pairDb of botPairsDb) {
 
 				if (pair.toUpperCase() == pairDb.toUpperCase()) {
 
 					pairFoundDb = true;
 				}
- 			}
- 
+			}
+
 			if (!bot[0]['active']) {
 
 				botActive = false;
 			}
 			else {
 
-				botConfigDb = bot[0]['config'];
-
-				dealMax = botConfigDb['dealMax'];
-				pairMax = botConfigDb['pairMax'];
-				pairDealsMax = botConfigDb['pairDealsMax'];
+				botConfigDb   = bot[0]['config'];
+				dealMax       = botConfigDb['dealMax'];
+				pairMax       = botConfigDb['pairMax'];
+				pairDealsMax  = botConfigDb['pairDealsMax'];
 			}
 		}
 	}
-	catch(e) {
-
-	}
-
+	catch(e) {}
 
 	// Deactivate bot if max deals reached
 	if (dealCount >= dealMax && dealMax > 0) {
 
-		const data = await updateBot(botIdMain, { 'active': false });
-		
+		const deactivateData = await updateBot(botIdMain, { 'active': false });
+
 		if (shareData.appData.verboseLog) {
-			
-			Common.logger( colors.bgYellow.bold(config.botName + ': Max deal count reached. Bot will not start another deal.') );
+
+			Common.logger(colors.bgYellow.bold(config.botName + ': Max deal count reached. Bot will not start another deal.'));
 		}
 
-		const statusObj = await sendBotStatus({ 'bot_id': botIdMain, 'bot_name': botNameMain, 'active': false, 'success': data.success });
+		await sendBotStatus({ 'bot_id': botIdMain, 'bot_name': botNameMain, 'active': false, 'success': deactivateData.success });
 	}
 
 	// Check if deal stop was requested
 	try {
 
-		if (dealTracker[dealIdMain]['update']['deal_stop']) {
+		if (dealTracker[dealId]['update']['deal_stop']) {
 
 			dealStop = true;
 		}
 	}
-	catch(e) {
-
-	}
+	catch(e) {}
 
 	// Check for any resuming deals before continuing
-	await processResumeDealTracker({ 'deal_id': dealIdMain });
+	await processResumeDealTracker({ 'deal_id': dealId });
 
-	// Get total active same pairs currently running on bot
-	let pairDealsActive = await getDeals({ 'botId': botIdMain, 'pair': pair, 'status': 0 });
+	// Get active deals for limit checks
+	const pairDealsActive = await getDeals({ 'botId': botIdMain, 'pair': pair, 'status': 0 });
+	const botDealsActive  = await getDeals({ 'botId': botIdMain, 'status': 0 });
+	const pairCount       = botDealsActive.length;
 
+	// pairDealsLast — too many deals on this pair already
 	if (pairDealsMax > 1 && pairDealsActive.length >= pairDealsMax) {
 
 		pairDealsLast = true;
 	}
 
-	// Get total active pairs currently running on bot
-	let botDealsActive = await getDeals({ 'botId': botIdMain, 'status': 0 });
-
-	let pairCount = botDealsActive.length;
-
-	// Check if last deal flag is set
-	let botDealCurrent = await getDeals({ 'botId': botIdMain, 'dealId': dealIdMain });
+	// dealLast — this deal was flagged as the last one for the pair
+	const botDealCurrent = await getDeals({ 'botId': botIdMain, 'dealId': dealId });
 
 	if (botDealCurrent && botDealCurrent.length > 0) {
 
-		for (let i = 0; i < botDealCurrent.length; i++) {
+		for (const deal of botDealCurrent) {
 
-			let deal = botDealCurrent[i];
-
-			let dealId = deal['dealId'];		
-			let config = deal['config'];
-
-			if (config['dealLast']) {
+			if (deal['config']['dealLast']) {
 
 				dealLast = true;
 			}
 		}
 	}
 
-	// Start another bot deal if max deals, max pairs have not been reached, and pair is not blacklisted
-	if (!isPairBlackListed && !pairDealsLast && !dealStop && botFoundDb && botActive && !dealLast && (pairCount < pairMax || pairMax == 0)) {
+	// Centralised permission check — blacklist, globalPairLimit, pairMax
+	// dealsActive is passed as [] because dcaFollow handles pairDealsLast separately above
+	// and the pair's current deal is already closed (status:1) before this point
+	// Guard: only call canStartDeal when bot is active and config is available
+	const { allowed: canStart } = (botFoundDb && botActive && botConfigDb)
+		? await canStartDeal({
+			pair,
+			config: botConfigDb,
+			pairCount,
+			dealsActive: []
+		})
+		: { allowed: false, reason: '' };
 
-		let configObj = JSON.parse(JSON.stringify(config));
+	// Start another bot deal if all conditions are met
+	if (canStart && !pairDealsLast && !dealStop && botFoundDb && botActive && !dealLast) {
+
+		const configObj = JSON.parse(JSON.stringify(config));
 
 		if (pairFoundDb && (dealCount < dealMax || dealMax == 0)) {
 
-			botConfigDb['pair'] = pair; // Set single pair
+			botConfigDb['pair']      = pair;
 			botConfigDb['dealCount'] = configObj['dealCount'];
-
-			// Increment deal count
 			botConfigDb['dealCount']++;
 
-			// Apply config data again
 			botConfigDb = await applyConfigData({ 'signal_id': configObj.signalId, 'bot_id': botIdMain, 'bot_name': botNameMain, 'config': botConfigDb });
 
 			if (shareData.appData.verboseLog) {
@@ -770,32 +896,1246 @@ async function start(dataObj, startId) {
 				Common.logger(colors.bgGreen('Starting new bot deal for ' + pair.toUpperCase() + ' ' + botConfigDb['dealCount'] + ' / ' + botConfigDb['dealMax']));
 			}
 
-			if (botConfigDb['dealCoolDown'] == 0) {
+			const coolDown = botConfigDb['dealCoolDown'] || 0;
 
-				start({ 'create': true, 'config': botConfigDb });
+			if (coolDown > 0 && shareData.appData.verboseLog) {
+
+				Common.logger(colors.bgYellow.bold('Waiting ' + coolDown + ' seconds for ' + pair.toUpperCase() + ' cooldown before starting new deal.'));
 			}
-			else {
 
-				if (shareData.appData.verboseLog) {
-
-					Common.logger(colors.bgYellow.bold('Waiting ' + botConfigDb['dealCoolDown'] + ' seconds for ' + pair.toUpperCase() + ' cooldown before starting new deal.'));
-				}
-
-				startDelay({ 'config': botConfigDb, 'delay': botConfigDb['dealCoolDown'], 'notify': false });
-			}
+			requestDealStart(botConfigDb, coolDown, 'deal complete');
 		}
 		else {
 
 			// Check for another pair to start if deal max reached above on current pair
 			// Deal max will be reset so current pair could still begin again at some point
-
 			startAsap(pair);
 		}
 	}
 
-	// Ensure deal tracker is removed
-	deleteDealTracker(dealIdMain);
+	// Clean up deal tracker
+	deleteDealTracker(dealId);
 }
+
+
+// Handles a deal's base order (isStart:0) for one dcaFollow tick. Extracted from
+// dcaFollow verbatim (#60) — behaviour is identical to the original inline block.
+// Returns the loop signal { success, finished } that dcaFollow returns directly.
+// Pause flags are passed in (read fresh from the deal each tick by the caller);
+// the handler's own pause-flag mutations are local — they only feed this tick's
+// tracker updates and returns, and are never read after the handler returns.
+const handleBaseOrder = async ({ config, exchange, dealId, deal, orders, pair, price, isDealPause, isDealPauseBuy, isDealPauseSell, isDealPauseReason, dcaError, cancelOnly }) => {
+
+	// Local tracker-update helper. The three base-order tracker refreshes below are
+	// identical except for the error value, and all read the current pause flags —
+	// which the invalid_order path mutates before its own refresh. Capturing the
+	// pause vars by closure means each call sees their live values (exactly as the
+	// former inline object literals did), so only the error is passed per call.
+	const trackBaseDeal = async (error) => {
+
+		await updateDealTracker({
+			'exchange': exchange,
+			'deal_id': dealId,
+			'price': price,
+			'config': config,
+			'orders': orders,
+			'pause': isDealPause,
+			'pause_buy': isDealPauseBuy,
+			'pause_sell': isDealPauseSell,
+			'pause_reason': isDealPauseReason,
+			'error': error
+		});
+	};
+
+	// Defence in depth — circuit breaker should already have been caught
+	// by canStartDeal before reaching here, but guard at the exchange call
+	// level too in case start() is ever called from a path that bypasses
+	// the serial queue (e.g. resume on startup).
+	if (shareData.appData.circuit_breaker_active) {
+
+		Common.logger(colors.yellow.bold('Circuit Breaker Active: ' + shareData.appData.circuit_breaker_active + ' - Blocking base order for deal ' + dealId));
+
+		return ( LOOP_RETRY );
+	}
+
+	// If the base order is paused (mid-verify after a previous invalid_order),
+	// do not place another buy. Refresh the tracker (so info.updated stays
+	// current and the system-pause banner keeps showing), then return
+	// finished:false so the follow loop stays alive and keeps ticking. This
+	// mirrors the safety order path exactly: the pause is the re-entry guard
+	// WITHIN a live loop — not a loop exit. When verifyInvalidOrder unpauses
+	// the deal in the background, this same loop resumes and advances it to
+	// isStart:1. Refreshing here (as the isStart==1 paused path also does)
+	// prevents checkTrackers from firing false "deal stale" warnings during
+	// the verification window, which can span up to ~200 minutes.
+	if (isDealPause || isDealPauseBuy) {
+
+		await trackBaseDeal(dcaError);
+
+		return ( LOOP_RETRY );
+	}
+
+	let buyError;
+	let buyOrderId = '';
+	let buySuccess = true;
+	let buyOrderInvalid = false;
+	let buyResult = null;
+
+	// Single loop-signal this function returns (one exit at the end). Defaults to
+	// "filled — continue the loop", which is also the limit-order fall-through value.
+	// Each buy outcome below overwrites it; the two guard clauses above return early.
+	let result = LOOP_CONTINUE;
+
+	const baseOrder = deal.orders[0];
+
+	// Something went wrong, don't allow deal to start
+	if (cancelOnly) {
+
+		buySuccess = false;
+	}
+
+	if (baseOrder.type == 'MARKET') {
+		//Send market order to exchange
+
+		if (!config.sandBox && !cancelOnly) {
+
+			const priceFiltered = await filterPrice(exchange, pair, price);
+
+			const buy = await buyOrder(exchange, dealId, pair, baseOrder.qty, priceFiltered);
+
+			if (!buy.success || (buy.success && !buy.success_verify)) {
+
+				buySuccess = false;
+				buyError = buy.message;
+				buyOrderInvalid = buy.invalid_order || false;
+				buyResult = buy;
+			}
+			else {
+
+				buyOrderId = buy['data']['id'];
+			}
+		}
+
+		if (buySuccess) {
+
+			orders[0].filled = 1;
+			orders[0].orderId = buyOrderId;
+			orders[0].dateFilled = new Date();
+
+			if (shareData.appData.verboseLog) {
+
+				Common.logger(
+					colors.green.bold.italic(
+					'Pair: ' +
+					pair +
+					'\tQty: ' +
+					baseOrder.qty +
+					'\tPrice: ' +
+					baseOrder.price +
+					'\tAmount: ' +
+					baseOrder.amount +
+					'\tStatus: Filled'
+					)
+				);
+			}
+
+			await Deals.updateOne({
+				dealId: dealId
+			}, {
+				isStart: 1,
+				orders: orders
+			});
+		}
+
+		await trackBaseDeal(buyError);
+
+		if (!buySuccess) {
+
+			// Base order placed but the exchange could not confirm it (invalid_order).
+			// The order is likely filled — do NOT delete the deal. Pause it, store the
+			// order ID, and verify in the background. This mirrors the safety order path.
+			if (buyOrderInvalid && buyResult && buyResult['data'] && buyResult['data']['id']) {
+
+				const retryMins = 2;
+				const unverifiedOrderId = buyResult['data']['id'];
+
+				// Store the order ID on the base order so the startup resume path
+				// can find it if SymBot restarts mid-verification.
+				orders[0].orderId = unverifiedOrderId;
+				await Deals.updateOne({ dealId: dealId }, { orders: orders });
+
+				const msgErr = 'Invalid base order for deal ID ' + dealId + '. Pausing deal and verifying in ' + retryMins + ' minutes.';
+				await sendDealMessage('deal_error', msgErr);
+
+				isDealPauseReason = 'order_verify_buy';
+				await pauseDeal(config.botId, dealId, null, true, null, isDealPauseReason);
+				isDealPauseBuy = true;
+
+				// Refresh the tracker now that the deal is paused so its info carries
+				// pause_reason. getDealInfo returns a minimal paused info object for an
+				// isStart:0 deal, which lets the UI render the system-pause banner.
+				// (The earlier updateDealTracker call above ran before the pause was set,
+				// so at that point getDealInfo returned no info for this unfilled deal.)
+				await trackBaseDeal(buyError);
+
+				// On successful verification, mark the base order filled and advance
+				// the deal to isStart=1 — EXACTLY what the normal base-order success
+				// path does. We keep SymBot's pre-calculated qty/amount/average/target
+				// untouched so fee accounting, take-profit and profit% are identical to
+				// a normally-filled base order. We do not overwrite with raw exchange
+				// values and do not recalculate the ladder.
+				const handleBaseOrderVerified = async (verifyData) => {
+
+					orders[0].filled = 1;
+					orders[0].orderId = unverifiedOrderId;
+					orders[0].dateFilled = new Date();
+
+					await Deals.updateOne({ dealId: dealId }, { isStart: 1, orders: orders });
+				};
+
+				const verifyPromise = verifyInvalidOrder({ count: 0, mins: retryMins, exchange, pair, botId: config.botId, dealId, orderId: unverifiedOrderId, onSuccessCallback: handleBaseOrderVerified, pauseBeforeCallback: false });
+
+				verifyPromise.then(async (verifyResult) => {
+
+					if (verifyResult.retriesExhausted) {
+
+						// Retries exhausted and the order still could not be confirmed.
+						// The asset may be sitting on the exchange untracked — warn the
+						// user to verify manually, then disable the bot and remove the deal.
+						const exhaustMsg = 'Base order verification retries exhausted for deal ID ' + dealId + ' (order ' + unverifiedOrderId + '). The asset may be on the exchange — verify manually before re-enabling bot ' + config.botName + '. Disabling bot and removing deal.';
+						await sendDealMessage('deal_error', exhaustMsg);
+
+						await processOrderError({ 'bot_id': config.botId, 'deal_id': dealId, 'bot_name': config.botName });
+						await deleteDeal(dealId);
+
+						// Remove the tracker entry immediately so no phantom row lingers in
+						// the UI. The live follow loop also stops on its next tick when it finds
+						// the deal gone (dcaFollow returns finished:true on not-found), and
+						// onDealComplete would delete the tracker then too — deleteDealTracker
+						// is idempotent, so the redundant call is safe.
+						await deleteDealTracker(dealId);
+					}
+				});
+
+				// finished:false so the follow loop stays alive. The deal is now paused,
+				// so the pause guard at the top of this function no-ops every subsequent
+				// tick (no re-buy). When verifyInvalidOrder succeeds it advances the deal
+				// to isStart:1 and unpauses; this same live loop then picks up and
+				// continues into normal safety-order / sell monitoring. This mirrors the
+				// safety order path, which also stays alive — NOT a loop exit.
+				result = LOOP_RETRY;
+			}
+			else {
+
+				// Order never placed (genuine exchange rejection, e.g. BadRequest limit-only,
+				// or cancelOnly). No asset on the exchange — disable bot and remove deal.
+				const statusObj = await processOrderError({ 'bot_id': config.botId, 'deal_id': dealId, 'bot_name': config.botName });
+
+				if (statusObj['success']) {
+
+					await deleteDeal(dealId);
+
+					// Deal removed — signal the loop to stop.
+					result = LOOP_STOPPED;
+				}
+				else {
+
+					// Could not disable/remove — stay alive and let a later tick retry.
+					result = LOOP_RETRY;
+				}
+			}
+		}
+	}
+	else {
+
+		// Limit order logic — not yet implemented. Leaves the default loop-continue
+		// signal in place, exactly as the original inline block did (it returned nothing
+		// and let dcaFollow's default { success:true, finished:false } stand).
+	}
+
+	return ( result );
+};
+
+
+const handleSell = async ({ config, exchange, dealId, deal, orders, order, currentOrder, filledOrders, pair, price, priceSellOrder, profit, profitBase, profitQuote, profitPerc, isDealPause, isDealPauseBuy, isDealPauseSell, isDealPauseReason, isDealCancel, isDealPanicSell, isDealVerifying, cancelOnly }) => {
+
+	// success/finished are the loop signal this handler returns. In dcaFollow these were
+	// function-scope with defaults success=true, finished=false; kept identical here so the
+	// (unreachable) deal-not-started fall-through returns the same {true,false} the original
+	// did. Within the sell path success is re-affirmed true and finished is set true only when
+	// the deal sells out (status:1); otherwise the deal keeps following.
+	let success = true;
+	let finished = false;
+
+	if (deal.isStart == 1) {
+
+		let qtySumSellOrder;
+
+		let profitCurrency = config['profitCurrency'];
+
+		let sellOrderIds = [];
+		let sellError;
+		let sellOrderPrice;
+		let sellOrderInvalid = false;
+		let sellOrderStatusInvalid = false;
+		let sellNSF = false;
+		let sellSuccess = true;
+
+		// Actual execution tally for this sell. A sell can complete as several partial
+		// fills at different prices (exchange cancels part way, remainder retried), so
+		// recording each fill lets the closed deal report what really executed instead
+		// of the pre-calculated ladder quantity valued at a single price.
+		//
+		// Observational only — it never feeds order sizing. The retry loops keep using
+		// qtySumSellOrder as the read-only ceiling exactly as before, so nothing here
+		// can change what gets sold. It is consumed only when building sellData, and
+		// only when it passes the checks in resolveFillSummary.
+		const fillTracker = {
+			'fills': [],
+			'qty': 0,
+			'proceeds': 0
+		};
+
+		// Record one executed fill.
+		//
+		// Exchange support for fill data varies widely across the exchanges CCXT
+		// covers, so the per-fill value is resolved through a precedence chain of
+		// CCXT unified fields, most trustworthy first:
+		//
+		//   1. average * qty  — 'average' is CCXT's volume-weighted fill price, i.e.
+		//                       unambiguously a PRICE, so it cannot silently include fees.
+		//                       Safest source where the exchange reports it.
+		//   2. cost           — CCXT's executed value. Preferred over 'price' because 'price'
+		//                       is rounded for display (observed live: the two differing
+		//                       by ~0.07% across a multi-fill sell) and on many exchanges
+		//                       'price' is the REQUESTED price, empty for market orders.
+		//                       CCXT maintainers note some exchanges fold fees into 'cost';
+		//                       since calculateProfit subtracts the configured exchangeFee
+		//                       itself, a fee-inclusive cost would be double-counted. It is
+		//                       therefore cross-checked against price * qty below.
+		//   3. price * qty    — CCXT's convention is cost = filled * price, so this
+		//                       reconstructs the same figure when cost is absent or rejected.
+		//   4. requested * qty— last resort. NOT evidence of execution, so it is tagged
+		//                       'requested' and resolveFillSummary rejects the summary.
+		//
+		// Exchanges that report nothing usable (some return null/zero for all of
+		// price, cost and average even after fetchOrder) fall through to 4 and the
+		// deal reports exactly as it does today. Quantity is still counted so the
+		// shortfall figure stays correct regardless.
+		const recordFill = (qtyFilled, orderData, requestedPrice) => {
+
+			const qty = Number(qtyFilled);
+
+			if (!isFinite(qty) || qty <= 0) {
+
+				return;
+			}
+
+			const num = (v) => {
+
+				const n = Number(v);
+
+				return (isFinite(n) && n > 0 ? n : 0);
+			};
+
+			const avg    = num(orderData?.['average']);
+			const cost   = num(orderData?.['amount']);
+			const px     = num(orderData?.['price']);
+			const reqPx  = num(requestedPrice ?? price);
+
+			let value = 0;
+			let valueSource = 'none';
+
+			if (avg > 0) {
+
+				value = qty * avg;
+				valueSource = 'average';
+			}
+			else if (cost > 0) {
+
+				// Guard against exchanges reporting cost net of fees. calculateProfit
+				// applies the configured exchangeFee itself, so a fee-inclusive cost
+				// would deduct fees twice and understate every partial-fill deal. On a
+				// sell, a cost materially BELOW price * qty is the signature of a
+				// fee-inclusive figure, so fall through to price instead. Display
+				// rounding is far smaller than any real fee, hence the tolerance.
+				// Where no price is available to compare, cost is used as-is.
+				const costImpliedPrice = cost / qty;
+
+				if (px > 0 && costImpliedPrice < (px * (1 - (costFeeTolerancePercent / 100)))) {
+
+					value = qty * px;
+					valueSource = 'price';
+				}
+				else {
+
+					value = cost;
+					valueSource = 'cost';
+				}
+			}
+			else if (px > 0) {
+
+				value = qty * px;
+				valueSource = 'price';
+			}
+			else if (reqPx > 0) {
+
+				value = qty * reqPx;
+				valueSource = 'requested';
+			}
+
+			fillTracker['fills'].push({
+				'qty': qty,
+				'price': value > 0 ? (value / qty) : 0,
+				'value': value,
+				'value_source': valueSource
+			});
+
+			fillTracker['qty'] += qty;
+			fillTracker['proceeds'] += value;
+		};
+
+		const sellDataObj = await processSellData(pair, price, dealId, exchange, config, currentOrder, filledOrders);
+
+		const feeData = sellDataObj['fee_data'];
+
+		const qtySumSell = feeData['dcaOrderQtySumNet'];
+		const priceFiltered = feeData['priceFiltered'];
+		const exchangeFeePercent = feeData['exchangeFeePercent'];
+		const minMoveAmount = feeData['minMoveAmount'];
+
+		const qtySumSellBase = await filterAmount(exchange, pair, (Number(qtySumSell) - Number(profitBase)));
+
+		// Default profit currency to quote if not defined or profit is negative
+		if (!profitCurrency || profitCurrency == 'quote' || Number(profitBase) <= 0) {
+
+			qtySumSellOrder = qtySumSell;
+		}
+		else {
+
+			qtySumSellOrder = qtySumSellBase;
+		}
+
+		// Calculate profit based on new exchange fee percent
+		//const profitData = await calculateProfit(price, config.sandBox, currentOrder.average, currentOrder.sum, config.dcaTakeProfitPercent, exchangeFeePercent);
+		//const profitPercFinal = profitData['profit_percentage'];
+		const profitPercFinal = Number(Number(profitPerc - feeData['exchangeFeeSumDiffPercent']).toFixed(2));
+
+		// Decide whether the recorded fills are trustworthy enough to report profit
+		// from. Exchange fill data already drives order sizing (the retry loops depend
+		// on data_order.quantity), but reporting has a higher bar: a wrong number here
+		// yields a confidently wrong profit figure, which is worse than the
+		// pre-calculated estimate. Actuals are therefore corroborating, not
+		// authoritative — any check failing falls back to exactly today's behaviour.
+		//
+		// Checks:
+		//   1. At least one fill with positive quantity was recorded.
+		//   2. Every fill's value came from the exchange (amount or executed price).
+		//      A value derived from the requested price is not evidence of execution.
+		//   3. Total filled does not exceed the planned quantity beyond a rounding
+		//      tolerance — selling more than was held means the data is wrong.
+		//   4. VWAP is finite and positive.
+		//
+		// Returns null when actuals should not be used.
+		const resolveFillSummary = (plannedQty) => {
+
+			const planned = Number(plannedQty);
+
+			if (!fillTracker['fills'].length || fillTracker['qty'] <= 0) {
+
+				return (null);
+			}
+
+			// Only values the exchange actually reported count as evidence of execution.
+			const trustedSources = ['average', 'cost', 'price'];
+
+			const anyUntrusted = fillTracker['fills'].some(f => trustedSources.indexOf(f['value_source']) === -1);
+
+			if (anyUntrusted) {
+
+				return (null);
+			}
+
+			if (isFinite(planned) && planned > 0 && fillTracker['qty'] > (planned * 1.001)) {
+
+				return (null);
+			}
+
+			const vwap = fillTracker['proceeds'] / fillTracker['qty'];
+
+			if (!isFinite(vwap) || vwap <= 0) {
+
+				return (null);
+			}
+
+			// Sanity-check the VWAP against the market price this sell was placed at.
+			// Some exchanges return values in the wrong unit or scale (cost in base
+			// rather than quote, prices in satoshi-like integers). A VWAP wildly away
+			// from the price the order was submitted at means the reported figures
+			// cannot be interpreted safely, so fall back rather than report nonsense.
+			const referencePrice = Number(price);
+
+			if (isFinite(referencePrice) && referencePrice > 0) {
+
+				const ratio = vwap / referencePrice;
+
+				if (ratio < 0.5 || ratio > 2) {
+
+					Common.logger(colors.bgRed.bold(
+						'Fill data rejected for deal ID ' + dealId +
+						' — VWAP ' + vwap + ' implausible vs market price ' + referencePrice +
+						'. Reporting from pre-calculated values instead.'
+					));
+
+					return (null);
+				}
+			}
+
+			const qtyUnsold = (isFinite(planned) && planned > 0) ? Math.max(planned - fillTracker['qty'], 0) : 0;
+
+			return ({
+				'qty_filled': fillTracker['qty'],
+				'vwap': vwap,
+				'proceeds': fillTracker['proceeds'],
+				'fill_count': fillTracker['fills'].length,
+				'qty_unsold': qtyUnsold,
+				'partial': qtyUnsold > 0 || fillTracker['fills'].length > 1
+			});
+		};
+
+		const handleSuccessfulSell = async (verifyData) => {
+
+			// Sell price/profit default to the values computed when the sell was
+			// first attempted (market price at that moment). If this callback is
+			// running after a late invalid_order verification, the order actually
+			// filled minutes earlier at a different price — use the exchange's
+			// reported fill price so recorded profit matches the real execution
+			// rather than the market price at verification time.
+			//
+			// Quantity is unaffected (qtySum comes from accumulated buys), so only
+			// the sell price and the profit figures derived from it are recomputed.
+			// The fee adjustment (exchangeFeeSumDiffPercent) is derived from the
+			// buy-side sums and does not depend on the sell price, so it is reused.
+			let sellPriceFinal   = price;
+			let profitFinal      = profitPercFinal;
+			let profitBaseFinal  = profitBase;
+			let profitQuoteFinal = profitQuote;
+
+			if (verifyData && verifyData.order_price && Number(verifyData.order_price) > 0) {
+
+				sellPriceFinal = Number(verifyData.order_price);
+
+				const profitDataVerified = await calculateProfit(exchange, pair, sellPriceFinal, currentOrder.average, currentOrder.sum, config.dcaTakeProfitPercent, config.exchangeFee, config.sandBox);
+
+				profitBaseFinal  = profitDataVerified['profit_base'];
+				profitQuoteFinal = profitDataVerified['profit'];
+				profitFinal      = Number(Number(profitDataVerified['profit_percentage'] - feeData['exchangeFeeSumDiffPercent']).toFixed(2));
+			}
+
+			// Recompute from what actually executed when the sell completed as more than
+			// one fill (or left a shortfall) and the recorded fills pass their checks. A
+			// clean single-fill sell produces identical numbers either way — filled
+			// quantity equals planned and VWAP equals the single fill price — so this
+			// only moves deals whose reported figures were wrong.
+			//
+			// Only the INPUTS change: sell price becomes the volume-weighted average of
+			// the fills, and the cost basis covers only the quantity that actually sold.
+			// Fee handling is untouched — same configured exchangeFee, same
+			// calculateProfit path, same exchangeFeeSumDiffPercent adjustment.
+			const fillSummary = resolveFillSummary(qtySumSellOrder);
+
+			let profitSource = 'planned';
+			let qtySoldFinal = currentOrder.qtySum;
+
+			if (fillSummary && fillSummary['partial']) {
+
+				// Cost basis matched to the quantity that sold, so the deal is not charged
+				// for coin it still holds. Scale currentOrder.sum by the fraction of the
+				// ACCUMULATED BUY quantity (currentOrder.qtySum) that sold — qtySum is what
+				// currentOrder.sum paid for. Scaling by qtySumSellOrder would mix
+				// denominators: that figure is already net of the sell-side fee reduction,
+				// so it is smaller than qtySum and would understate the basis.
+				const basisQtyTotal = Number(currentOrder.qtySum);
+				const basisSumTotal = Number(currentOrder.sum);
+
+				let basisMatched;
+
+				if (isFinite(basisQtyTotal) && basisQtyTotal > 0 && isFinite(basisSumTotal) && basisSumTotal > 0) {
+
+					basisMatched = basisSumTotal * Math.min(fillSummary['qty_filled'] / basisQtyTotal, 1);
+				}
+				else {
+
+					basisMatched = fillSummary['qty_filled'] * Number(currentOrder.average);
+				}
+
+				const profitDataActual = await calculateProfit(exchange, pair, fillSummary['vwap'], currentOrder.average, basisMatched, config.dcaTakeProfitPercent, config.exchangeFee, config.sandBox);
+
+				sellPriceFinal   = Number(Number(fillSummary['vwap']).toFixed(10));
+				profitBaseFinal  = profitDataActual['profit_base'];
+				profitQuoteFinal = profitDataActual['profit'];
+				profitFinal      = Number(Number(profitDataActual['profit_percentage'] - feeData['exchangeFeeSumDiffPercent']).toFixed(2));
+
+				qtySoldFinal = fillSummary['qty_filled'];
+				profitSource = 'actual';
+
+				Common.logger(colors.bgYellow.bold(
+					'Profit from actual fills for deal ID ' + dealId +
+					' / Fills: ' + fillSummary['fill_count'] +
+					' / Sold: ' + fillSummary['qty_filled'].toFixed(8) +
+					' of ' + Number(qtySumSellOrder).toFixed(8) +
+					' / VWAP: ' + formatPrice(pair, fillSummary['vwap']) +
+					' / Proceeds: ' + formatPrice(pair, Number(fillSummary['proceeds']).toFixed(8)) +
+					(fillSummary['qty_unsold'] > 0 ? ' / Unsold: ' + fillSummary['qty_unsold'].toFixed(8) : '')
+				));
+
+				if (fillSummary['qty_unsold'] > 0) {
+
+					await sendDealMessage('deal_error',
+						'Deal ID ' + dealId + ' closed with ' + fillSummary['qty_unsold'].toFixed(8) + ' ' + (pair.split('/')[0] || '') +
+						' unsold (below retry threshold). This quantity is not tracked in the deal — reconcile manually.'
+					);
+				}
+			}
+
+			await updateDealTracker({
+				'exchange': exchange,
+				'deal_id': dealId,
+				'price': sellPriceFinal,
+				'config': config,
+				'orders': orders,
+				'pause': isDealPause,
+				'pause_buy': isDealPauseBuy,
+				'pause_sell': isDealPauseSell,
+				'pause_reason': isDealPauseReason
+			});
+
+			if (shareData.appData.verboseLog) {
+
+				Common.logger(
+				colors.blue.bold.italic(
+				formatDealStatusLine({
+					'pair': pair,
+					'qty': qtySoldFinal,
+					'lastPrice': sellPriceFinal,
+					'dcaPrice': currentOrder.average,
+					'sellPrice': currentOrder.target,
+					'status': colors.red('SELL'),
+					'profit': profitFinal
+				})
+				));
+			}
+
+			// orderId is stored as an array for partial fill retry compatibility.
+			// Single-order deals will have a one-element array.
+			// Legacy deals with a string orderId are handled transparently by consumers.
+			// Existing keys are unchanged in name, meaning and type — qtySum remains the
+			// deal's accumulated buy quantity and price remains the figure profit was
+			// derived from (the VWAP when fills were used). The fields after feeData are
+			// additive: consumers unaware of them are unaffected, and they are absent on
+			// deals closed before this change, so readers must treat them as optional.
+			const sellData = {
+				'date': new Date(),
+				'orderId': sellOrderIds,
+				'qtySum': currentOrder.qtySum,
+				'qtySumSell': qtySumSell,
+				'qtySumSellOrder': qtySumSellOrder,
+				'price': sellPriceFinal,
+				'average': currentOrder.average,
+				'target': currentOrder.target,
+				'profit': profitFinal,
+				'profitBase': profitBaseFinal,
+				'profitQuote': profitQuoteFinal,
+				'feeData': feeData,
+				'profitSource': profitSource,
+				'qtySold': qtySoldFinal,
+				'qtyUnsold': fillSummary ? fillSummary['qty_unsold'] : 0,
+				'fillCount': fillSummary ? fillSummary['fill_count'] : (sellOrderIds.length || 1),
+				'proceeds': fillSummary ? fillSummary['proceeds'] : null,
+				'fills': fillTracker['fills']
+				 };
+
+			await Deals.updateOne({ dealId }, {
+				'sellData': sellData,
+				'panicSell': isDealPanicSell,
+				'canceled': isDealCancel,
+				'status': 1
+				  });
+
+			finished = true;
+
+			await deleteDealTracker(dealId);
+
+			if (shareData.appData.verboseLog) {
+
+				Common.logger(colors.bgRed('Deal ID ' + dealId + ' DCA Bot Finished.'));
+			}
+
+			sendNotificationFinish(config.botName, dealId, pair, sellData);
+		};
+
+		if (!config.sandBox && !isDealCancel && !cancelOnly) {
+
+			const sell = await sellOrder(exchange, dealId, pair, qtySumSellOrder, priceFiltered);
+
+			// Sell not successful / Sell successful but verification failed
+			if (!sell.success || (sell.success && !sell.success_verify)) {
+
+				// sellOrderInvalid - Order not found or unable to be looked up on exchange
+				// sellOrderStatusInvalid - Order may have been canceled by exchange or some other issue
+
+				sellSuccess = false;
+
+				sellOrderInvalid = sell.invalid_order;
+				sellOrderStatusInvalid = sell.invalid_status;
+				sellError = sell.message;
+				sellNSF = sell.nsf;
+
+				let msgErr = null;
+				let msgType = null;
+
+				if (sellNSF) {
+
+					// Let NSF reduce quantity sell error logic handle below
+				}
+				else if (sellOrderStatusInvalid) {
+
+					// Check if exchange cancelled after a partial fill (e.g. Coinbase price protection)
+					const cancelPartialFilled = orderFilledQty(sell);
+					const cancelShortfall = cancelPartialFilled > 0
+						? ((Number(qtySumSellOrder) - cancelPartialFilled) / Number(qtySumSellOrder)) * 100
+						: 0;
+
+					if (cancelPartialFilled > 0 && cancelShortfall > partialSellFillThresholdPercent) {
+
+						// Exchange cancelled after partial fill — record fill and
+						// wait for settlement before retrying the remainder
+						sellOrderIds.push(sell['data']['id']);
+
+						recordFill(cancelPartialFilled, sell['data_order'], priceFiltered);
+
+						Common.logger(colors.bgYellow.bold(
+							'Exchange-cancelled partial fill for deal ID ' + dealId +
+							' / Filled: ' + cancelPartialFilled.toFixed(8) +
+							' / Shortfall: ' + cancelShortfall.toFixed(2) + '% — waiting for settlement'
+						));
+
+						Common.sendNotification({
+							'message': `Partial sell fill for deal ID ${dealId}. Exchange cancelled after ${(100 - cancelShortfall).toFixed(0)}% filled. Waiting for settlement then retrying remainder.`,
+							'type': 'deal_error',
+							'telegram_id': shareData.appData.telegram_id
+						});
+
+						// Settlement delay — give exchange time to release remaining balance
+						const settlementDelayMs = 30000;
+						await Common.delay(settlementDelayMs);
+
+						let cancelRetryCount = 0;
+						let cancelTotalFilled = cancelPartialFilled;
+						let cancelQtyRemaining = Number(qtySumSellOrder) - cancelTotalFilled;
+
+						while (cancelRetryCount < maxPartialSellRetries && cancelQtyRemaining > 0) {
+
+							if (isDealCancel || isDealPanicSell) break;
+
+							await Common.delay(partialSellRetryDelayMs);
+							cancelRetryCount++;
+
+							const cancelSymData = await getSymbol(exchange, pair);
+							const cancelPrice = (cancelSymData.data?.bid ?? price);
+							const cancelPriceFiltered = await filterPrice(exchange, pair, cancelPrice);
+							const cancelQtyFiltered = await filterAmount(exchange, pair, cancelQtyRemaining);
+
+							if (!cancelQtyFiltered || Number(cancelQtyFiltered) <= 0) break;
+
+							Common.logger(colors.bgYellow.bold(
+								'Settlement retry ' + cancelRetryCount + '/' + maxPartialSellRetries +
+								' for deal ID ' + dealId + ' / Selling: ' + cancelQtyFiltered
+							));
+
+							const cancelSellRetry = await sellOrder(exchange, dealId, pair, cancelQtyFiltered, cancelPriceFiltered);
+
+							// Credit whatever actually filled this attempt, regardless of the
+							// final order status. A retry can partially fill then be cancelled by
+							// the exchange (e.g. Coinbase price protection) — that returns
+							// success_verify:false but still reports a real fill in
+							// data_order.quantity. Crediting only clean (success && success_verify)
+							// fills would drop that quantity, leaving cancelQtyRemaining too high so
+							// every later retry over-asks and hits InsufficientFunds. NSF attempts
+							// report an empty data_order so this credits 0 for them. Adjusts only the
+							// in-memory tally — the deal's pre-calculated qtySumSellOrder is never
+							// mutated and remains the read-only ceiling.
+							const cancelRetryFilled = orderFilledQty(cancelSellRetry);
+
+							if (cancelRetryFilled > 0) {
+
+								if (cancelSellRetry?.['data']?.['id']) {
+
+									sellOrderIds.push(cancelSellRetry['data']['id']);
+								}
+
+								recordFill(cancelRetryFilled, cancelSellRetry['data_order'], cancelPriceFiltered);
+
+								cancelTotalFilled += cancelRetryFilled;
+								cancelQtyRemaining = Number(qtySumSellOrder) - cancelTotalFilled;
+
+								if ((cancelQtyRemaining / Number(qtySumSellOrder)) * 100 <= partialSellFillThresholdPercent) break;
+							}
+							else if (cancelSellRetry.nsf) {
+
+								// Still settling — extend wait
+								await Common.delay(settlementDelayMs);
+							}
+						}
+
+						// Mark sell successful so deal closes with the partial fill
+						sellSuccess = true;
+						sellOrderStatusInvalid = false;
+
+					} else {
+
+						// Clean cancel with no partial fill — retry after short delay
+						await Common.delay(5000);
+					}
+				}
+				else if (sellOrderInvalid) {
+
+					const retryMins = 1;
+
+					msgType = 'deal_error';
+					msgErr = `Invalid order for deal ID ${dealId}. Pausing sell orders for ${retryMins} minutes.`;
+
+					isDealVerifying = true;
+
+					const verifyPromise = verifyInvalidOrder({ count: 0, mins: retryMins, exchange, pair, botId: config.botId, dealId, orderId: sell['data']['id'], onSuccessCallback: handleSuccessfulSell, pauseBeforeCallback: true });
+
+					// Reset verifying flag if needed
+					verifyPromise.then(async (verifyResult) => {
+
+						if (verifyResult.retriesExhausted || verifyResult.notPaused) {
+							clearSellErrorVerifying(dealId);
+						}
+					});
+				}
+				else {
+
+					msgType = 'deal_error';
+					msgErr = `An error occurred during sell order for deal ID ${dealId}. Pausing any further sell orders for deal.`;
+				}
+
+				if (msgErr) {
+
+					await sendDealMessage(msgType, msgErr);
+					isDealPauseReason = 'order_verify_sell';
+					await pauseDeal(config.botId, dealId, null, null, true, isDealPauseReason);
+					isDealPauseSell = true;
+				}
+			}
+			else {
+
+				// Initial sell succeeded — record this order ID and check for partial fill
+				sellOrderIds.push(sell['data']['id']);
+
+				const initialQtyFilled = orderFilledQty(sell);
+
+				recordFill(initialQtyFilled, sell['data_order'], priceFiltered);
+
+				let totalQtyFilled = initialQtyFilled;
+				let qtyRemaining = Number(qtySumSellOrder) - totalQtyFilled;
+
+				// Only attempt partial fill retry if the exchange reported a positive
+				// filled quantity. A zero or null quantity after a successful
+				// verifyBuySellOrder means the exchange didn't report the fill amount —
+				// not that nothing was filled. Retrying in that case would sell again
+				// on a position that has already been fully closed.
+				const shortfallPercent = initialQtyFilled > 0
+					? (qtyRemaining / Number(qtySumSellOrder)) * 100
+					: 0;
+
+				if (shortfallPercent > partialSellFillThresholdPercent) {
+
+					// Partial fill detected — attempt to sell the remainder
+					let retryCount = 0;
+
+					Common.logger(colors.bgYellow.bold(
+						'Partial sell fill detected for deal ID ' + dealId +
+						' / Requested: ' + qtySumSellOrder +
+						' / Filled: ' + totalQtyFilled.toFixed(8) +
+						' / Remaining: ' + qtyRemaining.toFixed(8) +
+						' / Shortfall: ' + shortfallPercent.toFixed(2) + '%'
+					));
+
+					Common.sendNotification({
+						'message': 'Partial sell fill detected for deal ID ' + dealId + '. Attempting to sell remaining quantity.',
+						'type': 'deal_error',
+						'telegram_id': shareData.appData.telegram_id
+					});
+
+					while (retryCount < maxPartialSellRetries && qtyRemaining > 0) {
+
+						// Stop retrying if a cancel or panic sell was requested
+						if (isDealCancel || isDealPanicSell) {
+
+							break;
+						}
+
+						await Common.delay(partialSellRetryDelayMs);
+
+						retryCount++;
+
+						// Get fresh price for this retry attempt
+						const symbolDataRetry = await getSymbol(exchange, pair);
+						const symbolRetry = symbolDataRetry.data;
+						const priceRetry = symbolRetry?.bid ?? price;
+						const priceRetryFiltered = await filterPrice(exchange, pair, priceRetry);
+
+						// Check the remaining qty meets exchange minimum after precision filter
+						const qtyRemainingFiltered = await filterAmount(exchange, pair, qtyRemaining);
+
+						if (!qtyRemainingFiltered || Number(qtyRemainingFiltered) <= 0) {
+
+							Common.logger(colors.bgYellow.bold(
+								'Partial sell retry halted for deal ID ' + dealId +
+								' — remaining quantity ' + qtyRemaining.toFixed(8) +
+								' is below exchange minimum. Accepting partial fill.'
+							));
+
+							break;
+						}
+
+						Common.logger(colors.bgYellow.bold(
+							'Partial sell retry ' + retryCount + '/' + maxPartialSellRetries +
+							' for deal ID ' + dealId +
+							' / Selling remaining: ' + qtyRemainingFiltered
+						));
+
+						const sellRetry = await sellOrder(exchange, dealId, pair, qtyRemainingFiltered, priceRetryFiltered);
+
+						// Credit whatever actually filled this attempt, regardless of the final
+						// order status. A retry can partially fill then be cancelled by the
+						// exchange (e.g. Coinbase price protection) — that returns
+						// success_verify:false but still reports a real fill in data_order.quantity.
+						// Crediting only clean fills would drop that quantity, leaving qtyRemaining
+						// too high so later retries over-ask and hit InsufficientFunds. A truly
+						// failed attempt reports an empty data_order and credits 0. Adjusts only the
+						// in-memory tally — pre-calculated qtySumSellOrder is never mutated.
+						const retryQtyFilled = orderFilledQty(sellRetry);
+
+						if (retryQtyFilled > 0) {
+
+							if (sellRetry?.['data']?.['id']) {
+
+								sellOrderIds.push(sellRetry['data']['id']);
+							}
+
+							recordFill(retryQtyFilled, sellRetry['data_order'], priceRetryFiltered);
+
+							totalQtyFilled += retryQtyFilled;
+							qtyRemaining = Number(qtySumSellOrder) - totalQtyFilled;
+
+							Common.logger(colors.bgYellow.bold(
+								'Partial sell retry ' + retryCount + ' filled for deal ID ' + dealId +
+								' / Filled this attempt: ' + retryQtyFilled.toFixed(8) +
+								' / Total filled: ' + totalQtyFilled.toFixed(8) +
+								' / Remaining: ' + qtyRemaining.toFixed(8)
+							));
+
+							const remainingShortfallPercent = (Math.max(qtyRemaining, 0) / Number(qtySumSellOrder)) * 100;
+
+							if (remainingShortfallPercent <= partialSellFillThresholdPercent) {
+
+								// Within acceptable threshold — done
+								break;
+							}
+						}
+						else {
+
+							Common.logger(colors.bgYellow.bold(
+								'Partial sell retry ' + retryCount + ' filled nothing for deal ID ' + dealId +
+								': ' + (sellRetry.message || 'unknown error')
+							));
+						}
+					}
+
+					if (retryCount >= maxPartialSellRetries) {
+
+						const finalShortfall = ((Math.max(qtyRemaining, 0) / Number(qtySumSellOrder)) * 100).toFixed(2);
+
+						Common.logger(colors.bgRed.bold(
+							'Max partial sell retries reached for deal ID ' + dealId +
+							'. Accepting fill. Final shortfall: ' + finalShortfall + '%'
+						));
+
+						Common.sendNotification({
+							'message': 'Max partial sell retries reached for deal ID ' + dealId + '. Accepted fill with ' + finalShortfall + '% shortfall.',
+							'type': 'deal_error',
+							'telegram_id': shareData.appData.telegram_id
+						});
+					}
+				}
+			}
+		}
+
+		if (sellSuccess) {
+
+			await handleSuccessfulSell();
+		}
+		else {
+
+			// Sell failed
+			dealTracker[dealId]['update']['deal_sell_error']['nsf'] = sellNSF;
+			dealTracker[dealId]['update']['deal_sell_error']['verifying'] = isDealVerifying;
+			dealTracker[dealId]['update']['deal_sell_error']['count']++;
+			dealTracker[dealId]['update']['deal_sell_error']['date'] = new Date();
+
+			await Common.delay(1000);
+		}
+
+		success = true;
+	}
+
+	// Single exit. Within the sell path success stays true; finished becomes true only when
+	// the deal sells out (status:1). So the signal is DONE when sold out, else CONTINUE. If the
+	// deal is not started (unreachable — caller is already in the isStart:1 branch) the defaults
+	// keep success:true/finished:false, i.e. CONTINUE, matching dcaFollow's original fall-through.
+	return ( finished ? LOOP_DONE : LOOP_CONTINUE );
+};
+
+
+const handleSafetyOrder = async ({ config, exchange, dealId, deal, orders, order, currentOrder, pair, price, priceBuyOrder, profit, i, isDealPause, isDealPauseBuy, isDealPauseSell, isDealPauseReason, isDealCancel, isDealPanicSell, isDealVerifying, cancelOnly }) => {
+
+	// Working state, local to this handler (was per-iteration / preamble state in dcaFollow).
+	let buyError;
+	let buySuccess = true;
+	let buyOrderId = '';
+	let buyOrderPrice;
+	let buyOrderInvalid = false;
+	let buyOrderStatusInvalid = false;
+	let buyNSF = false;
+	// isBuy is propagated back to dcaFollow (read after the loop for the 'max safety orders
+	// used' log). Returned alongside the loop signal.
+	let isBuy = false;
+
+	//Buy DCA
+
+	// Circuit breaker blocks safety order buys
+	if (shareData.appData.circuit_breaker_active) {
+
+		Common.logger(colors.yellow.bold('Circuit Breaker Active: ' + shareData.appData.circuit_breaker_active + ' - Blocking safety order for deal ' + dealId));
+
+		return ( { 'result': LOOP_RETRY, 'isBuy': isBuy } );
+	}
+
+	isBuy = true;
+
+	const handleSuccessfulBuy = async ({ dealId, orderIndex, buyOrderId, buyOrderPrice, orders, price, currentOrder, exchange, pair, profit }) => {
+
+		let recalcPrice = price;
+
+		if (buyOrderPrice !== undefined && buyOrderPrice !== null && buyOrderPrice !== '' && buyOrderPrice !== 0) {
+
+			recalcPrice = buyOrderPrice;
+		}
+
+		const orderUpdated = await updateOrderDeal(dealId, orderIndex, buyOrderId, orders);
+
+		if (shareData.appData.verboseLog) {
+
+			Common.logger(
+				colors.blue.bold.italic(
+				formatDealStatusLine({
+					'pair': pair,
+					'qty': currentOrder.qtySum,
+					'lastPrice': price,
+					'dcaPrice': currentOrder.average,
+					'sellPrice': currentOrder.target,
+					'status': colors.green('BUY'),
+					'profit': profit
+				})
+			));
+		}
+
+		await recalculateOrders({
+			'exchange': exchange,
+			'dealId': dealId,
+			'orderIndex': undefined,
+			'orderNo': orderUpdated.orderNo,
+			'orderId': undefined,
+			'price': recalcPrice,
+			'dryRun': false
+		});
+	};
+
+	if (!config.sandBox) {
+
+		const priceFiltered = await filterPrice(exchange, pair, price);
+
+		// Record safety order trigger for circuit breaker evaluation
+		recordSafetyOrderTrigger(dealId, pair, price);
+
+		const buy = await buyOrder(exchange, dealId, pair, order.qty, priceFiltered);
+
+		const handleSuccessfulBuyPostVerify = async () => {
+
+			await handleSuccessfulBuy({
+				'dealId': dealId,
+				'orderIndex': i,
+				'buyOrderId': buy['data']['id'],
+				'buyOrderPrice': buy['data_order']['price'],
+				'orders': Common.deepCopy(orders),
+				'price': price,
+				'currentOrder': currentOrder,
+				'exchange': exchange,
+				'pair': pair,
+				'profit': profit
+			});
+
+			// Wait before unpausing deal in callback to ensure existing data settles
+			await Common.delay(5000);
+		};
+
+		// Buy not successful / Buy successful but verification failed 
+		if (!buy.success || (buy.success && !buy.success_verify)) {
+
+			buySuccess = false;
+
+			buyOrderInvalid = buy.invalid_order;
+			buyOrderStatusInvalid = buy.invalid_status;
+			buyError = buy.message;
+			buyNSF = buy.nsf;
+
+			let msgErr;
+			let msgType;
+
+			// Insufficient funds to buy
+			if (buyNSF) {
+
+				msgType = 'deal_error';
+				msgErr = 'Insufficient funds to buy order for deal ID ' + dealId + '. Pausing any further buy orders for deal.';
+			}
+			else if (buyOrderInvalid) {
+
+				const retryMins = 2;
+
+				msgType = 'deal_error';
+				msgErr = 'Invalid order for deal ID ' + dealId + '. Pausing buy orders for ' + retryMins + ' minutes.';
+
+				isDealVerifying = true;
+
+				const verifyPromise = verifyInvalidOrder({ count: 0, mins: retryMins, exchange, pair, botId: config.botId, dealId, orderId: buy['data']['id'], onSuccessCallback: handleSuccessfulBuyPostVerify, pauseBeforeCallback: false });
+
+				// Reset verifying flag if needed
+				verifyPromise.then(async (verifyResult) => {
+
+					if (verifyResult.retriesExhausted || verifyResult.notPaused) {
+						clearSellErrorVerifying(dealId);
+					}
+				});
+			}
+			else if (buyOrderStatusInvalid) {
+
+				// Exchange returned a terminal-but-not-clean status (e.g. Coinbase
+				// CANCELLED via "price protection point was breached"). Unlike an
+				// unverifiable order (buyOrderInvalid, which we retry), a status-invalid
+				// order is final — there is nothing to keep polling for. BUT the exchange
+				// may have PARTIALLY FILLED before cancelling: buyOrder surfaces that fill
+				// in data_order.quantity. We currently do NOT credit that partial into the
+				// deal ladder (that requires recomputing average/qty/target — tracked as a
+				// separate item, see backlog #66/#58). To avoid silently stranding coin,
+				// alert with the exact fill so it can be reconciled manually, then pause.
+				const buyPartialFilled = orderFilledQty(buy);
+
+				msgType = 'deal_error';
+
+				if (buyPartialFilled > 0) {
+
+					const buyPartialPrice = buy['data_order']?.['price'];
+					const buyPartialAmount = buy['data_order']?.['amount'];
+
+					msgErr = 'Exchange-cancelled PARTIAL buy fill for deal ID ' + dealId +
+						'. Filled ' + buyPartialFilled + ' ' + pair.split('/')[0] +
+						(buyPartialPrice != undefined ? ' @ $' + buyPartialPrice : '') +
+						(buyPartialAmount != undefined ? ' ($' + buyPartialAmount + ')' : '') +
+						' before the exchange cancelled the remainder. This fill is NOT yet ' +
+						'tracked in the deal — reconcile manually. Pausing further buy orders.';
+
+					Common.logger(colors.bgRed.bold(
+						'Exchange-cancelled partial BUY fill for deal ID ' + dealId +
+						' / Filled: ' + buyPartialFilled +
+						(buyPartialPrice != undefined ? ' @ $' + buyPartialPrice : '') +
+						' — NOT credited to deal, manual reconciliation required'
+					));
+
+					Common.sendNotification({
+						'message': `Partial BUY fill for deal ID ${dealId}. Exchange filled ${buyPartialFilled} ${pair.split('/')[0]}${buyPartialPrice != undefined ? ' @ $' + buyPartialPrice : ''} then cancelled the rest. This fill is NOT tracked in the deal — reconcile manually.`,
+						'type': 'deal_error',
+						'telegram_id': shareData.appData.telegram_id
+					});
+				}
+				else {
+
+					msgErr = 'Buy order for deal ID ' + dealId + ' was cancelled by the exchange with no fill. Pausing any further buy orders for deal.';
+				}
+			}
+			else {
+
+				msgType = 'deal_error';
+				msgErr = 'An error occurred during buy order for deal ID ' + dealId + '. Pausing any further buy orders for deal.';
+			}
+
+			// Pause deal buy orders
+			if (msgErr != undefined && msgErr != null && msgErr != '') {
+
+				await sendDealMessage(msgType, msgErr);
+
+				isDealPauseReason = 'order_verify_buy';
+				const pauseData = await pauseDeal(config.botId, dealId, null, true, null, isDealPauseReason);
+				isDealPauseBuy = true;
+			}
+		}
+		else {
+
+			buyOrderId = buy['data']['id'];
+			buyOrderPrice = buy['data_order']['price'];
+		}
+	}
+
+	if (buySuccess) {
+
+		await handleSuccessfulBuy({
+			'dealId': dealId,
+			'orderIndex': i,
+			'buyOrderId': buyOrderId,
+			'buyOrderPrice': buyOrderPrice,
+			'orders': orders,
+			'price': price,
+			'currentOrder': currentOrder,
+			'exchange': exchange,
+			'pair': pair,
+			'profit': profit
+		});
+	}
+
+	await updateDealTracker({
+				'exchange': exchange,
+				'deal_id': dealId,
+				'price': price,
+				'config': config,
+				'orders': orders,
+				'pause': isDealPause,
+				'pause_buy': isDealPauseBuy,
+				'pause_sell': isDealPauseSell,
+				'pause_reason': isDealPauseReason,
+				'error': buyError
+			});
+
+	// Single exit. On buy failure signal RETRY (loop keeps ticking, deal paused); on success
+	// result:null tells dcaFollow to fall through to its post-loop logic (incl. the isBuy log).
+	// isBuy is propagated either way (it was set true once a buy was attempted).
+	const result = buySuccess ? null : LOOP_RETRY;
+
+	return ( { 'result': result, 'isBuy': isBuy } );
+};
 
 
 const dcaFollow = async (configDataObj, exchange, dealId) => {
@@ -807,6 +2147,11 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 	let isDealPause = false;
 	let isDealPauseBuy = false;
 	let isDealPauseSell = false;
+	let isDealPauseReason = '';
+	let isDealVerifying = false;
+	let cancelOnly = false;
+
+	let dcaError;
 
 	let { priceSlippageBuyPercent, priceSlippageSellPercent } = await getSlippage(true);
 
@@ -814,24 +2159,24 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 
 		Common.logger(colors.red.bold(shareData.appData.database_error + ' - Not processing'));
 
-		return ( { 'success': false, 'finished': false } );
+		return ( LOOP_RETRY );
 	}
 
 	if (shareData.appData.system_pause != undefined && shareData.appData.system_pause != null && shareData.appData.system_pause != '') {
 
 		Common.logger(colors.red.bold('System Paused: ' + shareData.appData.system_pause + ' - Not processing deal ' + dealId));
 
-		return ( { 'success': false, 'finished': false } );
+		return ( LOOP_RETRY );
 	}
 
 	if (shareData.appData.sig_int) {
 
 		Common.logger(colors.red.bold(shareData.appData.name + ' is terminating. Not processing deal ' + dealId));
 
-		return ( { 'success': false, 'finished': false } );
+		return ( LOOP_RETRY );
 	}
 
-	if (dealTracker[dealId]['update'] != undefined && dealTracker[dealId]['update'] != null) {
+	if (dealTracker[dealId] != undefined && dealTracker[dealId] != null && dealTracker[dealId]['update'] != undefined && dealTracker[dealId]['update'] != null) {
 
 		if (dealTracker[dealId]['update']['deal_cancel']) {
 
@@ -848,7 +2193,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 
 			Common.logger(colors.red.bold('Deal ID ' + dealId + ' stop requested. Not processing'));
 	
-			return ( { 'success': false, 'finished': true } );
+			return ( LOOP_STOPPED );
 		}
 
 		// Refresh config without restarting deal
@@ -858,15 +2203,33 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 
 			delete dealTracker[dealId]['update']['config'];
 
-			return ( { 'success': true, 'finished': false, 'config': configRefresh } );
+			return ( loopContinueWithConfig(configRefresh) );
 		}
 
 		// Deal sell error
 		if (dealTracker[dealId]['update']['deal_sell_error']) {
 
+			let isMaxError = false;
+
 			let diffSec = (new Date().getTime() - new Date(dealTracker[dealId]['update']['deal_sell_error']['date']).getTime()) / 1000;
 
-			if (dealTracker[dealId]['update']['deal_sell_error']['count'] > maxSellErrorCount || diffSec > maxSellErrorResetSec) {
+			if (dealTracker[dealId]['update']['deal_sell_error']['verifying']) {
+
+				isDealVerifying = true;
+			}
+
+			if (dealTracker[dealId]['update']['deal_sell_error']['count'] > maxSellErrorCount) {
+
+				isMaxError = true;
+
+				let msg = 'WARNING: Unable to sell deal ID ' + dealId + '. Check the logs for details.';
+
+				Common.logger(colors.red.bold(msg));
+
+				Common.sendNotification({ 'message': msg, 'type': 'warning', 'telegram_id': shareData.appData.telegram_id });
+			}
+
+			if (!isDealVerifying && (isMaxError || diffSec > maxSellErrorResetSec)) {
 
 				delete dealTracker[dealId]['update']['deal_sell_error'];
 			}
@@ -891,20 +2254,63 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 			// Error getting symbol data
 			if (symbolData.error != undefined && symbolData.error != null) {
 
-				success = false;
+				// Problem getting symbol data. Only allow cancel
+				cancelOnly = true;
 
-				if (Object.keys(dealTracker).length == 0) {
+				dcaError = symbolData.error;
 
-					//process.exit(0);
-				}
+				//success = false;
 
-				return ( { 'success': success, 'finished': finished } );
+				//return ( { 'success': success, 'finished': finished } );
 			}
 
-			const bidPrice = symbol.bid;
-			const askPrice = symbol.ask;
+			const bidPrice = symbol?.bid ?? 0;
+			const askPrice = symbol?.ask ?? 0;
 
 			const price = parseFloat(bidPrice);
+
+			// Invalid price
+			if (price == undefined || price == null || price == '' || price === 0) {
+
+				cancelOnly = true;
+
+				let msg = 'Invalid Price: ' + price + ' / Pair: ' + pair + ' / Deal ID: ' + dealId;
+
+				if (shareData.appData.verboseLog) {
+					
+					Common.logger(colors.red.bold(msg));
+				}
+
+				// Track consecutive zero-price events per deal
+				if (!shareData.appData.cb_price_zero_tracker) shareData.appData.cb_price_zero_tracker = {};
+				const pzt = shareData.appData.cb_price_zero_tracker;
+				pzt[dealId] = (pzt[dealId] || 0) + 1;
+
+				const cbCfg = shareData.appData.circuit_breaker;
+				const zeroAlertThreshold = (cbCfg && cbCfg.price_zero_alert_count) || 4;
+
+				if (pzt[dealId] >= zeroAlertThreshold) {
+
+					if (cbCfg && cbCfg.enabled) {
+
+						Common.sendNotification({
+							'message': `⚠️ Invalid Price: 0\n\nPair: ${pair}\nDeal ID: ${dealId}\n\nPrice feed has returned 0 ${pzt[dealId]} consecutive times. The exchange may have an issue with this pair.`,
+							'type': 'warning',
+							'telegram_id': shareData.appData.telegram_id
+						});
+					}
+
+					// Reset counter after alert (or threshold reached) so it doesn't accumulate
+					pzt[dealId] = 0;
+				}
+			}
+			else {
+
+				// Valid price — reset zero counter for this deal
+				if (shareData.appData.cb_price_zero_tracker) {
+					shareData.appData.cb_price_zero_tracker[dealId] = 0;
+				}
+			}
 
 			let targetPrice = 0;
 
@@ -913,99 +2319,24 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 			isDealPause = Common.convertBoolean(deal.paused, false);
 			isDealPauseBuy = Common.convertBoolean(deal.pausedBuy, false);
 			isDealPauseSell = Common.convertBoolean(deal.pausedSell, false);
+			// Re-read the pause REASON from the deal each tick too (it's a string, not a
+			// boolean). The extracted handlers (handleSafetyOrder / handleSell) set the
+			// reason on their own local copy when they pause a deal for order verification;
+			// that local mutation does not propagate back here. Without refreshing it from
+			// the deal, the idle-arm updateDealTracker below would send pause_reason:'' on
+			// every subsequent paused tick, so the UI never renders the "system paused"
+			// (order_verify_buy) banner even though the deal is correctly paused.
+			isDealPauseReason = deal.pauseReason || '';
 
 			if (deal.isStart == 0) {
 
-				let buyError;
-				let buyOrderId = '';
-				let buySuccess = true;
+				const baseResult = await handleBaseOrder({
+					config, exchange, dealId, deal, orders, pair, price,
+					isDealPause, isDealPauseBuy, isDealPauseSell, isDealPauseReason,
+					dcaError, cancelOnly
+				});
 
-				const baseOrder = deal.orders[0];
-				targetPrice = baseOrder.target;
-
-				if (baseOrder.type == 'MARKET') {
-					//Send market order to exchange
-
-					if (!config.sandBox) {
-
-						const priceFiltered = await filterPrice(exchange, pair, price);
-
-						const buy = await buyOrder(exchange, dealId, pair, baseOrder.qty, priceFiltered);
-
-						if (!buy.success) {
-
-							buySuccess = false;
-							buyError = buy.message;
-						}
-						else {
-
-							buyOrderId = buy['data']['id'];
-						}
-					}
-
-					if (buySuccess) {
-
-						orders[0].filled = 1;
-						orders[0].orderId = buyOrderId;
-						orders[0].dateFilled = new Date();
-
-						if (shareData.appData.verboseLog) {
-
-							Common.logger(
-								colors.green.bold.italic(
-								'Pair: ' +
-								pair +
-								'\tQty: ' +
-								baseOrder.qty +
-								'\tPrice: ' +
-								baseOrder.price +
-								'\tAmount: ' +
-								baseOrder.amount +
-								'\tStatus: Filled'
-								)
-							);
-						}
-
-						await Deals.updateOne({
-							dealId: dealId
-						}, {
-							isStart: 1,
-							orders: orders
-						});
-					}
-
-					await updateDealTracker({ 
-												'deal_id': dealId,
-												'price': price,
-												'config': config,
-												'orders': orders,
-												'pause': isDealPause,
-												'pause_buy': isDealPauseBuy,
-												'pause_sell': isDealPauseSell,
-												'error': buyError
-											});
-
-					if (!buySuccess) {
-
-						// Initial buy failed
-						let finished = false;
-
-						const statusObj = await processOrderError({ 'bot_id': config.botId, 'deal_id': dealId, 'bot_name': config.botName });
-
-						if (statusObj['success']) {
-
-							await deleteDeal(dealId);
-
-							finished = true;
-						}
-
-						return ( { 'success': false, 'finished': finished } );
-					}
-				}
-				else {
-
-					// Limit order logic
-				}
+				return ( baseResult );
 			}
 			else {
 
@@ -1013,9 +2344,11 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 				const unfilledOrders = orders.filter(item => item.filled != 1);
 				const currentOrder = filledOrders.pop();
 
-				const profitData = await calculateProfit(price, config.sandBox, currentOrder.average, currentOrder.sum, config.dcaTakeProfitPercent, config.exchangeFee);
-				
+				const profitData = await calculateProfit(exchange, pair, price, currentOrder.average, currentOrder.sum, config.dcaTakeProfitPercent, config.exchangeFee, config.sandBox);
+
 				let profit = profitData['profit_percentage'];
+				let profitBase = profitData['profit_base'];
+				let profitQuote = profitData['profit'];
 
 				let profitPerc = profit;
 
@@ -1039,6 +2372,9 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 				for (let i = 0; i < orders.length; i++) {
 
 					let buyOrderId = '';
+					let buyOrderPrice;
+					let buyOrderInvalid = false;
+					let buyOrderStatusInvalid = false;
 					let buyNSF = false;
 
 					const order = orders[i];
@@ -1055,223 +2391,49 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 						const priceBuyOrder = parseFloat(Number(order.price) - (Number(order.price) * priceSlippageBuyPercent));
 						const priceSellOrder = parseFloat(Number(currentOrder.target) + (Number(currentOrder.target) * priceSlippageSellPercent));
 
-						if ((price <= priceBuyOrder && order.filled == 0) && !isDealPause && !isDealPauseBuy && !isDealCancel && !isDealPanicSell) {
-							//Buy DCA
+						if ((price <= priceBuyOrder && order.filled == 0) && !cancelOnly && !isDealPause && !isDealPauseBuy && !isDealCancel && !isDealPanicSell) {
 
-							isBuy = true;
+							const safetyResult = await handleSafetyOrder({
+								config, exchange, dealId, deal, orders, order, currentOrder, pair, price,
+								priceBuyOrder, profit, i, isDealPause, isDealPauseBuy, isDealPauseSell,
+								isDealPauseReason, isDealCancel, isDealPanicSell, isDealVerifying, cancelOnly
+							});
 
-							if (!config.sandBox) {
+							// Propagate isBuy (read after the loop for the 'max safety orders used' log).
+							isBuy = safetyResult['isBuy'];
 
-								const priceFiltered = await filterPrice(exchange, pair, price);
+							// A non-null result is a loop-exit/retry signal; null means the buy succeeded
+							// and the deal keeps following (fall through to the post-loop logic).
+							if (safetyResult['result'] != null) {
 
-								const buy = await buyOrder(exchange, dealId, pair, order.qty, priceFiltered);
-
-								if (!buy.success) {
-
-									buySuccess = false;
-									buyError = buy.message;
-									buyNSF = buy.nsf;
-
-									// Insufficient funds to buy
-									if (buyNSF) {
-
-										let msg = 'Insufficient funds to buy order for deal ID ' + dealId + '. Pausing any further buy orders for deal.';
-
-										await sendDealError(msg);
-
-										const pauseData = await pauseDeal(config.botId, dealId, false, true, false);
-									}
-								}
-								else {
-
-									buyOrderId = buy['data']['id'];
-								}
-							}
-
-							if (buySuccess) {
-
-								orders[i].filled = 1;
-								orders[i].orderId = buyOrderId;
-								orders[i].dateFilled = new Date();
-
-								if (shareData.appData.verboseLog) {
-		
-									Common.logger(
-										colors.blue.bold.italic(
-										'Pair: ' +
-										pair +
-										'\tQty: ' +
-										currentOrder.qtySum +
-										'\tLast Price: $' +
-										price +
-										'\tDCA Price: $' +
-										currentOrder.average +
-										'\tSell Price: $' +
-										currentOrder.target +
-										'\tStatus: ' +
-										colors.green('BUY') +
-										'' +
-										'\tProfit: ' +
-										profit +
-										''
-										)
-									);
-								}
-
-								await Deals.updateOne({
-									dealId: dealId
-								}, {
-									orders: orders
-								});
-							}
-							
-							await updateDealTracker({
-														'deal_id': dealId,
-														'price': price,
-														'config': config,
-														'orders': orders,
-														'pause': isDealPause,
-														'pause_buy': isDealPauseBuy,
-														'pause_sell': isDealPauseSell,
-														'error': buyError
-													});
-
-							if (!buySuccess) {
-
-								// DCA buy failed
-								return ( { 'success': false, 'finished': false } );
+								return ( safetyResult['result'] );
 							}
 						}
-						else if ((price >= priceSellOrder && !isDealPause && !isDealPauseSell) || isDealCancel || isDealPanicSell) {
+						else if ((price >= priceSellOrder && !isDealVerifying && !isDealPause && !isDealPauseSell) || isDealCancel || isDealPanicSell) {
 
-							//Sell order
+							const sellResult = await handleSell({
+								config, exchange, dealId, deal, orders, order, currentOrder, filledOrders,
+								pair, price, priceSellOrder, profit, profitBase, profitQuote, profitPerc,
+								isDealPause, isDealPauseBuy, isDealPauseSell, isDealPauseReason,
+								isDealCancel, isDealPanicSell, isDealVerifying, cancelOnly
+							});
 
-							if (deal.isStart == 1) {
-
-								let sellOrderId = '';
-								let sellNSF = false;
-								let sellSuccess = true;
-
-								const sellDataObj = await processSellData(pair, price, dealId, exchange, config, currentOrder, filledOrders);
-
-								const feeData = sellDataObj['fee_data'];
-
-								const qtySumSell = feeData['dcaOrderQtySumNet'];
-								const priceFiltered = feeData['priceFiltered'];
-								const exchangeFeePercent = feeData['exchangeFeePercent'];
-
-								// Calculate profit based on new exchange fee percent
-								//const profitData = await calculateProfit(price, config.sandBox, currentOrder.average, currentOrder.sum, config.dcaTakeProfitPercent, exchangeFeePercent);
-								//const profitPercFinal = profitData['profit_percentage'];
-								const profitPercFinal = Number(Number(profitPerc - feeData['exchangeFeeSumDiffPercent']).toFixed(2));
-
-								if (!config.sandBox && !isDealCancel) {
-
-									const sell = await sellOrder(exchange, dealId, pair, qtySumSell, priceFiltered);
-
-									sellNSF = sell.nsf;
-
-									if (!sell.success) {
-
-										sellSuccess = false;
-									}
-									else {
-
-										sellOrderId = sell['data']['id'];
-									}
-								}
-
-								if (sellSuccess) {
-
-									await updateDealTracker({
-																'deal_id': dealId,
-																'price': price,
-																'config': config,
-																'orders': orders,
-																'pause': isDealPause,
-																'pause_buy': isDealPauseBuy,
-																'pause_sell': isDealPauseSell
-															});
-
-									if (shareData.appData.verboseLog) {
-
-										Common.logger(
-											colors.blue.bold.italic(
-											'Pair: ' +
-											pair +
-											'\tQty: ' +
-											currentOrder.qtySum +
-											'\tLast Price: $' +
-											price +
-											'\tDCA Price: $' +
-											currentOrder.average +
-											'\tSell Price: $' +
-											currentOrder.target +
-											'\tStatus: ' +
-											colors.red('SELL') +
-											'' +
-											'\tProfit: ' +
-											profit +
-											''
-											)
-										);
-									}
-
-									const sellData = {
-														'date': new Date(),
-														'orderId': sellOrderId,
-														'qtySum': currentOrder.qtySum,
-														'qtySumSell': qtySumSell,
-														'price': price,
-														'average': currentOrder.average,
-														'target': currentOrder.target,
-														'profit': profitPercFinal,
-														'feeData': feeData
-													 };
-
-									await Deals.updateOne({
-										dealId: dealId
-									}, {
-										'sellData': sellData,
-										'panicSell': isDealPanicSell,
-										'canceled': isDealCancel,
-										'status': 1
-									});
-
-									finished = true;
-
-									await deleteDealTracker(dealId);
-
-									if (shareData.appData.verboseLog) { Common.logger(colors.bgRed('Deal ID ' + dealId + ' DCA Bot Finished.')); }
-
-									sendNotificationFinish(config.botName, dealId, pair, sellData);
-								}
-								else {
-
-									// Sell failed
-									dealTracker[dealId]['update']['deal_sell_error']['nsf'] = sellNSF;
-									dealTracker[dealId]['update']['deal_sell_error']['count']++;
-									dealTracker[dealId]['update']['deal_sell_error']['date'] = new Date();
-
-									await Common.delay(1000);
-								}
-
-								success = true;
-
-								return ( { 'success': success, 'finished': finished } );
-							}
+							return ( sellResult );
 						}
 						else {
 
 							await updateDealTracker({
-														'deal_id': dealId,
-														'price': price,
-														'config': config,
-														'orders': orders,
-														'pause': isDealPause,
-														'pause_buy': isDealPauseBuy,
-														'pause_sell': isDealPauseSell
-													});
+										'exchange': exchange,
+										'deal_id': dealId,
+										'price': price,
+										'config': config,
+										'orders': orders,
+										'pause': isDealPause,
+										'pause_buy': isDealPauseBuy,
+										'pause_sell': isDealPauseSell,
+										'pause_reason': isDealPauseReason,
+										'error': dcaError
+									});
 
 							//let nextOrder = currentOrder.price;
 							let nextOrder = unfilledOrders.find(order => Number(order.orderNo) == Number(currentOrder.orderNo) + 1) || null;
@@ -1284,24 +2446,21 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 
 								nextOrder = nextOrder.price;
 								nextOrder = parseFloat(Number(nextOrder) - (Number(nextOrder) * priceSlippageBuyPercent));
+
+								nextOrder = Common.adjustDecimals(nextOrder, price, currentOrder.average, currentOrder.target);
 							}
 
 							if (shareData.appData.verboseLog) {
 							
 								Common.logger(
-								'Pair: ' +
-								pair +
-								'\tLast Price: $' +
-								price +
-								'\tDCA Price: $' +
-								currentOrder.average +
-								'\t\tTarget: $' +
-								currentOrder.target +
-								'\t\tNext Order: $' +
-								nextOrder +
-								'\tProfit: ' +
-								profit +
-								''
+								formatDealStatusLine({
+									'pair': pair,
+									'lastPrice': price,
+									'dcaPrice': currentOrder.average,
+									'target': currentOrder.target,
+									'nextOrder': nextOrder,
+									'profit': profit
+								})
 								);
 							}
 						}
@@ -1314,7 +2473,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 
 				if (maxSafetyOrdersUsed && isBuy) {
 
-					if (shareData.appData.verboseLog) { Common.logger( colors.bgYellow.bold(pair + ' Max safety orders used.') + '\tLast Price: $' + price + '\tTarget: $' + currentOrder.target + '\tProfit: ' + profit); }
+					if (shareData.appData.verboseLog) { Common.logger( colors.bgYellow.bold(pair + ' Max safety orders used.') + '\tLast Price: ' + formatPrice(pair, price) + '\tTarget: ' + formatPrice(pair, currentOrder.target) + '\tProfit: ' + profit); }
 					
 					//await Common.delay(2000);
 				}
@@ -1324,14 +2483,17 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 			// Delay before following again
 			await Common.delay(2000);
 
-			return ( { 'success': success, 'finished': finished } );
+			return ( loopSignal(success, finished) );
 		}
 		else {
 
-			if (!followFinished) {
+			// Deal no longer exists in the database (e.g. deleted after verification
+			// retries were exhausted, or cancelled/closed elsewhere). There is nothing
+			// left to follow, so signal the loop to stop rather than spin on a missing
+			// deal. finished stays authoritative for runFollowLoop's exit condition.
+			finished = true;
 
-				if (shareData.appData.verboseLog) { Common.logger('No deal ID found for ' + config.pair); }
-			}
+			if (shareData.appData.verboseLog) { Common.logger('No deal ID found for ' + config.pair); }
 		}
 	}
 	catch (e) {
@@ -1341,7 +2503,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 		Common.logger(JSON.stringify(e));
 	}
 
-	return ( { 'success': success, 'finished': finished } );
+	return ( loopSignal(success, finished) );
 };
 
 
@@ -1574,6 +2736,106 @@ const filterPrice = async (exchange, pair, price) => {
 };
 
 
+
+// Centralised start-permission check.
+// Runs only the checks specified in the `checks` object and returns
+// { allowed: bool, reason: string } so every callsite has one place
+// to consult for limit logic.
+//
+// Normalisation (pairMax / pairDealsMax → 0 when blank/null/undefined)
+// is always applied regardless of which checks are requested.
+//
+// checks:
+//   blacklist        – pair must not be on the blacklist
+//   pairMax          – active pairs on this bot must be below pairMax
+//   pairDealsMax     – active deals for this pair must be below pairDealsMax
+//   globalPairLimit  – same pair across all bots must be below pairBotsDealsMax
+//   dealsActiveZero  – no active deals for this pair (asap / enable / update paths)
+//
+const canStartDeal = async ({ pair, config, pairCount = 0, dealsActive = [] }) => {
+
+	const pairMax          = Number(config.pairMax)          || 0;
+	const pairDealsMax     = Number(config.pairDealsMax)     || 0;
+	const pairBotsDealsMax = Number(config.pairBotsDealsMax) || 0;
+
+	let allowed = true;
+	let reason  = '';
+
+	// Circuit breaker is the first gate — checked before any DB queries.
+	// Enforced here rather than in individual signal clients so that ALL
+	// deal-start paths (3CQS signals, manual API, webhooks, future clients)
+	// are blocked consistently and receive a clear reason in the response.
+	if (shareData.appData.circuit_breaker_active) {
+
+		return {
+			allowed: false,
+			reason:  'Circuit Breaker Active: ' + shareData.appData.circuit_breaker_active
+		};
+	}
+
+	const isPairBlackListed        = await Common.pairBlackListed(pair);
+	const globalPairLimitExceeded  = await checkGlobalPairLimit(pairBotsDealsMax, pair);
+
+	if (isPairBlackListed) {
+
+		allowed = false;
+		reason  = 'Pair is blacklisted';
+	}
+	else if (globalPairLimitExceeded) {
+
+		allowed = false;
+		reason  = `${pair} global max of ${pairBotsDealsMax} deals already running across all bots`;
+	}
+	else if (pairMax > 0 && pairCount >= pairMax) {
+
+		allowed = false;
+		reason  = 'Bot max ' + pairMax + ' pairs reached';
+	}
+	else if (dealsActive.length > 0) {
+
+		// Per-pair deals max check:
+		// - If pairDealsMax > 1: block when that limit is reached
+		// - If pairDealsMax <= 1 (default): block if any active deal exists for this pair
+		//   (only enforced when dealsActive is explicitly passed — dcaFollow passes [] to skip this)
+		if (pairDealsMax > 1 && dealsActive.length >= pairDealsMax) {
+
+			allowed = false;
+			reason  = pair + ' pair max ' + pairDealsMax + ' deals already running';
+		}
+		else if (pairDealsMax <= 1) {
+
+			allowed = false;
+			reason  = pair + ' already has an active deal';
+		}
+	}
+
+	return { allowed, reason };
+};
+
+
+const checkGlobalPairLimit = async (pairBotsDealsMax, pair) => {
+
+	let globalPairLimitExceeded = false;
+
+	if (pairBotsDealsMax == undefined || pairBotsDealsMax == null || pairBotsDealsMax == '') {
+
+		pairBotsDealsMax = 0;
+	}
+
+	if (pairBotsDealsMax > 0) {
+
+		let allDealsForPair = await getDeals({ 'pair': pair, 'status': 0 });
+
+		if (allDealsForPair.length >= pairBotsDealsMax) {
+
+			globalPairLimitExceeded = true;
+		}
+	}
+
+	return globalPairLimitExceeded;
+};
+
+
 const checkActiveDeal = async (botId, pair) => {
 
 	try {
@@ -1593,28 +2855,104 @@ const checkActiveDeal = async (botId, pair) => {
 };
 
 
-const getDeals = async (query, options, projection) => {
+const getDealsMaxUsedFunds = async (maxDealsPerBot = 1, useConfig = false) => {
 
-	if (query == undefined || query == null) {
+	const bots = await getBots();
 
-		query = {};
+	let botIds = bots?.map(bot => bot.botId) || [];
+
+	const results = botIds.length ?
+		await getDeals(
+			null,
+			null,
+			null,
+			DbQueries.dealsMaxUsedFundsPipeline({
+					status: [null, 0, 1]
+				},
+				botIds,
+				null,
+				maxDealsPerBot
+			)
+		) : [];
+
+	if (useConfig) {
+
+		try {
+
+			for (let i in results) {
+
+				let totalSum = 0;
+				let lastSumArr = [];
+
+				let botObj = results[i];
+
+				const pairMax = Math.max(parseInt(botObj['botConfig']['pairMax']), 1);
+				const pairDealsMax = Math.max(parseInt(botObj['botConfig']['pairDealsMax']), 1);
+
+				const botMaxDeals = Math.round(pairMax * pairDealsMax);
+
+				const resultsBot = await getDeals(
+					null,
+					null,
+					null,
+					DbQueries.dealsMaxUsedFundsPipeline({
+						status: [null, 0, 1]
+					},
+						botObj['botId'],
+						null,
+						botMaxDeals
+					)
+				);
+
+				const config = results[i]['botConfig'];
+				const maxFundsObj = await calculateMaxFunds(config);
+
+				const mergedBot = resultsBot[0];
+
+				results[i] = {
+					...mergedBot,
+					...maxFundsObj
+				};
+
+				for (let d in results[i]['deals']) {
+
+					const deal = results[i]['deals'][d];
+
+					const lastSum = deal['lastSum'];
+
+					lastSumArr.push(lastSum);
+					totalSum += Number(lastSum)
+				}
+
+				results[i]['bot_max_funds_exposure'] = Math.round(totalSum * 100) / 100;
+			}
+		}
+		catch(e) {}
 	}
 
-	if (options == undefined || options == null) {
+	return {
+		success: bots && bots.length > 0,
+		data: results
+	};
+};
 
-		options = {};
-	}
 
-	if (projection == undefined || projection == null) {
+const getDeals = async (query, options, projection, aggregatePipeline = null) => {
 
-		projection = {};
-	}
+	query = query || {};
+	options = options || {};
+	projection = projection || {};
 
 	try {
 
-		const deals = await Deals.find(query, projection, options);
+		if (aggregatePipeline && Array.isArray(aggregatePipeline)) {
 
-		return deals;
+			return await Deals.aggregate(aggregatePipeline);
+		}
+		else {
+
+			return await Deals.find(query, projection, options);
+		}
 	}
 	catch (e) {
 
@@ -1640,6 +2978,36 @@ const getBots = async (query) => {
 	catch (e) {
 
 		Common.logger(JSON.stringify(e));
+	}
+};
+
+
+const deleteBot = async (query) => {
+
+	try {
+
+		const result = await Bots.deleteOne(query);
+		return result.deletedCount > 0;
+	}
+	catch (e) {
+
+		Common.logger('deleteBot error: ' + JSON.stringify(e));
+		return false;
+	}
+};
+
+
+const deleteDeals = async (query) => {
+
+	try {
+
+		const result = await Deals.deleteMany(query);
+		return result.deletedCount;
+	}
+	catch (e) {
+
+		Common.logger('deleteDeals error: ' + JSON.stringify(e));
+		return 0;
 	}
 };
 
@@ -1737,11 +3105,56 @@ const getBalance = async (exchange, symbol) => {
 };
 
 
+const getOHLCV = async (exchange, pair, timeframe, since, limit) => {
+
+	let data;
+	let success = false;
+
+	pair = (pair ?? '').replace(/[_-]/g, '/');
+
+	// Only try if exchange supports fetchOHLCV
+	if (exchange != undefined && exchange != null && exchange.has['fetchOHLCV']) {
+
+		try {
+
+			success = true;
+
+			data = await exchange.fetchOHLCV(pair, timeframe, since, limit);
+		}
+		catch(e) {
+
+			success = false;
+
+			data = 'ERROR: ' + e.name + ' ' + e.message;
+		}
+	}
+	else {
+		
+		data = 'fetchOHLCV not supported by exchange';
+	}
+
+	const dataObj = { 
+						'success': success,
+						'pair': pair,
+						'data': data
+					};
+
+	if (shareData.appData.verboseLog) {
+		
+		Common.logger(dataObj);
+	}
+
+	return dataObj;
+}
+
+
 const getOrder = async (exchange, orderId, pair, dealId) => {
 
+	const days = 1;
+	const limit = 500;
 	const maxTries = 15;
 
-	let success = true;
+	let success = false;
 	let finished = false;
 	let orderInvalid = false;
 	let timeOut = false;
@@ -1751,17 +3164,44 @@ const getOrder = async (exchange, orderId, pair, dealId) => {
 	let errMsg;
 	let orderStatus;
 
-	// Only try if exchange supports fetchOrder
-	if (exchange != undefined && exchange != null && exchange.has['fetchOrder']) {
+	// Only try if exchange supports fetchOrders
+	if (exchange != undefined && exchange != null && exchange.has['fetchOrders']) {
 
 		while (!finished) {
 
 			try {
 
-				order = await exchange.fetchOrder(orderId, pair);
+				let since = exchange.milliseconds() - (86400000 * days);
+
+				let ordersAll = await exchange.fetchOrders(pair, since, limit);
+
+				if (ordersAll != undefined && ordersAll != null && Array.isArray(ordersAll) && ordersAll.length > 0) {
+
+					for (let orderObj of ordersAll) {
+			
+						let id = orderObj['id'];
+			
+						// Found matching order id
+						if (id == orderId) {
+			
+							order = orderObj;
+			
+							orderStatus = order.status;
+							orderStatus = orderStatus?.toLowerCase();
+			
+							success = true;
+			
+							break;
+						}
+					}
+				}
+
+				if (!success) {
+
+					orderInvalid = true;
+				}
 
 				errMsg = null;
-				success = true;
 				finished = true;
 			}
 			catch(e) {
@@ -1787,17 +3227,8 @@ const getOrder = async (exchange, orderId, pair, dealId) => {
 				}
 				else if (e instanceof ccxt.ExchangeError && count < maxTries) {
 
-					// Order invalid or not found
-					if (e.message.toLowerCase().includes('invalid') || e.message.toLowerCase().includes('found')) {
-
-						orderInvalid = true;
-						finished = true;
-					}
-					else {
-
-						// Delay and try again
-						await Common.delay(500 + (Math.random() * 100));
-					}
+					// Delay and try again
+					await Common.delay(500 + (Math.random() * 100));
 				}
 				else {
 
@@ -1811,16 +3242,12 @@ const getOrder = async (exchange, orderId, pair, dealId) => {
 	}
 	else {
 
-		// Mimic closed order response since fetchOrder is not supported
+		// Mimic closed order response since fetchOrders is not supported
 		order = {};
 		order['status'] = 'closed'; 
-		order['_message'] = 'fetchOrder not supported by exchange';
-	}
+		order['_message'] = 'fetchOrders not supported by exchange';
 
-	if (order != undefined && order != null && typeof order == 'object') {
-
-		orderStatus = order.status;
-		orderStatus = orderStatus?.toLowerCase();
+		success = true;
 	}
 
 	let msg = 'Get Order Complete. Order ID: ' + orderId + ' / Pair: ' + pair + ' / Deal ID: ' + dealId + ' / Success: ' + success;
@@ -1893,16 +3320,17 @@ const cancelOrder = async (exchange, orderId, pair, dealId) => {
 }
 
 
-const verifyOrder = async (exchange, orderId, pair, dealId) => {
+const verifyExchangeOrder = async (exchange, orderId, pair, dealId) => {
 
 	const maxSec = 75;
-	const maxTries = 5;
+	const maxTries = 15;
 
 	let success = true;
 	let finished = false;
 	let timeOutOrder = false;
 	let timeOutVerify = false;
 	let orderInvalid = false;
+	let statusInvalid = false;
 
 	let count = 0;
 	let orderCount = 0;
@@ -1919,7 +3347,8 @@ const verifyOrder = async (exchange, orderId, pair, dealId) => {
 
 	Common.logger(msg);
 
-	//const botConfig = await Common.getConfig('bot.json');
+	//const botConfigFile = shareData.appData.bot_config;
+	//const botConfig = await Common.getConfig(botConfigFile);
 
 	//let configBot = botConfig.data;
 	//let config = await initConfigData(configBot);
@@ -1954,7 +3383,7 @@ const verifyOrder = async (exchange, orderId, pair, dealId) => {
 				// Reduce count to allow more time for other error retries
 				count--;
 
-				if (invalidCount > maxTries) {
+				if (invalidCount >= maxTries) {
 
 					success = false;
 					finished = true;
@@ -2036,6 +3465,8 @@ const verifyOrder = async (exchange, orderId, pair, dealId) => {
 
 				}
 
+				statusInvalid = true;
+
 				success = false;
 				finished = true;
 			}
@@ -2044,13 +3475,23 @@ const verifyOrder = async (exchange, orderId, pair, dealId) => {
 
 	msg = 'Verify Order Complete. Order ID: ' + orderId + ' / Pair: ' + pair + ' / Deal ID: ' + dealId + ' / Success: ' + success;
 
+	if (orderInvalid) {
+
+		let msgWarn = 'WARNING: Unable to verify order on exchange. Manual verification is strongly recommended.';
+
+		msg += ' / ' + msgWarn;
+
+		Common.sendNotification({ 'message': msg, 'type': 'deal_error', 'telegram_id': shareData.appData.telegram_id });
+	}
+
 	const dataObj = { 
 						'success': success,
 						'message': msg,
 						'data': order,
 						'status': orderStatus,
 						'attempts': orderCount,
-						'invalid': orderInvalid,
+						'invalid_order': orderInvalid,
+						'invalid_status': statusInvalid,
 						'timeout_order': timeOutOrder,
 						'timeout_verify': timeOutVerify,
 						'error': errMsg
@@ -2062,6 +3503,248 @@ const verifyOrder = async (exchange, orderId, pair, dealId) => {
 }
 
 
+const verifyBuySellOrder = async (exchange, orderId, pair, dealId) => {
+
+	let success = false;
+	let finished = false;
+	let orderInvalid = false;
+	let statusInvalid = false;
+
+	let orderAmount = null;
+	let orderQty = null;
+	let orderPrice = null;
+	let orderAverage = null;
+
+	if (orderId) {
+
+		while (!finished) {
+
+			let orderVerify = await verifyExchangeOrder(exchange, orderId, pair, dealId);
+
+			if (orderVerify.success) {
+
+				// Verification successful
+				const orderVerifyData = orderVerify.data;
+
+				orderAmount = orderVerifyData.cost;
+				orderQty = orderVerifyData.filled ?? orderVerifyData.amount;
+				orderPrice = orderVerifyData.price;
+
+				// CCXT unified 'average' is the volume-weighted fill price. Where an
+				// exchange populates it, it is more accurate than 'price' (which is the
+				// requested price on many exchanges) and needs no derivation from cost.
+				// Not all exchanges provide it, so it is captured opportunistically.
+				orderAverage = orderVerifyData.average ?? null;
+
+				success = true;
+				finished = true;
+			}
+			else {
+
+				// Verification failed
+				if (orderVerify.timeout_order || orderVerify.timeout_verify) {
+
+					// Handle timeouts and retry
+					await Common.delay(1000);
+				}
+				else {
+
+					if (orderVerify.invalid_order) {
+
+						orderInvalid = true;
+					}
+
+					if (orderVerify.invalid_status) {
+
+						statusInvalid = true;
+
+						// Capture partial fill qty even when exchange cancels the order
+						// (e.g. Coinbase price protection cancels after partial fill)
+						if (orderVerify.data) {
+
+							const partialFilled = orderVerify.data.filled ?? null;
+							if (partialFilled !== null && Number(partialFilled) > 0) {
+
+								orderQty    = Number(partialFilled);
+								orderAmount = orderVerify.data.cost ?? null;
+								orderPrice  = orderVerify.data.price ?? null;
+								orderAverage = orderVerify.data.average ?? null;
+							}
+						}
+					}
+
+					success = false;
+					finished = true;
+				}
+			}
+		}
+	}
+	else {
+
+		Common.logger(`Unable to verify order. No order ID received from exchange. Deal ID: ${dealId}`);
+	}
+
+	return {
+		'success': success,
+		'order_amount': orderAmount,
+		'order_qty': orderQty,
+		'order_price': orderPrice,
+		'order_average': orderAverage,
+		'order_invalid': orderInvalid,
+		'status_invalid': statusInvalid
+	};
+}
+
+
+// Shared post-verification cleanup for the safety-order-buy and sell invalid_order
+// paths. When verification is exhausted or the deal is no longer paused, clear the
+// UI "verifying" flag on the deal's sell-error tracker so the row stops showing the
+// in-progress state. Both paths behaved identically here; this is the single source.
+// (The base-order path deliberately does NOT use this — on exhaustion it tears the
+// deal down entirely, which is different behaviour and stays in its own handler.)
+function clearSellErrorVerifying(dealId) {
+
+	try {
+
+		if (dealTracker[dealId]?.update?.deal_sell_error) {
+
+			dealTracker[dealId].update.deal_sell_error.verifying = false;
+		}
+	}
+	catch (e) {}
+}
+
+
+const verifyInvalidOrder = ({ count = 0, mins = 2, exchange, pair, botId, dealId, orderId, onSuccessCallback = null, pauseBeforeCallback = false }) => {
+
+	const maxTries = 100;
+
+	const retryMins = mins ?? 2;
+	count++;
+
+	return new Promise(async (resolve) => {
+
+		if (count > maxTries) {
+
+			await sendDealMessage(
+				'info',
+				`Max tries (${maxTries}) reached for verifying order ID ${orderId} for deal ID ${dealId}. Will not try again.`
+			);
+
+			return resolve({
+				success: false,
+				retriesExhausted: true
+			});
+		}
+
+		await Common.delay(retryMins * 60000);
+
+		let resume = false;
+
+		let msg = `Attempt #${count} to verify order ID ${orderId} for deal ID ${dealId}.`;
+
+		await sendDealMessage('info', msg);
+
+		let verifiedData = null;
+
+		if (orderId) {
+
+			const verifyData = await verifyBuySellOrder(exchange, orderId, pair, dealId);
+
+			if (verifyData.success) {
+
+				resume = true;
+				verifiedData = verifyData;
+
+				msg = `Attempt #${count} to verify order ID ${orderId} for deal ID ${dealId} successful.`;
+
+				await sendDealMessage('info', msg);
+			}
+			else {
+
+				const deal = await Deals.findOne({
+					dealId,
+					status: 0
+				});
+
+				const isDealPause = Common.convertBoolean(deal?.paused, false);
+				const isDealPauseBuy = Common.convertBoolean(deal?.pausedBuy, false);
+				const isDealPauseSell = Common.convertBoolean(deal?.pausedSell, false);
+
+				msg = `Attempt #${count} to verify order ID ${orderId} for deal ID ${dealId} unsuccessful.`;
+
+				if (deal && (isDealPause || isDealPauseBuy || isDealPauseSell)) {
+
+					msg += ` Trying again in ${retryMins} minutes.`;
+
+					await sendDealMessage('info', msg);
+
+					// Recursive retry
+					const retryResult = await verifyInvalidOrder({
+						count,
+						mins: retryMins,
+						exchange,
+						pair,
+						botId,
+						dealId,
+						orderId,
+						onSuccessCallback,
+						pauseBeforeCallback
+					});
+
+					return resolve(retryResult);
+				}
+				else {
+
+					msg += ' Will not try again.';
+
+					await sendDealMessage('info', msg);
+
+					// Deal is no longer paused, exit
+					return resolve({
+						success: false,
+						notPaused: true
+					});
+				}
+			}
+		}
+		else {
+
+			// No orderId => resume immediately
+			resume = true;
+		}
+
+		if (resume) {
+
+			await sendDealMessage('info', `Resuming order placement for deal ID ${dealId}`);
+
+			if (pauseBeforeCallback) {
+				
+				await pauseDeal(botId, dealId, false, null, null, '');
+			}
+
+			if (typeof onSuccessCallback === 'function') {
+
+				await onSuccessCallback(verifiedData);
+			}
+
+			if (!pauseBeforeCallback) {
+
+				await pauseDeal(botId, dealId, false, null, null, '');
+			}
+
+			return resolve({
+				success: true
+			});
+		}
+
+		return resolve({
+			success: false
+		});
+	});
+};
+
+
 const buyOrder = async (exchange, dealId, pair, qty, price) => {
 
 	const maxTries = 5;
@@ -2069,21 +3752,17 @@ const buyOrder = async (exchange, dealId, pair, qty, price) => {
 	let msg;
 	let order;
 	let orderId;
-	let orderPrice;
-	let orderAmount;
-	let orderQty;
 	let isErr;
 	let success;
 
 	let nsf = false;
 	let finished = false;
-	let finishedVerify = false;
-	let successVerify = false;
 
 	let count = 0;
+	let verifyData = {};
 
 	while (!finished) {
-	
+
 		try {
 
 			isErr = null;
@@ -2091,7 +3770,20 @@ const buyOrder = async (exchange, dealId, pair, qty, price) => {
 
 			msg = 'BUY SUCCESS';
 
-			order = await exchange.createOrder(pair, 'market', 'buy', qty, price);
+			let orderParamsObj = {
+				'symbol': pair,
+				'type': 'market',
+				'side': 'buy',
+				'quantity': qty,
+				'price': price
+			};
+
+			let template = getOrderTemplate();
+			let templateParams = template.createOrder.buy.params;
+			let orderParamsArr = replacePlaceholders(templateParams, orderParamsObj);
+
+			// Pass params in the same structure as referenced in template
+			order = await exchange.createOrder(...orderParamsArr);
 
 			finished = true;
 		}
@@ -2102,13 +3794,7 @@ const buyOrder = async (exchange, dealId, pair, qty, price) => {
 
 			msg = 'BUY ERROR: ' + e.name + ' ' + e.message;
 
-			if (e instanceof ccxt.InsufficientFunds) {
-
-				nsf = true;
-
-				finished = true;
-			}
-			else if ((e instanceof ccxt.ExchangeError || e instanceof ccxt.BadRequest) && msg.toLowerCase().includes('insufficient')) {
+			if (e instanceof ccxt.InsufficientFunds || ((e instanceof ccxt.ExchangeError || e instanceof ccxt.BadRequest) && msg.toLowerCase().includes('insufficient'))) {
 
 				nsf = true;
 
@@ -2116,7 +3802,6 @@ const buyOrder = async (exchange, dealId, pair, qty, price) => {
 			}
 			else if (e instanceof ccxt.ExchangeError && count < maxTries) {
 
-				// Delay and try again
 				await Common.delay(500 + (Math.random() * 100));
 			}
 			else {
@@ -2130,66 +3815,29 @@ const buyOrder = async (exchange, dealId, pair, qty, price) => {
 
 	if (success) {
 
-		// Verify order on exchange
 		orderId = order['id'];
 
-		if (orderId != undefined && orderId != null && orderId != '') {
+		verifyData = await verifyBuySellOrder(exchange, orderId, pair, dealId);
 
-			while (!finishedVerify) {
+		if (verifyData.order_price) {
 
-				let orderVerify = await verifyOrder(exchange, orderId, pair, dealId);
+			const priceFiltered = await filterPrice(exchange, pair, verifyData.order_price);
 
-				if (orderVerify.success) {
+			if (priceFiltered) {
 
-					// Verification successful
-
-					const orderVerifyData = orderVerify.data;
-
-					orderAmount = orderVerifyData.cost;
-					orderQty = orderVerifyData.filled ?? orderVerifyData.amount;
-					orderPrice = orderVerifyData.price;
-
-					successVerify = true;
-					finishedVerify = true;
-				}
-				else {
-
-					// Verification failed, consider buy order unsuccessful
-
-					if (orderVerify['timeout_order'] || orderVerify['timeout_verify']) {
-
-						// Handle cases of timeouts
-						// Circuit breaker
-
-						// Timeout occurred so delay and try again
-						await Common.delay(1000);
-					}
-					else {
-
-						success = false;
-						successVerify = false;
-						finishedVerify = true;
-					}
-				}
+				verifyData.order_price = priceFiltered;
 			}
-		}
-		else {
-
-			successVerify = false;
-
-			let msg = 'Unable to verify order. No order ID received from exchange. Deal ID: ' + dealId;
-
-			Common.logger(msg);
 		}
 	}
 
 	const dataObj = {
 						'date': new Date(),
 						'success': success,
-						'success_verify': successVerify,
+						'success_verify': verifyData.success || false,
 						'data': order,
 						'error': isErr,
-						'verified': finishedVerify,
+						'invalid_order': verifyData.order_invalid || false,
+						'invalid_status': verifyData.status_invalid || false,
 						'nsf': nsf,
 						'message': msg,
 						'deal_id': dealId,
@@ -2197,12 +3845,13 @@ const buyOrder = async (exchange, dealId, pair, qty, price) => {
 						'quantity': qty,
 						'price': price,
 						'data_order': {
-							'id': orderId,
-							'price': orderPrice,
-							'amount': orderAmount,
-							'quantity': orderQty
-						}
-					};
+										'id': orderId,
+										'price': verifyData.order_price,
+										'average': verifyData.order_average,
+										'amount': verifyData.order_amount,
+										'quantity': verifyData.order_qty
+									  }
+	};
 
 	Common.logger(dataObj);
 
@@ -2216,6 +3865,7 @@ const sellOrder = async (exchange, dealId, pair, qty, price) => {
 
 	let msg;
 	let order;
+	let orderId;
 	let isErr;
 	let success;
 
@@ -2223,6 +3873,7 @@ const sellOrder = async (exchange, dealId, pair, qty, price) => {
 	let nsf = false;
 
 	let count = 0;
+	let verifyData = {};
 
 	while (!finished) {
 
@@ -2233,7 +3884,27 @@ const sellOrder = async (exchange, dealId, pair, qty, price) => {
 
 			msg = 'SELL SUCCESS';
 
-			order = await exchange.createOrder(pair, 'market', 'sell', qty, price);
+			let orderParamsObj = {
+				'symbol': pair,
+				'type': 'market',
+				'side': 'sell',
+				'quantity': qty,
+				'price': price
+			};
+
+			// Remove price from params so quantity is not altered
+			if (exchange.id == 'bybit') {
+
+				delete orderParamsObj.price;
+			}
+
+			let template = getOrderTemplate();
+			let templateParams = template.createOrder.sell.params;
+			let orderParamsArr = replacePlaceholders(templateParams, orderParamsObj);
+
+			// Pass params in the same structure as referenced in template
+			order = await exchange.createOrder(...orderParamsArr);
+			//order = await exchange.createOrder(pair, 'market', 'sell', qty, price);
 
 			finished = true;
 		}
@@ -2270,22 +3941,93 @@ const sellOrder = async (exchange, dealId, pair, qty, price) => {
 		}
 	}
 
+	if (success) {
+
+		orderId = order['id'];
+
+		verifyData = await verifyBuySellOrder(exchange, orderId, pair, dealId);
+
+		if (verifyData.order_price) {
+
+			const priceFiltered = await filterPrice(exchange, pair, verifyData.order_price);
+
+			if (priceFiltered) {
+
+				verifyData.order_price = priceFiltered;
+			}
+		}
+	}
+
 	const dataObj = {
 						'date': new Date(),
 						'success': success,
+						'success_verify': verifyData.success || false,
 						'data': order,
 						'error': isErr,
+						'invalid_order': verifyData.order_invalid || false,
+						'invalid_status': verifyData.status_invalid || false,
 						'nsf': nsf,
 						'message': msg,
 						'deal_id': dealId,
 						'pair': pair,
 						'quantity': qty,
-						'price': price
+						'price': price,
+						'data_order': {
+										'id': orderId,
+										'price': verifyData.order_price,
+										'average': verifyData.order_average,
+										'amount': verifyData.order_amount,
+										'quantity': verifyData.order_qty
+									  }
 					};
 
 	Common.logger(dataObj);
 
 	return dataObj;
+};
+
+
+const getOrderTemplate = () => {
+
+	const template = {
+		"createOrder": {
+			"buy": {
+				"params": [
+					"{symbol}",
+					"{type}",
+					"{side}",
+					"{quantity}",
+					"{price}"
+				]
+			},
+			"sell": {
+				"params": [
+					"{symbol}",
+					"{type}",
+					"{side}",
+					"{quantity}",
+					"{price}"
+				]
+			}
+		}
+	};
+
+	return template;
+}
+
+
+const replacePlaceholders = (params, data) => {
+
+	return params.flatMap(param => {
+
+			if (typeof param === "string" && param.startsWith("{") && param.endsWith("}")) {
+
+				const key = param.slice(1, -1);
+				return key in data ? [data[key]] : [];
+			}
+
+			return [param];
+	});
 };
 
 
@@ -2344,7 +4086,60 @@ const getSlippage = async(normalize) => {
 }
 
 
-const calculateProfit = async (price, sandBox, orderAverage, orderSum, takeProfitPercent, exchangeFeePercent) => {
+async function calculateMaxFunds(config) {
+
+	const {
+		dcaMaxOrder,
+		dcaOrderAmount,
+		dcaOrderSizeMultiplier,
+		dcaOrderStepPercent,
+		dcaOrderStepPercentMultiplier,
+		firstOrderAmount,
+		exchangeFee,
+		pairMax,
+		pairDealsMax,
+		pair = [],
+	} = { ...config };
+
+	const safetyOrdersMax = Number(dcaMaxOrder);
+	const safetyOrderVolume = Number(dcaOrderAmount);
+	const safetyOrderVolumeScale = Number(dcaOrderSizeMultiplier);
+	const safetyOrderStepPerc = Number(dcaOrderStepPercent);
+	const safetyOrderStepScale = Number(dcaOrderStepPercentMultiplier);
+	const baseOrderVolume = Number(firstOrderAmount);
+	const feeMultiplier = 1 + (Number(exchangeFee) * 2) / 100;
+
+	const totalPairs = Array.isArray(pair) && pair.length > 0 ? pair.length : 1;
+
+	const effectivePairMax = Math.max(1, Number(pairMax) || 1);
+	const effectivePairDealsMax = Math.max(1, Number(pairDealsMax));
+
+	const maxDeviation =
+		safetyOrderStepScale === 1 ?
+		safetyOrdersMax * safetyOrderStepPerc :
+		(safetyOrderStepPerc * (1 - Math.pow(safetyOrderStepScale, safetyOrdersMax))) /
+		(1 - safetyOrderStepScale);
+
+	let maxFunds = baseOrderVolume * feeMultiplier;
+
+	for (let i = 0; i < safetyOrdersMax; i++) {
+
+		maxFunds += safetyOrderVolume * Math.pow(safetyOrderVolumeScale, i) * feeMultiplier;
+	}
+
+	const botMaxFunds = Math.round(
+		maxFunds * Math.min(effectivePairMax, totalPairs) * effectivePairDealsMax * 100
+	) / 100;
+
+	return {
+		'max_deviation': Math.round(maxDeviation * 100) / 100,
+		'max_funds': Math.round(maxFunds * 100) / 100,
+		'bot_max_funds': botMaxFunds,
+	};
+}
+
+
+const calculateProfit = async (exchange, pair, price, orderAverage, orderSum, takeProfitPercent, exchangeFeePercent, sandBox) => {
 
 	let profitPerc = await Percentage.subNumsAsPerc(
 		price,
@@ -2362,12 +4157,35 @@ const calculateProfit = async (price, sandBox, orderAverage, orderSum, takeProfi
 	profitPerc = profitPerc - Number(exchangeFeePercent) - (Number(priceSlippageSellPercent));
 	profitPerc = Number(Number(profitPerc).toFixed(2));
 
-	const takeProfit = shareData.Common.roundAmount(Number(Number(orderSum) * ((Number(takeProfitPercent) - Number(exchangeFeePercent) - priceSlippageSellPercent) / 100)));
-	const currentProfit = shareData.Common.roundAmount(Number((Number(orderSum) * (Number(profitPerc) / 100))));
+	//const profitQuoteProjected = Common.roundAmount(Number(Number(orderSum) * ((Number(takeProfitPercent) - Number(exchangeFeePercent) - priceSlippageSellPercent) / 100)));
+	//const profitQuoteProjected = Common.roundAmount(Number(Number(orderSum) * ((Number(takeProfitPercent) - (Number(exchangeFeePercent) / 2)) / 100)));
+	const profitQuoteProjected = Common.roundAmount(Number(Number(orderSum) * ((Number(takeProfitPercent)) / 100)));
+	const currentProfit = Common.roundAmount(Number((Number(orderSum) * (Number(profitPerc) / 100))));
+
+	let baseProfit = Number(currentProfit) / Number(price);
+
+	if (exchange && pair) {
+
+		try {
+
+			baseProfit = await filterAmount(exchange, pair, Number(baseProfit));
+		}
+		catch(e) {
+
+			// Does not meet exchange requirements or some filter error
+			baseProfit = 0;
+		}
+
+		if (!baseProfit) {
+
+			baseProfit = 0;
+		}
+	}
 
 	const data = {
 					'profit': currentProfit,
-					'take_profit': takeProfit,
+					'profit_base': baseProfit,
+					'profit_quote_projected': profitQuoteProjected,
 					'profit_percentage': profitPerc
 				 };
 
@@ -2460,7 +4278,9 @@ const processSellData = async(pair, price, dealId, exchange, config, currentOrde
 
 					if (shareData.appData.verboseLog) {
 
-						Common.logger('Applying additional exchange fee factor of ' + addFee + ' to reduce sell quantity for deal ' + dealId + '. Attempt: ' + sellErrorCount + '/' + maxSellErrorCount);
+						let msg = 'Applying additional exchange fee factor of ' + addFee + ' to reduce sell quantity for deal ' + dealId + '. Attempt: ' + sellErrorCount + '/' + maxSellErrorCount;
+
+						Common.logger(colors.red.bold(msg));
 					}
 				}
 
@@ -2522,6 +4342,45 @@ const processSellData = async(pair, price, dealId, exchange, config, currentOrde
 				   };
 
 	return resObj;
+}
+
+
+const getAdjustedOrder = async (exchange, pair, price, amount, orderSize, exchangeFee, minMoveAmount) => {
+
+	const finalAdjustments = {};
+
+	// Get adjustments without exchange fee since already previously included
+	const baseAdjustments = await calculateAdjustments({
+		exchange,
+		pair,
+		price,
+		amount,
+		orderSize,
+		exchangeFee: 0,
+		minMoveAmount: null
+	});
+
+	// Call again to get fees
+	const feeAdjustments = await calculateAdjustments({
+		exchange,
+		pair,
+		price,
+		amount,
+		orderSize,
+		exchangeFee,
+		minMoveAmount
+	});
+
+	// Set fees in original adjustments
+	for (const key of Object.keys(feeAdjustments)) {
+
+		const base = baseAdjustments[key];
+		const fee = feeAdjustments[key];
+
+		finalAdjustments[key] = (base === undefined || base === null || base === 0) ? fee : base;
+	}
+
+	return finalAdjustments;
 }
 
 
@@ -2594,6 +4453,7 @@ const calculateSellData = async (pair, price, exchange, configObj, addFee, curre
 	let allOrders = filledOrders;
 	allOrders.push(currentOrder);
 
+	let minMoveAmount;
 	let exchangeFeeQtySum = 0;
 	let exchangeFeeAmountSum = 0;
 
@@ -2613,6 +4473,12 @@ const calculateSellData = async (pair, price, exchange, configObj, addFee, curre
 
 		exchangeFeeQtySum += exchangeFeeQty;
 		exchangeFeeAmountSum += exchangeFeeAmount;
+
+		try {
+
+			minMoveAmount = orderMetadata['minimum_movement_amount'];
+		}
+		catch (e) {}
 	}
 
 	const priceFiltered = await filterPrice(exchange, pair, price);
@@ -2663,76 +4529,19 @@ const calculateSellData = async (pair, price, exchange, configObj, addFee, curre
 						'exchangeFeeSumDiffPercent': exchangeFeeSumDiffPercent,
 						'exchangeFeeQtySumDiffPercent': exchangeFeeQtySumDiffPercent,
 						'exchangeFeePercent': exchangeFeePercent,
-						'priceFiltered': priceFiltered
+						'priceFiltered': priceFiltered,
+						'minMoveAmount': minMoveAmount
 				   };
 
 	return resObj;
 }
 
 
-async function calculatePairData(arr) {
-
-	let sum = 0;
-	let count = 0;
-	let wholeNumberCount = 0;
-	let differenceSum = 0;
-
-	let totalLength = arr.length;
-
-	arr.forEach((num, index) => {
-
-		const parts = num.split('.');
-
-		if (parts.length === 2) {
-
-			// If contains decimal, add to the sum and increment count
-			sum += parseFloat(`0.${parts[1]}`);
-			count++;
-
-		} else {
-
-			// Whole number found
-			wholeNumberCount++;
-		}
-
-		// Calculate difference with the next number
-		if (index < totalLength - 1) {
-
-			const currentNum = parseFloat(num);
-			const nextNum = parseFloat(arr[index + 1]);
-			differenceSum += Math.abs(nextNum - currentNum);
-		}
-	});
-
-	// Calculate average decimal
-	const average = count > 0 ? sum / count : 0;
-
-	// Calculate average difference
-	const averageDifference = totalLength > 1 ? differenceSum / (totalLength - 1) : 1;
-
-	// Calculate average whole number percentage
-	const wholeNumberPercentage = (wholeNumberCount / totalLength) * 100;
-
-	// Calculate addFeePercentage
-	const addFeePercentage = average * (wholeNumberPercentage / 100);
-
-	// Calculate minQty
-	const minAmount = +(wholeNumberCount / totalLength);
-
-	return {
-		'average_decimal': Number(average.toFixed(2)),
-		'total_count': totalLength,
-		'whole_number_count': wholeNumberCount,
-		'whole_number_percent': Number(wholeNumberPercentage.toFixed(2)),
-		'add_fee_percent': Number(addFeePercentage.toFixed(4)),
-		'minimum_movement_amount': Number(minAmount.toFixed(4))
-	};
-}
-
-
 async function getPairPrecision(exchange, exchangeName, pair, isPairData) {
 
 	let minMoveAmount;
+
+	exchangeName = await getExchangeAlias(exchangeName);
 
 	try {
 
@@ -2759,7 +4568,11 @@ async function getPairPrecision(exchange, exchangeName, pair, isPairData) {
 	if (!isPairData && (minMoveAmount == undefined || minMoveAmount == null)) {
 
 		const pairData = await getPairData(pair);
-		minMoveAmount = pairData['pair_data']['minimum_movement_amount'];
+
+		if (pairData.success) {
+
+			minMoveAmount = pairData['pair_data']['minimum_movement_amount'];
+		}
 	}
 
 	return minMoveAmount;
@@ -2778,7 +4591,8 @@ async function getPairData(pair) {
 		return ({'success': false});
 	}
 
-	const botConfig = await shareData.Common.getConfig('bot.json');
+	const botConfigFile = shareData.appData.bot_config;
+	const botConfig = await Common.getConfig(botConfigFile);
 
 	let config = botConfig.data;
 
@@ -2807,14 +4621,19 @@ async function getPairData(pair) {
 
 		const orderData = JSON.parse(JSON.stringify(orders.data.orders));
 
-		const orderDataSteps = orderData.steps;
+		// Use structured data if available, fall back to legacy positional array
+		const orderDataSteps = orderData.structured || orderData.steps;
 
 		for (let i = 0; i < orderDataSteps.length; i++) {
 
-			qtyArr.push(orderDataSteps[i][5])
+			const step = orderDataSteps[i];
+			const isObj = step !== null && typeof step === 'object' && !Array.isArray(step);
+			qtyArr.push(isObj ? step.qty : step[5]);
 		}
 
-		pairData = await calculatePairData(qtyArr);
+		const precisionAmount = Common.getPrecision(qtyArr);
+
+		pairData = { 'minimum_movement_amount': precisionAmount };
 	}
 
 	const resObj = {
@@ -2836,22 +4655,24 @@ async function loadExchangeMarkets(exchangeObj) {
 	let success;
 	let exchanges;
 
-	if (exchangeObj == undefined || exchangeObj == null || exchangeObj == '') {
+	// If no specific exchange object is provided, load markets for all exchanges
+	if (!exchangeObj) {
 
 		exchanges = shareData.appData.exchanges;
-	}
-	else {
 
-		// Only load markets for one exchange
+	}else {
+
+		// Only load markets for the provided exchange
 		exchanges = exchangeObj;
 	}
 
-	for (let exchangeId in exchanges) {
+	for (let hash in exchanges) {
 
 		let count = 0;
 		let finished = false;
 
-		let exchange = exchanges[exchangeId];
+		let exchange = exchanges[hash]['exchange'];
+		let exchangeName = exchanges[hash]['name'];
 
 		while (!finished) {
 
@@ -2859,25 +4680,26 @@ async function loadExchangeMarkets(exchangeObj) {
 
 				success = true;
 
+				// Load markets for the current exchange
 				const markets = await exchange.loadMarkets();
 
-				await processExchangeMarkets(exchangeId, markets);
+				// Use the hash as the identifier when processing the markets
+				await processExchangeMarkets(exchangeName, markets);
 
 				finished = true;
 			}
-			catch(e) {
+			catch (e) {
 
 				isErr = null;
 
 				if (count < maxTries) {
-	
-					// Delay and try again
+
+					// Delay and retry
 					await Common.delay(1000 + (Math.random() * 100));
 				}
 				else {
 
 					isErr = e;
-
 					success = false;
 					finished = true;
 				}
@@ -2887,7 +4709,7 @@ async function loadExchangeMarkets(exchangeObj) {
 		}
 	}
 
-	return { 'success': success, 'error': isErr };
+	return { success, error: isErr };
 }
 
 
@@ -2928,6 +4750,8 @@ async function connectExchange(configObj) {
 
 	let success;
 	let exchange;
+	let exchangeHash;
+	let exchangeNewObj = {};
 	let isErr;
 	let isNew = false;
 	let options = { 'defaultType': 'spot' };
@@ -2937,24 +4761,34 @@ async function connectExchange(configObj) {
 		success = true;
 
 		let exchangeName = config.exchange;
-
 		exchangeName = await getExchangeAlias(exchangeName);
 
-		if (config.exchangeOptions != undefined && config.exchangeOptions != null && config.exchangeOptions != '') {
+		if (config.exchangeOptions) {
 
 			options = config.exchangeOptions;
 		}
 
-		if (shareData.appData.exchanges[exchangeName] != undefined && shareData.appData.exchanges[exchangeName] != null) {
+		const hash = crypto.createHash('sha256')
+			.update(
+				exchangeName +
+				(config.apiKey || '') +
+				(config.apiSecret || '') +
+				(config.apiPassphrase || '') +
+				(config.apiPassword || '')
+			)
+			.digest('hex');
 
-			exchange = shareData.appData.exchanges[exchangeName];
+		exchangeHash = hash;
+
+		if (shareData.appData.exchanges[hash]) {
+
+			exchange = shareData.appData.exchanges[hash]['exchange'];
 		}
 		else {
 
 			isNew = true;
 
 			exchange = new ccxt.pro[exchangeName]({
-
 				'timeout': (exchangeTimeoutSec * 1000),
 				'enableRateLimit': true,
 				'apiKey': config.apiKey,
@@ -2964,38 +4798,44 @@ async function connectExchange(configObj) {
 				'options': options
 			});
 
-			shareData.appData.exchanges[exchangeName] = exchange;
+			const exchangeObj = {
+									'name': exchangeName,
+									'exchange': exchange
+								};
+
+			exchangeNewObj[hash] = exchangeObj;
+			shareData.appData.exchanges[hash] = exchangeObj;
 		}
 	}
-	catch(e) {
+	catch (e) {
 
 		isErr = e;
+		exchange = null;
 		success = false;
 	}
 
 	// Load markets if newly connected
 	if (success && isNew) {
 
-		let exchangeObj = {};
-		exchangeObj[config.exchange] = exchange;
-
-		let loadData = await loadExchangeMarkets(exchangeObj);
+		let loadData = await loadExchangeMarkets(exchangeNewObj);
 
 		success = loadData['success'];
 		isErr = loadData['error'];
 	}
 
-	if (isErr != undefined && isErr != null && isErr != '') {
+	if (isErr) {
 
 		success = false;
-
 		let msg = 'Connect exchange error: ' + isErr;
 
 		Common.logger(msg);
+		Common.sendNotification({
+			'message': msg,
+			'type': 'error',
+			'telegram_id': shareData.appData.telegram_id
+		});
 
-		Common.sendNotification({ 'message': msg, 'type': 'error', 'telegram_id': shareData.appData.telegram_id });
-
-		delete shareData.appData.exchanges[config.exchange];
+		delete shareData.appData.exchanges[exchangeHash];
 	}
 
 	return exchange;
@@ -3018,11 +4858,11 @@ async function getExchangeAlias(exchangeName) {
 }
 
 
-async function sendDealError(msg) {
+async function sendDealMessage(msgType, msg) {
 
 	Common.logger(colors.bgRed(msg));
 
-	await Common.sendNotification({ 'message': msg, 'type': 'deal_error', 'telegram_id': shareData.appData.telegram_id });
+	await Common.sendNotification({ 'message': msg, 'type': msgType, 'telegram_id': shareData.appData.telegram_id });
 }
 
 
@@ -3045,9 +4885,9 @@ async function processOrderError(data) {
 
 	if (success) {
 
-		let msg = 'An error occurred starting deal ID ' + dealId + '. Disabling bot. Check the logs for details.';
+		let msg = 'An error occurred starting deal ID ' + dealId + '. Disabling bot ' + botName + '. Check the logs for details.';
 
-		await sendDealError(msg);
+		await sendDealMessage('deal_error', msg);
 		const statusObj = await sendBotStatus({ 'bot_id': botId, 'bot_name': botName, 'active': active, 'success': success });
 	}
 
@@ -3170,6 +5010,24 @@ async function deleteDeal(dealId) {
 }
 
 
+const updateOrderDeal = async (dealId, orderIndex, orderId, orders) => {
+
+	orders[orderIndex].filled = 1;
+	orders[orderIndex].orderId = orderId;
+	orders[orderIndex].dateFilled = new Date();
+
+	await Deals.updateOne({
+		dealId: dealId
+	}, {
+		orders: orders
+	});
+
+	const orderUpdated = orders[orderIndex];
+
+	return orderUpdated;
+}
+
+
 async function updateOrders(data) {
 
 	let orderData = JSON.parse(JSON.stringify(data));
@@ -3183,32 +5041,33 @@ async function updateOrders(data) {
 	for (let i = 0; i < orderSteps.length; i++) {
 
 		let orderNew;
+		const step = orderSteps[i];
 
-		let priceTargetNew = orderSteps[i][4].replace(/[^0-9.]/g, '');
+		// Support both structured objects (new path) and legacy positional arrays (old path)
+		const isObj = step !== null && typeof step === 'object' && !Array.isArray(step);
+
+		const priceTargetNew = String(isObj ? step.target : step[4]).replace(/[^0-9.]/g, '');
 
 		// Use existing order data if available
 		if (ordersOrig[i] != undefined && ordersOrig[i] != null) {
 
-			let priceTargetOrig = ordersOrig[i]['target'];
-
 			orderNew = ordersOrig[i];
-
 			orderNew['target'] = priceTargetNew;
 		}
 		else {
 
 			let orderObj = {
-								orderNo: orderSteps[i][0],
-								orderId: '',
-								price: orderSteps[i][2].replace(/[^0-9.]/g, ''),
-								average: orderSteps[i][3].replace(/[^0-9.]/g, ''),
-								target: priceTargetNew,
-								qty: orderSteps[i][5].replace(/[^0-9.]/g, ''),
-								amount: orderSteps[i][6].replace(/[^0-9.]/g, ''),
-								qtySum: orderSteps[i][7].replace(/[^0-9.]/g, ''),
-								sum: orderSteps[i][8].replace(/[^0-9.]/g, ''),
-								type: orderSteps[i][9],
-								filled: 0,
+								orderNo:  isObj ? step.no                                          : step[0],
+								orderId:  '',
+								price:    String(isObj ? step.price   : step[2]).replace(/[^0-9.]/g, ''),
+								average:  String(isObj ? step.average : step[3]).replace(/[^0-9.]/g, ''),
+								target:   priceTargetNew,
+								qty:      String(isObj ? step.qty     : step[5]).replace(/[^0-9.]/g, ''),
+								amount:   String(isObj ? step.amount  : step[6]).replace(/[^0-9.]/g, ''),
+								qtySum:   String(isObj ? step.qtySum  : step[7]).replace(/[^0-9.]/g, ''),
+								sum:      String(isObj ? step.sum     : step[8]).replace(/[^0-9.]/g, ''),
+								type:     isObj ? step.type : step[9],
+								filled:   0,
 								orderMetadata: orderMetadata[i]
 							};
 
@@ -3219,6 +5078,20 @@ async function updateOrders(data) {
 	}
 
 	return ordersNew;
+}
+
+
+async function removeDbKeys(obj) {
+
+	for (let key in obj) {
+
+		if (key.substr(0, 1) == '$' || key.substr(0, 1) == '_') {
+
+			delete obj[key];
+		}
+	}
+
+	return obj;
 }
 
 
@@ -3341,12 +5214,14 @@ async function createSellErrorTracker(dealId) {
 
 		if (dealTracker[dealId]['update']['deal_sell_error'] == undefined || dealTracker[dealId]['update']['deal_sell_error'] == null) {
 
-			dealTracker[dealId]['update']['deal_sell_error'] = {};
-			dealTracker[dealId]['update']['deal_sell_error']['history'] = {};
-			dealTracker[dealId]['update']['deal_sell_error']['nsf'] = false;
-			dealTracker[dealId]['update']['deal_sell_error']['count'] = 0;
-			dealTracker[dealId]['update']['deal_sell_error']['count_dupes'] = 0;
-			dealTracker[dealId]['update']['deal_sell_error']['date'] = new Date();
+			dealTracker[dealId]['update']['deal_sell_error'] = {
+				'history': {},
+				'nsf': false,
+				'verifying': false,
+				'count': 0,
+				'count_dupes': 0,
+				'date': new Date()
+			};
 		}
 	}
 	catch(e) {}
@@ -3361,7 +5236,10 @@ async function createDealTracker(data) {
 	dealTracker[dealId] = {};
 	dealTracker[dealId]['deal'] = {};
 	dealTracker[dealId]['info'] = {};
+	dealTracker[dealId]['meta'] = {};
 	dealTracker[dealId]['update'] = {};
+
+	dealTracker[dealId]['meta']['start_id'] = startId;
 
 	dealTracker[dealId]['deal'] = JSON.parse(JSON.stringify(data['deal']));
 
@@ -3370,18 +5248,21 @@ async function createDealTracker(data) {
 }
 
 
-async function updateDealTracker(data) {	
+async function updateDealTracker(data) {
 
-	let dataObj = JSON.parse(JSON.stringify(data));
+	const { exchange, ...dataInObj } = data;
+
+	let dataObj = JSON.parse(JSON.stringify(dataInObj));
 
 	dataObj['active'] = true;
 	dataObj['updated'] = new Date();
+	dataObj['exchange'] = exchange;
 
 	const dealId = data['deal_id'];
 
 	const dealData = await getDealInfo(dataObj);
 
-	if (dealData['success']) {
+	if (dealData['success'] && dealTracker[dealId] != undefined && dealTracker[dealId] != null) {
 
 		dealTracker[dealId]['info'] = dealData['info'];
 		dealTracker[dealId]['deal']['config'] = dealData['config'];
@@ -3454,6 +5335,12 @@ async function deleteDealTracker(dealId) {
 }
 
 
+async function createStartDealTracker(startId, botId) {
+
+	startDealTracker[startId] = { 'date': new Date(), 'botId': botId };
+}
+
+
 async function deleteStartDealTracker(id) {
 
 	if (id != undefined && id != null && id != '') {
@@ -3485,6 +5372,78 @@ async function deleteResumeDealTracker(dealId) {
 		resumeDealTracker[dealId] = null;
 		delete resumeDealTracker[dealId];
 	}
+}
+
+
+async function getActiveDeals(active) {
+
+	let dealsArr = [];
+	let dealsSort = [];
+
+	let botsActiveObj = {};
+
+	if (active == undefined || active == null || active == '') {
+
+		active = true;
+	}
+
+	const bots = await getBots({ 'active': active });
+
+	const dealTracker = await getDealTracker();
+
+	if (bots && bots.length > 0) {
+
+		for (let i = 0; i < bots.length; i++) {
+
+			let bot = bots[i];
+
+			const botId = bot.botId;
+			const botName = bot.botName;
+
+			botsActiveObj[botId] = botName;
+		}
+	}
+
+	// Remove sensitive data
+	for (let dealId in dealTracker) {
+
+		let botActive = true;
+
+		let obj = {};
+
+		let deal = dealTracker[dealId];
+
+		let botId = deal['deal']['botId'];
+		let config = deal['deal']['config'];
+		let info = JSON.parse(JSON.stringify(deal['info']));
+
+		let dealRoot = deal['deal'];
+
+		dealRoot = await removeDbKeys(dealRoot);
+		dealRoot['config'] = await removeConfigData(config);
+
+		if (botsActiveObj[botId] == undefined || botsActiveObj[botId] == null) {
+
+			botActive = false;
+		}
+
+		obj = Object.assign({}, obj, dealRoot);
+
+		obj['info'] = info;
+		obj['info']['bot_active'] = botActive;
+
+		obj = Common.convertStringToNumeric(obj);
+
+		dealsArr.push(obj);
+	}
+
+	dealsSort = Common.sortByKey(dealsArr, 'date');
+	dealsSort = dealsSort.reverse();
+
+	// Keep circuit breaker informed of active deal count
+	shareData.appData.cb_active_deal_count = dealsSort.length;
+
+	return dealsSort;
 }
 
 
@@ -3575,7 +5534,7 @@ async function processResumeDealTracker(data) {
 	const maxSec = 60;
 	const dateNow = new Date();
 
-	const dealId = data['deal_id'];
+	const dealId = data['deal_id'] ?? 'ALL DEALS';
 
 	let success = false;
 	let finished = false;
@@ -3634,14 +5593,20 @@ async function processResumeDealTracker(data) {
 }
 
 
+// Returns the cached balance directly — no exchange call, no timestamp update.
+// Use this everywhere except the background refresh interval.
+function getBalanceCache() {
+
+	return balanceTracker ? JSON.parse(JSON.stringify(balanceTracker)) : {};
+}
+
+
 async function getBalanceTracker() {
 
 	let getNew = false;
-
 	let balances = {};
 
 	let lastUpdated = balanceTracker['updated'];
-
 	let diffSec = (new Date().getTime() - new Date(lastUpdated).getTime()) / 1000;
 
 	if (diffSec > 5 || lastUpdated == undefined || lastUpdated == null) {
@@ -3653,33 +5618,52 @@ async function getBalanceTracker() {
 
 		const exchanges = shareData.appData.exchanges;
 
-		for (let exchange in exchanges) {
+		for (let hash in exchanges) {
 
-			const exchangeObj = exchanges[exchange];
+			const exchangeObj = exchanges[hash];
 
-			const balance = await getBalance(exchangeObj);
+			const exchangeName = exchangeObj['name'];
+			const exchange = exchangeObj['exchange'];
+
+			// Skip exchanges without API credentials — they were connected
+			// for public data only (e.g. BTC price ticker, market data)
+			// or are sandbox instances without real credentials.
+			if (!exchange.apiKey) continue;
+
+			const balance = await getBalance(exchange);
 
 			if (balance.success) {
 
-				balances[exchange] = balance.balance;
+				let uniqueName = exchangeName;
+				let counter = 1;
+
+				// Ensure unique name
+				while (uniqueName in balances) {
+
+					uniqueName = `${exchangeName}_${counter++}`;
+				}
+
+				balances[uniqueName] = balance.balance;
 			}
 		}
+
+		// Only stamp updated when we actually fetched from the exchange
+		const resObj = {
+			'updated': new Date(),
+			'balances': balances
+		};
+
+		balanceTracker = JSON.parse(JSON.stringify(resObj));
 	}
 	else {
 
 		try {
 
-			balances = JSON.parse(JSON.stringify(balanceTracker));
+			balances = JSON.parse(JSON.stringify(balanceTracker.balances));
 		}
-		catch(e) {}
+		catch (e) {}
 	}
 
-	const resObj = {
-						'updated': new Date(),
-						'balances': balances
-				   };
-
-	// Divide total by qty sum in orders to get percentage difference
 	for (let exchange in balances) {
 
 		const exchangeData = balances[exchange];
@@ -3697,15 +5681,14 @@ async function getBalanceTracker() {
 		}
 	}
 
-	balanceTracker = JSON.parse(JSON.stringify(resObj));
-
-	return resObj;
+	return balanceTracker;
 }
 
 
 async function getDealInfo(data) {
 
 	const updated = data['updated'];
+	const exchange = data['exchange'];
 	const dealId = data['deal_id'];
 	const active = data['active'];
 	const price = data['price'];
@@ -3713,6 +5696,7 @@ async function getDealInfo(data) {
 	const pause = data['pause'];
 	const pauseBuy = data['pause_buy'];
 	const pauseSell = data['pause_sell'];
+	const pauseReason = data['pauseReason'] || data['pause_reason'] || '';
 
 	const config = JSON.parse(JSON.stringify(data['config']));
 	const orders = JSON.parse(JSON.stringify(data['orders']));
@@ -3720,41 +5704,118 @@ async function getDealInfo(data) {
 	const filledOrders = orders.filter(item => item.filled == 1);
 	const currentOrder = filledOrders.pop();
 
-	if (currentOrder != undefined && currentOrder != null) {
+	const isPaused = (pause || pauseBuy || pauseSell);
 
-		const profitData = await calculateProfit(price, config.sandBox, currentOrder.average, currentOrder.sum, config.dcaTakeProfitPercent, config.exchangeFee);
-
-		const profitPerc = profitData['profit_percentage'];
-		const takeProfit = profitData['take_profit'];
-		const currentProfit = profitData['profit'];
-
-		const dealInfo = {
-							'updated': updated,
-							'active': active,
-							'pause': pause,
-							'pause_buy': pauseBuy,
-							'pause_sell': pauseSell,
-							'error': error,
-							'bot_id': config.botId,
-							'bot_name': config.botName,
-							'safety_orders_used': filledOrders.length,
-							'safety_orders_max': orders.length - 1,
-							'price_last': price,
-							'price_average': currentOrder.average,
-							'price_target': currentOrder.target,
-							'profit': currentProfit,
-							'profit_percentage': profitPerc,
-							'take_profit': takeProfit,
-							'deal_count': config.dealCount,
-							'deal_max': config.dealMax
-						 };
-
-		return ({ 'success': true, 'info': dealInfo, 'config': config, 'orders': orders });
-	}
-	else {
+	// No filled order yet: normally there's nothing to show. But if the deal is
+	// paused for verification (e.g. a base order mid-invalid_order-verify, isStart:0),
+	// return a minimal-but-valid info object so the UI can render the system-pause
+	// banner instead of dropping the row. Profit/estimate fields default to 0 since
+	// there is no filled order to compute them from.
+	if ((currentOrder == undefined || currentOrder == null) && !isPaused) {
 
 		return ({ 'success': false });
 	}
+
+	let profitPerc = 0;
+	let profitQuoteProjected = 0;
+	let currentProfit = 0;
+	let currentProfitBase = 0;
+
+	let safetyOrdersUsed = 0;
+	let priceAverage = 0;
+	let priceTarget = 0;
+	let maxDeviation = 0;
+	let maxFunds = 0;
+
+	let estimates = {};
+
+	if (currentOrder != undefined && currentOrder != null) {
+
+		const profitData = await calculateProfit(exchange, config.pair, price, currentOrder.average, currentOrder.sum, config.dcaTakeProfitPercent, config.exchangeFee, config.sandBox);
+
+		profitPerc = profitData['profit_percentage'];
+		profitQuoteProjected = profitData['profit_quote_projected'];
+		currentProfit = profitData['profit'];
+		currentProfitBase = profitData['profit_base'];
+
+		const maxFundsObj = await calculateMaxFunds(config);
+
+		const estimateObj = await estimateFunds({
+				'dealId': undefined,
+				'sum': currentOrder.sum,
+				'qtySum': currentOrder.qtySum,
+				'targetProfitPercent': config.dcaTakeProfitPercent,
+				'targetPrice': currentOrder.target,
+				'price': price,
+				'exchangeFee': config.exchangeFee
+		});
+
+		const estAmountNet = Common.adjustDecimals(estimateObj['amount_net'], price, currentOrder.average, currentOrder.target);
+		const estAmountGross = Common.adjustDecimals(estimateObj['amount_gross'], price, currentOrder.average, currentOrder.target);
+		const estAvgNet = Common.adjustDecimals(estimateObj['average_price_net'], price, currentOrder.average, currentOrder.target);
+		const estAvgGross = Common.adjustDecimals(estimateObj['average_price_gross'], price, currentOrder.average, currentOrder.target);
+		const estTargetNet = Common.adjustDecimals(estimateObj['target_price_net'], price, currentOrder.average, currentOrder.target);
+		const estTargetGross = Common.adjustDecimals(estimateObj['target_price_gross'], price, currentOrder.average, currentOrder.target);
+		const estAvgChangePerc = estimateObj['average_price_change_percent'];
+		const estTargetChangePerc = estimateObj['target_price_change_percent'];
+		const estFeeTotal = estimateObj['exchange_fee_total'];
+
+		safetyOrdersUsed = filledOrders.length;
+		priceAverage = currentOrder.average;
+		priceTarget = currentOrder.target;
+		maxDeviation = maxFundsObj.max_deviation;
+		maxFunds = maxFundsObj.max_funds;
+
+		estimates = {
+			'amount_net': estAmountNet,
+			'amount_gross': estAmountGross,
+			'price_average_net': estAvgNet,
+			'price_average_gross': estAvgGross,
+			'price_target_net': estTargetNet,
+			'price_target_gross': estTargetGross,
+			'price_average_change_percent': estAvgChangePerc,
+			'price_target_change_percent': estTargetChangePerc,
+			'exchange_fee_total': estFeeTotal
+		};
+	}
+	else {
+
+		// Paused deal with no filled order (base order mid-verify). Show the base
+		// order's stored price as the average/target placeholder if available.
+		const baseOrder = orders[0] || {};
+
+		priceAverage = baseOrder.average || baseOrder.price || 0;
+		priceTarget = baseOrder.target || 0;
+		safetyOrdersUsed = 0;
+	}
+
+	const dealInfo = {
+						'updated': updated,
+						'active': active,
+						'pause': pause,
+						'pause_buy': pauseBuy,
+						'pause_sell': pauseSell,
+						'pause_reason': pauseReason,
+						'error': error,
+						'bot_id': config.botId,
+						'bot_name': config.botName,
+						'safety_orders_used': safetyOrdersUsed,
+						'safety_orders_max': orders.length - 1,
+						'price_last': price,
+						'price_average': priceAverage,
+						'price_target': priceTarget,
+						'profit': currentProfit,
+						'profit_base': currentProfitBase,
+						'profit_percentage': profitPerc,
+						'profit_quote_projected': profitQuoteProjected,
+						'estimates': estimates,
+						'deal_count': config.dealCount,
+						'deal_max': config.dealMax,
+						'max_deviation': maxDeviation,
+						'max_funds': maxFunds,
+					 };
+
+	return ({ 'success': true, 'info': dealInfo, 'config': config, 'orders': orders });
 }
 
 
@@ -3780,7 +5841,9 @@ async function initConfigData(config) {
 
 	let configObj = JSON.parse(JSON.stringify(config));
 
-	const botConfig = await shareData.Common.getConfig('bot.json');
+	const botConfigFile = shareData.appData.bot_config;
+
+	const botConfig = await Common.getConfig(botConfigFile);
 
 	// Set exchange options
 	configObj['exchangeOptions'] = botConfig.data['exchangeOptions'];
@@ -3867,6 +5930,32 @@ async function ordersToHtml(data) {
 }
 
 
+async function ordersToStructuredData(structured) {
+
+	if (!Array.isArray(structured) || structured.length === 0) {
+		return { 'headers': [], 'steps': [], 'structured': [] };
+	}
+
+	const headers = ['No', 'Deviation', 'Price', 'Average', 'Target', 'Qty', 'Amount', 'Sum(Qty)', 'Sum', 'Type', 'Filled'];
+
+	const steps = structured.map(order => [
+		order.no,
+		order.deviation + '%',
+		order.price,
+		order.average,
+		order.target,
+		order.qty,
+		order.amount,
+		order.qtySum,
+		order.sum,
+		order.type,
+		order.filled == 0 ? 'Waiting' : 'Filled'
+	]);
+
+	return { 'headers': headers, 'steps': steps, 'structured': structured };
+}
+
+
 async function ordersToData(data) {
 
 	let rows = data.split(/[\r\n]+/);
@@ -3928,6 +6017,7 @@ async function ordersCreateTable(data) {
 
 	let ordersDeviation = [];
 	let ordersMetadata = [];
+	let ordersStructured = [];
 
 	let t = new Table();
 
@@ -3942,19 +6032,39 @@ async function ordersCreateTable(data) {
 		ordersDeviation.push(deviationPerc);
 	}
 
+	const pair = typeof config.pair === 'string' ? config.pair : (config.pair || [])[0] || '';
+	const quoteCurrency = pair.split('/')[1] || '';
+	const sym = Common.getCurrencySymbol(quoteCurrency);
+	const amountHeader = 'Amount' + (sym ? '(' + sym + ')' : '');
+	const sumHeader = 'Sum' + (sym ? '(' + sym + ')' : '');
+
 	orders.forEach(function (order) {
 
 		ordersMetadata.push(order.orderMetadata);
 
+		ordersStructured.push({
+			no:        order.orderNo,
+			deviation: ordersDeviation[order.orderNo - 1],
+			price:     order.price,
+			average:   order.average,
+			target:    order.target,
+			qty:       order.qty,
+			amount:    order.amount,
+			qtySum:    order.qtySum,
+			sum:       order.sum,
+			type:      order.type,
+			filled:    order.filled
+		});
+
 		t.cell('No', order.orderNo);
 		t.cell('Deviation', ordersDeviation[order.orderNo - 1] + '%');
-		t.cell('Price', '$' + order.price);
-		t.cell('Average', '$' + order.average);
-		t.cell('Target', '$' + order.target);
+		t.cell('Price', sym + order.price);
+		t.cell('Average', sym + order.average);
+		t.cell('Target', sym + order.target);
 		t.cell('Qty', order.qty);
-		t.cell('Amount($)', '$' + order.amount);
+		t.cell(amountHeader, sym + order.amount);
 		t.cell('Sum(Qty)', order.qtySum);
-		t.cell('Sum($)', '$' + order.sum);
+		t.cell(sumHeader, sym + order.sum);
 		t.cell('Type', order.type);
 		t.cell('Filled', order.filled == 0 ? 'Waiting' : 'Filled');
 
@@ -3963,7 +6073,7 @@ async function ordersCreateTable(data) {
 
 	let maxDeviation = await getDeviationDca(config.dcaOrderStepPercent, config.dcaOrderStepPercentMultiplier, orders.length - 1);
 
-	return ( { 'table': t, 'max_deviation': maxDeviation, 'metadata': ordersMetadata } );
+	return ( { 'table': t, 'structured': ordersStructured, 'max_deviation': maxDeviation, 'metadata': ordersMetadata } );
 }
 
 
@@ -3997,30 +6107,40 @@ async function sendNotificationStart(botName, dealId, pair) {
 
 async function sendNotificationFinish(botName, dealId, pair, sellData) {
 
-	let orderCount = 0;
-
 	let msg;
 	let msgLoss;
 	let msgProfit;
+	let profit;
+
+	pair = pair.toUpperCase();
+
+	const pairArr = pair.split('/');
+
+	const pairBase = pairArr[0];
+	const pairQuote = pairArr[1];
 
 	const dealData = await getDeals({ 'dealId': dealId });
-	const profitPerc = Number(sellData.profit);
 
 	const deal = dealData[0];
-	const orders = deal.orders;
+	const config = deal.config;
 
-	for (let x = 0; x < orders.length; x++) {
+	const profitQuote = Number(sellData.profitQuote);
+	const profitBase = Number(sellData.profitBase);
+	const profitPerc = Number(sellData.profit);
 
-		const order = orders[x];
+	const profitCurrency = config['profitCurrency'];
 
-		if (order['filled']) {
+	const duration = Common.timeDiff(new Date(), new Date(deal['date']));
 
-			orderCount++;
-		}
+	if (!profitCurrency || profitCurrency == 'quote' || Number(profitBase) <= 0) {
+
+		const quoteSym = Common.getCurrencySymbol(pairQuote);
+		profit = quoteSym + profitQuote + ' ' + pairQuote;
 	}
+	else {
 
-	const profit = shareData.Common.roundAmount(Number((Number(orders[orderCount - 1]['sum']) * (profitPerc / 100))));
-	const duration = shareData.Common.timeDiff(new Date(), new Date(deal['date']));
+		profit = profitBase + ' ' + pairBase;
+	}
 
 	try {
 
@@ -4033,7 +6153,7 @@ async function sendNotificationFinish(botName, dealId, pair, sellData) {
 
 	}
 
-	if (profit <= 0) {
+	if (profitQuote <= 0) {
 
 		msg = msgLoss;
 	}
@@ -4122,7 +6242,7 @@ async function volumeValid(startBot, pair, symbol, config) {
 			if (shareData.appData.verboseLog) { Common.logger( colors.bgCyan.bold(msg) ); }
 
 			timerTracker[timerKey]['id'] = setTimeout(() => {
-																startVerify(configObj);
+																requestDealStart(configObj, 0, 'volume delay');
 
 															}, (60000 * 1));
 		}
@@ -4284,60 +6404,145 @@ async function createDeal(pair, pairMax, dealCount, dealMax, config, orders) {
 }
 
 
-async function startVerify(config, startId) {
+// ── Single entry point for all new deal starts ───────────────────────────────
+//
+// Every path that wants to create a new deal — API, webhook, signal, ASAP,
+// Single entry point for all new deal starts — API, webhook, signal, ASAP,
+// cooldown restart, internal loop — calls requestDealStart(). It enqueues
+// the work onto a serial queue so only one deal-start attempt runs at a time,
+// eliminating all race conditions regardless of call origin.
+//
+// delaySec: optional cooldown/stagger delay before the attempt runs.
+// Returns { success, data, startId } where:
+//   success  — true if successfully enqueued, false if queue not initialised
+//   data     — error message if success is false, otherwise null
+//   startId  — ID callers (e.g. apiStartDealProcess) can poll to confirm commit
+async function requestDealStart(config, delaySec = 0, source = '') {
 
-	// Verify bot is still enabled / active
+	let success = false;
+	let data    = null;
+	let startId = null;
 
-	const pair = config.pair;
-	const botId = config.botId;
-	const dealCount = config.dealCount;
+	if (!dealStartQueue) {
 
-	if (botId != undefined && botId != null && botId != '') {
+		data = 'requestDealStart called before queue initialised';
+		Common.logger(data);
+	}
+	else {
 
-		// Reload bot config from db in case any changes were made
-		const bot = await getBots({ 'botId': botId });
+		success = true;
+		startId = Common.uuidv4();
 
-		if (bot && bot.length > 0) {
+		await createStartDealTracker(startId, config.botId);
 
-			if (bot[0].active) {
+		// Fast pre-enqueue check — count pending starts already queued for this botId.
+		// If pending starts alone already meet or exceed pairMax there is no point
+		// enqueueing another task that is guaranteed to be blocked when it runs.
+		// This uses only in-memory state so it never touches the database.
+		// The authoritative canStartDeal check inside the queue task still runs —
+		// this is purely an optimisation to avoid wasteful queue drain.
+		const pairMaxFast = Number(config.pairMax) || 0;
 
-				// Get total active pairs currently running on bot
-				let botDealsActive = await getDeals({ 'botId': botId, 'status': 0 });
+		if (pairMaxFast > 0) {
 
-				let pairCount = botDealsActive.length;
+			const pendingForBot = Object.values(startDealTracker)
+				.filter(entry => entry && entry.botId === config.botId)
+				.length;
 
-				let botConfigDb = bot[0].config;
+			// pendingForBot includes the current startId (added above),
+			// so block only when count exceeds pairMax — meaning there are
+			// already pairMax other pending starts ahead of this one.
+			if (pendingForBot > pairMaxFast) {
 
-				let pairMax = botConfigDb.pairMax;
-
-				if (pairMax == undefined || pairMax == null || pairMax == '') {
-
-					pairMax = 0;
-				}
-
-				if (pairMax == 0 || pairCount < pairMax) {
-
-					botConfigDb['pair'] = pair;
-					botConfigDb['botId'] = botId;
-					botConfigDb['dealCount'] = dealCount;
-
-					start({ 'create': true, 'config': botConfigDb }, startId);
-				}
+				deleteStartDealTracker(startId);
+				return { success: false, data: 'pairMax pre-check: too many pending starts', startId: null };
 			}
 		}
+
+		dealStartQueue.enqueue(async () => {
+
+			let taskSuccess = false;
+			let taskData    = null;
+
+			try {
+
+				// Apply optional stagger/cooldown delay
+				if (delaySec > 0) {
+
+					await Common.delay(delaySec * 1000);
+				}
+
+				// Wait for any resuming deals before proceeding
+				await processResumeDealTracker();
+
+				const pair      = config.pair;
+				const botId     = config.botId;
+				const dealCount = config.dealCount;
+
+				if (!botId || !pair) {
+
+					taskData = 'Missing botId or pair';
+				}
+				else {
+
+					const bot = await getBots({ 'botId': botId });
+
+					if (!bot || bot.length === 0 || !bot[0].active) {
+
+						taskData = 'Bot not found or inactive';
+					}
+					else {
+
+						const botConfigDb    = bot[0].config;
+						const botDealsActive  = await getDeals({ 'botId': botId, 'status': 0 });
+						const pairDealsActive = await getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
+						const pairCount       = botDealsActive.length;
+
+						const { allowed, reason } = await canStartDeal({
+							pair,
+							config: botConfigDb,
+							pairCount,
+							dealsActive: pairDealsActive
+						});
+
+						if (!allowed) {
+
+							taskData = reason;
+
+							if (shareData.appData.verboseLog) {
+
+								const sourceLabel = source ? ' (' + source + ')' : '';
+								Common.logger(colors.bgYellow('requestDealStart blocked for ' + pair + sourceLabel + ': ' + reason));
+							}
+						}
+						else {
+
+							botConfigDb['pair']      = pair;
+							botConfigDb['botId']     = botId;
+							botConfigDb['dealCount'] = dealCount;
+
+							await start({ 'create': true, 'config': botConfigDb }, startId);
+							taskSuccess = true;
+						}
+					}
+				}
+			}
+			catch (err) {
+
+				taskData = err?.message || String(err);
+				Common.logger('requestDealStart error: ' + taskData);
+			}
+
+			if (!taskSuccess) {
+
+				deleteStartDealTracker(startId);
+			}
+
+			return { 'success': taskSuccess, 'data': taskData };
+		});
 	}
-}
 
-
-async function startSignals() {
-
-	// Start signals after everything else is finished loading
-
-	const appConfig = await Common.getConfig('app.json');
-
-	const enabled = appConfig['data']['signals']['3CQS']['enabled'];
-
-	const socket = await shareData.Signals3CQS.start(enabled, appConfig['data']['signals']['3CQS']['api_key']);
+	return { success, data, startId };
 }
 
 
@@ -4349,64 +6554,56 @@ async function startAsap(pairIgnore) {
 	// Start any active asap bots that have no deals running
 	const botsActive = await getBots({ 'active': true, 'config.startConditions': { '$eq': 'asap' } });
 
-	if (botsActive && botsActive.length > 0) {
+	if (!botsActive || botsActive.length === 0) return;
 
-		let count = 0;
+	let count = 0;
 
-		for (let i = 0; i < botsActive.length; i++) {
+	for (let i = 0; i < botsActive.length; i++) {
 
-			let bot = botsActive[i];
+		const bot     = botsActive[i];
+		const botId   = bot.botId;
+		const botName = bot.botName;
 
-			let config = bot['config'];
+		let config = bot['config'];
+		const pairs = config.pair;
 
-			let botId = bot.botId;
-			let botName = bot.botName;
+		// Get total active pairs on this bot once per bot (incremented locally as starts are queued)
+		const botDealsActive = await getDeals({ 'botId': botId, 'status': 0 });
+		let pairCount = botDealsActive.length;
 
-			let pairs = config.pair;
-			let pairMax = config.pairMax;
+		const pairMax = Number(config.pairMax) || 0;
 
-			if (pairMax == undefined || pairMax == null || pairMax == '') {
+		for (let x = 0; x < pairs.length; x++) {
 
-				pairMax = 0;
-			}
+			// Early exit — no point iterating further once the pair limit is reached
+			if (pairMax > 0 && pairCount >= pairMax) break;
 
-			// Get total active pairs currently running on bot
-			let botDealsActive = await getDeals({ 'botId': botId, 'status': 0 });
+			const pair = pairs[x];
 
-			let pairCount = botDealsActive.length;
+			if (pairIgnore && pair.toUpperCase() === pairIgnore.toUpperCase()) continue;
 
-			for (let x = 0; x < pairs.length; x++) {
+			const dealsActive = await getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
 
-				let pair = pairs[x];
+			config['pair'] = pair;
+			config = await applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
 
-				if (pairIgnore != undefined && pairIgnore != null && pairIgnore != '') {
+			const { allowed } = await canStartDeal({
+				pair,
+				config,
+				pairCount,
+				dealsActive
+			});
 
-					if (pair.toUpperCase() == pairIgnore.toUpperCase()) {
+			if (allowed) {
 
-						continue;
-					}
-				}
+				// Stagger multiple simultaneous starts by 1 second per pair.
+				// notify is not passed — startAsap is an internal background restart,
+				// not a user-triggered action. Deal start notifications are sent
+				// by sendNotificationStart inside start() when the deal is created.
+				requestDealStart(config, count + 1, 'asap');
 
-				let dealsActive = await getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
-
-				config['pair'] = pair;
-				config = await applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
-
-				// Start bot if active, no deals are currently running and start condition is now asap
-				if (dealsActive && dealsActive.length == 0) {
-
-					if (pairMax == 0 || pairCount < pairMax) {
-
-						startDelay({ 'config': config, 'delay': count + 1, 'notify': false });
-
-						count++;
-						pairCount++;
-					}
-					else {
-
-						//Common.logger('Bot max pairs of ' + pairMax + ' reached');
-					}
-				}
+				count++;
+				pairCount++;
 			}
 		}
 	}
@@ -4476,13 +6673,220 @@ async function resumeDeal(dealObj) {
 
 	Common.logger( colors.bgGreen.bold('Resuming Deal ID ' + dealId) );
 
+	// If the deal was mid-verification when SymBot was terminated, restart
+	// verifyInvalidOrder so it continues polling rather than sitting paused forever.
+	const resumePauseReason = dealObj.pauseReason || '';
+
+	if (resumePauseReason === 'order_verify_buy' || resumePauseReason === 'order_verify_sell') {
+
+		const isSell = resumePauseReason === 'order_verify_sell';
+		const retryMins = 2;
+
+		// Find the pending order ID from the most recent unfilled order
+		const orders = dealObj.orders || [];
+		let pendingOrderId = null;
+
+		if (isSell) {
+
+			// Sell: look for a sell order ID stored on the deal
+			pendingOrderId = dealObj.sellData?.orderId?.[0] || null;
+		}
+		else {
+
+			// Buy: find the last unfilled order with an order ID
+			for (let i = orders.length - 1; i >= 0; i--) {
+
+				if (!orders[i].filled && orders[i].orderId) {
+
+					pendingOrderId = orders[i].orderId;
+					break;
+				}
+			}
+		}
+
+		// If there is no pending order ID to verify, do NOT arm verification. This happens
+		// when the deal was paused with an order_verify_* reason but the order that caused
+		// the pause left no stored ID — most commonly an exchange-cancelled partial buy
+		// (price-protection): that path pauses with pauseReason 'order_verify_buy' but never
+		// persists a pending order ID. Arming verifyInvalidOrder with orderId=null logged a
+		// misleading "verify order ID null / Attempt #1" and immediately resumed anyway.
+		// Instead, clear the stale pause reason and resume cleanly — there is nothing to poll.
+		if (!pendingOrderId) {
+
+			Common.logger( colors.bgYellow.bold(`Deal ID ${dealId} was paused (${resumePauseReason}) at shutdown but has no pending order ID to verify (e.g. an exchange-cancelled order). Clearing pause and resuming.`) );
+
+			await pauseDeal(botId, dealId, false, false, false, '');
+		}
+		else {
+
+			Common.logger( colors.bgYellow.bold(`Deal ID ${dealId} was mid-${isSell ? 'sell' : 'buy'} verification at shutdown. Restarting verification loop.`) );
+
+			const exchange = await connectExchange(dealObj.config || config);
+
+			if (exchange) {
+
+				let verifyCallback = null;
+
+				// Base order interrupted mid-verify (isStart:0). On success, mark the base
+				// order filled and advance to isStart=1 — identical to the normal base-order
+				// success path. Pre-calculated qty/amount/average/target are preserved.
+				if (!isSell && dealObj.isStart === 0) {
+
+					const baseOrders = dealObj.orders || [];
+
+					verifyCallback = async (verifyData) => {
+
+						if (baseOrders[0]) {
+
+							baseOrders[0].filled = 1;
+							baseOrders[0].dateFilled = new Date();
+
+							await Deals.updateOne({ dealId: dealId }, { isStart: 1, orders: baseOrders });
+						}
+					};
+				}
+
+				verifyInvalidOrder({ count: 0, mins: retryMins, exchange, pair, botId, dealId, orderId: pendingOrderId, onSuccessCallback: verifyCallback, pauseBeforeCallback: !isSell });
+			}
+		}
+	}
+
+	// Resuming an existing deal — bypass requestDealStart/queue intentionally.
+	// The deal already exists in the database (dealResumeId is set) so
+	// canStartDeal checks do not apply. start() handles resume logic directly.
 	start({ 'create': true, 'config': config });
 
 	await Common.delay(1000);
 }
 
 
-async function pauseDeal(botId, dealId, pause, pauseBuy, pauseSell) {
+function recordSafetyOrderTrigger(dealId, pair, price) {
+
+	const cb = shareData.appData.circuit_breaker;
+	if (!cb || !cb.enabled) return;
+
+	const now = Date.now();
+	const windowMs = (cb.deal_ratio_window_secs || 30) * 1000;
+
+	// Initialise rolling window arrays
+	if (!shareData.appData.cb_trigger_window) shareData.appData.cb_trigger_window = [];
+	if (!shareData.appData.cb_price_tracker)  shareData.appData.cb_price_tracker  = {};
+
+	// Add this trigger to rolling window
+	shareData.appData.cb_trigger_window.push({ dealId, pair, price, time: now });
+
+	// Prune entries outside the deal-ratio window
+	shareData.appData.cb_trigger_window = shareData.appData.cb_trigger_window
+		.filter(t => (now - t.time) <= windowMs);
+
+	// Track price history per pair for drop detection
+	const tracker = shareData.appData.cb_price_tracker;
+	const dropWindowMs = (cb.price_drop_window_secs || 60) * 1000;
+	if (!tracker[pair]) tracker[pair] = [];
+	tracker[pair].push({ price: parseFloat(price), time: now });
+	tracker[pair] = tracker[pair].filter(p => (now - p.time) <= dropWindowMs);
+
+	// Skip if circuit breaker already active
+	if (shareData.appData.circuit_breaker_active) return;
+
+	// ── Deal ratio trigger ───────────────────────────────────────────────
+	const uniqueDeals = new Set(shareData.appData.cb_trigger_window.map(t => t.dealId)).size;
+	const totalActive = shareData.appData.cb_active_deal_count || 1;
+	const ratio = uniqueDeals / totalActive;
+	const ratioThreshold = cb.deal_ratio_threshold || 0.5;
+
+	if (ratio >= ratioThreshold && uniqueDeals >= 2) {
+
+		activateCircuitBreaker(
+			`Deal ratio: ${uniqueDeals}/${totalActive} deals triggered safety orders within ${cb.deal_ratio_window_secs}s`
+		);
+		return;
+	}
+
+	// ── Price drop trigger ───────────────────────────────────────────────
+	const pairPrices = tracker[pair];
+	if (pairPrices && pairPrices.length >= 2 && cb.price_drop_enabled !== false) {
+
+		const oldest  = pairPrices[0].price;
+		const newest  = pairPrices[pairPrices.length - 1].price;
+		const dropPct = oldest > 0 ? ((oldest - newest) / oldest) * 100 : 0;
+		const dropThreshold = cb.price_drop_percent || 5.0;
+
+		if (dropPct >= dropThreshold) {
+
+			activateCircuitBreaker(
+				`Price drop: ${pair} fell ${dropPct.toFixed(2)}% within ${cb.price_drop_window_secs}s`
+			);
+		}
+	}
+}
+
+
+function activateCircuitBreaker(reason) {
+
+	const cb = shareData.appData.circuit_breaker;
+	const pauseSecs = (cb && cb.pause_duration_secs) || 60;
+
+	shareData.appData.circuit_breaker_active       = reason;
+	shareData.appData.circuit_breaker_activated_at = Date.now();
+	shareData.appData.circuit_breaker_clears_at    = Date.now() + (pauseSecs * 1000);
+
+	Common.logger(colors.yellow.bold(`CIRCUIT BREAKER ACTIVATED (${pauseSecs}s): ${reason}`));
+
+	// Build top affected pairs list from the trigger window
+	const triggerWindow = shareData.appData.cb_trigger_window || [];
+	const pairCounts = {};
+	triggerWindow.forEach(t => { pairCounts[t.pair] = (pairCounts[t.pair] || 0) + 1; });
+	const topPairs = Object.entries(pairCounts)
+		.sort((a, b) => b[1] - a[1])
+		.slice(0, 5)
+		.map(([pair, count]) => `${pair} (${count})`)
+		.join(', ');
+	const pairsLine = topPairs ? `\nTop pairs: ${topPairs}` : '';
+
+	// Check if CB has activated recently — elevated alert if so
+	const now = Date.now();
+	const cbRepeatWindowMs = ((cb && cb.repeat_alert_window_secs) || 3600) * 1000;
+	const lastActivation = shareData.appData.circuit_breaker_last_activation || 0;
+	const isRepeat = (now - lastActivation) <= cbRepeatWindowMs && lastActivation > 0;
+	shareData.appData.circuit_breaker_last_activation = now;
+
+	const prefix = isRepeat ? '🚨 Circuit Breaker Activated Again' : '⚡ Circuit Breaker Activated';
+	const repeatLine = isRepeat
+		? `\n⚠️ This is a repeat activation within ${Math.round((now - lastActivation) / 60000)}m — market conditions may be deteriorating.`
+		: '';
+
+	Common.sendNotification({
+		'message': `${prefix}\n\n${reason}${pairsLine}${repeatLine}\n\nNew buys paused for ${pauseSecs}s. Sells and panic sells are unaffected.`,
+		'type': 'warning',
+		'telegram_id': shareData.appData.telegram_id
+	});
+
+	// Capture activation timestamp to guard against re-trigger clearing a newer activation
+	const activatedAt = shareData.appData.circuit_breaker_activated_at;
+
+	setTimeout(() => {
+
+		if (shareData.appData.circuit_breaker_activated_at === activatedAt) {
+
+			delete shareData.appData.circuit_breaker_active;
+			delete shareData.appData.circuit_breaker_activated_at;
+			delete shareData.appData.circuit_breaker_clears_at;
+			shareData.appData.cb_trigger_window = [];
+			Common.logger(colors.yellow.bold('CIRCUIT BREAKER CLEARED — resuming normal deal processing'));
+
+			Common.sendNotification({
+				'message': '✅ Circuit Breaker Cleared\n\nNormal deal processing has resumed.',
+				'type': 'warning',
+				'telegram_id': shareData.appData.telegram_id
+			});
+		}
+
+	}, pauseSecs * 1000);
+}
+
+
+async function pauseDeal(botId, dealId, pause, pauseBuy, pauseSell, pauseReason = null) {
 
 	let status;
 	let success;
@@ -4494,6 +6898,13 @@ async function pauseDeal(botId, dealId, pause, pauseBuy, pauseSell) {
 
 		// Both pauseBuy and pauseSell are true
 		pause = true;
+		pauseBuy = false;
+		pauseSell = false;
+	}
+	else if (pause === false && (pauseBuy == undefined || pauseBuy == null) && (pauseSell == undefined || pauseSell == null)) {
+
+		// Only pause passed as false
+		pause = false;
 		pauseBuy = false;
 		pauseSell = false;
 	}
@@ -4511,7 +6922,8 @@ async function pauseDeal(botId, dealId, pause, pauseBuy, pauseSell) {
 	const dbParams = {
 		'paused': pause,
 		'pausedBuy': pauseBuy,
-		'pausedSell': pauseSell
+		'pausedSell': pauseSell,
+		'pauseReason': pauseReason
 	};
 
 	// Update only if values are defined
@@ -4519,7 +6931,8 @@ async function pauseDeal(botId, dealId, pause, pauseBuy, pauseSell) {
 
 		if (val != null) {
 
-			const convertedVal = Common.convertBoolean(val, false);
+			// pauseReason is a string — write it as-is, do not convert to boolean
+			const convertedVal = dbKey === 'pauseReason' ? val : Common.convertBoolean(val, false);
 
 			const dataUpdate = await updateDeal(botId, dealId, {
 				[dbKey]: convertedVal
@@ -4603,10 +7016,118 @@ async function panicSellDeal(dealId) {
 }
 
 
-async function addFundsDeal(dealId, volume) {
+async function estimateFunds({ dealId, sum, qtySum, targetPrice, price, exchangeFee, targetProfitPercent, maxFunds = Infinity }) {
 
+	const target = parseFloat(targetPrice);
+	const qtySumFloat = parseFloat(qtySum);
+	const sumFloat = parseFloat(sum);
+	const currentPrice = parseFloat(price);
+
+	const totalFeeRate = (parseFloat(exchangeFee) / 100) * 2;
+	const profitMultiplier = 1 + (parseFloat(targetProfitPercent) / 100);
+	const requiredValue = (sumFloat * profitMultiplier) / (1 - totalFeeRate);
+	const additionalValueNeeded = requiredValue - (currentPrice * qtySumFloat);
+
+	let amountWithFees = 0;
+	let avgPrice_funds = 0;
+	let avgChangePercent = 0;
+	let targetChangePercent = 0;
 	let success = true;
+	let message = '';
+
+
+	if (target > currentPrice && additionalValueNeeded > 0) {
+
+		const additionalQty = additionalValueNeeded / (target - currentPrice);
+		amountWithFees = additionalQty * currentPrice;
+		amountWithFees = amountWithFees / (1 - totalFeeRate);
+	
+		if (amountWithFees > maxFunds) {
+
+			success = false;
+			message = 'Insufficient funds to reach target profit';
+			amountWithFees = maxFunds;
+		}
+	}
+	else {
+
+		// No funds needed or not possible to calculate
+		success = false;
+		amountWithFees = 0;
+	}
+
+	let totalFee = amountWithFees * totalFeeRate;
+
+	// Round gross and fee
+	amountWithFees = Math.round((amountWithFees + Number.EPSILON) * 100) / 100;
+	totalFee = Math.round((totalFee + Number.EPSILON) * 100) / 100;
+
+	const amountWithoutFees = Math.round((amountWithFees - totalFee + Number.EPSILON) * 100) / 100;
+
+	// New average price (net-based)
+	const addedQty_net = amountWithoutFees / currentPrice;
+	const newQtySum_net = qtySumFloat + addedQty_net;
+	const newSum_net = sumFloat + amountWithoutFees;
+	const avgPrice_net = newQtySum_net > 0 ? newSum_net / newQtySum_net : 0;
+
+	// New average price (gross-based)
+	const addedQty_gross = amountWithFees / currentPrice;
+	const newQtySum_gross = qtySumFloat + addedQty_gross;
+	const newSum_gross = sumFloat + amountWithFees;
+	const avgPrice_gross = newQtySum_gross > 0 ? newSum_gross / newQtySum_gross : 0;
+
+	// Calculate new target price based on new average and desired profit + fees
+	const newTargetPrice_net = avgPrice_net * (1 + totalFeeRate + parseFloat(targetProfitPercent) / 100);
+	const newTargetPrice_gross = avgPrice_gross * (1 + totalFeeRate + parseFloat(targetProfitPercent) / 100);
+
+	// Process new estimated funds for average price accuracy
+	if (dealId != undefined && dealId != null && dealId != '') {
+
+		const addFundsObj = await addFundsDeal(dealId, avgPrice_net, true);
+
+		if (addFundsObj.success) {
+
+			const addFundsOrders = addFundsObj.orders;
+			const filledOrders = addFundsOrders.filter(item => item.filled == 1);
+			const currentOrder = filledOrders.pop();
+
+			avgPrice_funds = parseFloat(currentOrder.average);
+		}
+	}
+
+	if (avgPrice_net < (sumFloat / qtySumFloat)) {
+	
+		const prevAvg = sumFloat / qtySumFloat;
+		avgChangePercent = ((prevAvg - avgPrice_net) / prevAvg) * 100;
+	}
+
+	if (newTargetPrice_net < target) {
+		
+		targetChangePercent = ((target - newTargetPrice_net) / target) * 100;
+	}
+
+	return {
+		success,
+		message,
+		amount_net: amountWithoutFees,
+		amount_gross: amountWithFees,
+		exchange_fee_total: totalFee,
+		average_price_net: Number(avgPrice_net.toFixed(8)),
+		average_price_gross: Number(avgPrice_gross.toFixed(8)),
+		average_price_add_funds: Number(avgPrice_funds.toFixed(8)),
+		target_price_net: Number(newTargetPrice_net.toFixed(8)),
+		target_price_gross: Number(newTargetPrice_gross.toFixed(8)),
+		average_price_change_percent: Number(avgChangePercent.toFixed(2)),
+		target_price_change_percent: Number(targetChangePercent.toFixed(2))
+	};
+}
+
+
+async function addFundsDeal(dealId, volume, dryRun) {
+
+	let success = false;
 	let isUpdated = false;
+	let ordersReturn = [];
 	let msg = 'Success';
 
 	const deal = await Deals.findOne({
@@ -4616,179 +7137,423 @@ async function addFundsDeal(dealId, volume) {
 
 	if (deal) {
 
-		const config = JSON.parse(JSON.stringify(deal.config));
+		let orderNo;
+
+		const configDeal = JSON.parse(JSON.stringify(deal.config));
 		const orders = JSON.parse(JSON.stringify(deal.orders));
+		const config = await initConfigData(configDeal);
 
-		Common.logger(
-			colors.red.bold('Add Funds to deal ID ' + dealId + ' requested.')
-		);
-
-		let minMoveAmount;
+		Common.logger(colors.red.bold('Add Funds to deal ID ' + dealId + ' requested.'));
 
 		let oldOrders = orders;
-		let exchange = await connectExchange(config).catch(console.log);
+		let exchange = await connectExchange(config);
 
-		const ex = await exchange.loadMarkets();
+		if (exchange) {
 
-		volume = await filterPrice(exchange, config.pair, volume);
+			volume = await filterPrice(exchange, config.pair, volume);
 
-		for (let i = 0; i < oldOrders.length; i++) {
+			const allOrdersFilled = oldOrders.every(order => order.filled);
 
-			if (!oldOrders[i].filled && !isUpdated) {
+			async function handleOrder(order, previousOrder = null) {
 
 				const symbolData = await getSymbol(exchange, config.pair);
 				const symbol = symbolData.data;
-
-				const bidPrice = symbol.bid;
 				const askPrice = symbol.ask;
 
-				let newOrder = Object.assign({}, oldOrders[i]);
 				let price = await filterPrice(exchange, config.pair, askPrice);
 				let amount = await filterPrice(exchange, config.pair, volume);
-				let qty = await filterAmount(exchange, config.pair, ((volume) / askPrice));
+				let qty = await filterAmount(exchange, config.pair, (parseFloat(volume) / parseFloat(askPrice)));
 
-				// Get minimum movement amount from first order
-				try {
-
-					minMoveAmount = oldOrders[0]['orderMetadata']['minimum_movement_amount'];
-				}
-				catch (e) {}
+				let minMoveAmount = oldOrders[0]?.orderMetadata?.minimum_movement_amount;
 
 				const adjustments = await calculateAdjustments({
-
-					'exchange': exchange,
-					'pair': config.pair,
-					'price': price,
-					'amount': amount,
-					'orderSize': qty,
-					'exchangeFee': config.exchangeFee,
-					'minMoveAmount': minMoveAmount
+					exchange,
+					pair: config.pair,
+					price,
+					amount,
+					orderSize: qty,
+					exchangeFee: config.exchangeFee,
+					minMoveAmount,
 				});
 
-				qty = adjustments['order_qty'];
-				amount = adjustments['order_amount'];
+				qty = adjustments.order_qty;
+				amount = adjustments.order_amount;
 
-				let qtySum = (parseFloat(qty) + parseFloat(oldOrders[i - 1].qtySum));
+				let qtySum = parseFloat(qty) + parseFloat(previousOrder?.qtySum || 0);
 				qtySum = await filterAmount(exchange, config.pair, qtySum);
 
-				let orderSum = (parseFloat(amount) + parseFloat(oldOrders[i - 1].sum));
+				let orderSum = parseFloat(amount) + parseFloat(previousOrder?.sum || 0);
 				orderSum = await filterPrice(exchange, config.pair, orderSum);
 
-				let sum = await filterPrice(exchange, config.pair, orderSum);
+				// Round final amount
+				orderSum = Math.round(orderSum * 100) / 100;
 
-				const avgPrice = await filterPrice(exchange, config.pair, (parseFloat(orderSum) / parseFloat(qtySum)));
+				const avgPrice = await filterPrice(exchange, config.pair, (orderSum / qtySum));
 
-				let targetPrice = await calculateTargetPrice({
+				const targetObj = {
+					exchange,
+					pair: config.pair,
+					price: avgPrice,
+					takeProfit: config.dcaTakeProfitPercent,
+					exchangeFee: config.exchangeFee,
+				};
 
-					'exchange': exchange,
-					'pair': config.pair,
-					'price': avgPrice,
-					'takeProfit': config.dcaTakeProfitPercent,
-					'exchangeFee': config.exchangeFee
-				});
+				const targetPrice = await calculateTargetPrice(targetObj);
 
-				if (targetPrice != undefined && targetPrice != null && targetPrice != false && targetPrice > 0) {
+				if (targetPrice > 0) {
 
-					let buyOrderId = '';
-
-					isUpdated = true;
+					let newOrder = {
+						...order,
+						price,
+						average: avgPrice,
+						target: targetPrice,
+						qty,
+						amount,
+						qtySum,
+						sum: orderSum,
+						filled: 1,
+						manual: true,
+						orderMetadata: adjustments,
+						dateFilled: new Date()
+					};
 
 					if (!config.sandBox) {
 
 						const buy = await buyOrder(exchange, dealId, config.pair, qty, price);
 
 						if (!buy.success) {
-	
-							success = false;
-							isUpdated = false;
-							msg = buy;
-						}
-						else {
 
-							buyOrderId = buy['data']['id'];
+							msg = buy;
+
+							return;
 						}
+
+						newOrder.orderId = buy.data.id;
 					}
 
-					newOrder.orderId = buyOrderId;
-					newOrder.price = price;
-					newOrder.average = avgPrice;
-					newOrder.target = targetPrice;
-					newOrder.qty = qty;
-					newOrder.amount = amount;
-					newOrder.qtySum = qtySum;
-					newOrder.sum = orderSum;
-					newOrder.manual = true;
-					newOrder.filled = 1;
-					newOrder.orderMetadata = adjustments;
-					newOrder.dateFilled = new Date();
+					let insertionIndex;
 
-					oldOrders.splice(i, 0, newOrder);
+					// Insert the newOrder into oldOrders first
+					if (previousOrder) {
+
+						const previousIndex = oldOrders.indexOf(previousOrder);
+
+						insertionIndex = previousIndex + 1;
+						oldOrders.splice(insertionIndex, 0, newOrder);
+					}
+					else {
+
+						oldOrders.push(newOrder);
+						insertionIndex = oldOrders.length - 1;
+					}
+
+					// Set orderNo based on insertion index
+					newOrder.orderNo = insertionIndex + 1;
+
+					// Increment orderNo for all subsequent orders
+					for (let j = insertionIndex + 1; j < oldOrders.length; j++) {
+
+						let orderNoOrig = oldOrders[j].orderNo;
+
+						oldOrders[j].orderNo = Number(orderNoOrig) + 1;
+					}
+
+					orderNo = newOrder.orderNo;
+
+					isUpdated = true;
+					success = true;
+				}
+				else {
+
+					msg = 'Unable to calculate target price: ' + JSON.stringify(targetObj);
+				}
+			}
+
+			if (allOrdersFilled) {
+
+				await handleOrder(null, oldOrders[oldOrders.length - 1]);
+			}
+			else {
+
+				for (let i = 0; i < oldOrders.length; i++) {
+
+					if (!oldOrders[i].filled && !isUpdated) {
+
+						await handleOrder(oldOrders[i], i > 0 ? oldOrders[i - 1] : null);
+					}
+				}
+			}
+
+			if (success) {
+
+				let dryRunOrders;
+
+				ordersReturn = oldOrders;
+
+				if (!dryRun) {
+
+					const botId = deal.botId;
+
+					await updateDeal(botId, dealId, {
+						config: deal.config,
+						orders: oldOrders
+					});
+				}
+				else {
+
+					// Pass orders to recalculate without updating db when using dryRun
+					dryRunOrders = oldOrders;
 				}
 
-			} else if (isUpdated) {
-
-				let price = Percentage.subPerc(
-					(oldOrders[i - 1].price),
-					(config.dcaOrderStartDistance)
-				);
-
-				price = await filterPrice(exchange, config.pair, price);
-
-				let orderSize = (oldOrders[i].qty);
-
-				orderSize = await filterAmount(exchange, config.pair, orderSize);
-
-				let orderAmount = parseFloat(orderSize) * parseFloat(price);
-				orderAmount = await filterPrice(exchange, config.pair, orderAmount);
-
-				let orderSum = parseFloat(orderAmount) + parseFloat(oldOrders[i - 1].sum);
-				orderSum = await filterPrice(exchange, config.pair, orderSum);
-
-				let orderQtySum = parseFloat(orderSize) + parseFloat(oldOrders[i - 1].qtySum);
-				orderQtySum = await filterAmount(exchange, config.pair, orderQtySum);
-
-				const avgPrice = await filterPrice(exchange, config.pair, parseFloat(orderSum) / parseFloat(orderQtySum));
-
-				let targetPrice = await calculateTargetPrice({
-
+				let recalcObj = await recalculateOrders({
 					'exchange': exchange,
-					'pair': config.pair,
-					'price': avgPrice,
-					'takeProfit': config.dcaTakeProfitPercent,
-					'exchangeFee': config.exchangeFee
+					'dealId': dealId,
+					'orders': dryRunOrders,
+					'orderIndex': undefined,
+					'orderNo': orderNo,
+					'orderId': undefined,
+					'price': undefined,
+					'dryRun': dryRun
 				});
 
-				oldOrders[i].orderNo = oldOrders[i].orderNo + 1;
-				oldOrders[i].price = price;
-				oldOrders[i].average = avgPrice;
-				oldOrders[i].target = targetPrice;
-				oldOrders[i].qty = orderSize;
-				oldOrders[i].amount = orderAmount;
-				oldOrders[i].qtySum = orderQtySum;
-				oldOrders[i].sum = orderSum;
+				if (recalcObj.success) {
+
+					ordersReturn = null;
+
+					ordersReturn = recalcObj.orders;
+				}
 			}
 		}
+		else {
 
-		//console.table(oldOrders);
-
-		if (success) {
-
-			const botId = deal.botId;
-			const config = deal.config;
-
-			let dataUpdate = await updateDeal(botId, dealId, {
-				config: config,
-				orders: oldOrders,
-			});
+			msg = 'Unable to connect to exchange';
 		}
 	}
 	else {
 
-		success = false;
 		msg = 'Deal ID not found';
 	}
 
-	return ( { 'success': success, 'data': msg } );
+	return { 'success': success, 'data': msg, 'orders': ordersReturn };
+}
+
+
+async function recalculateOrders(params) {
+
+	let deal;
+	let config;
+	let success = false;
+	let orderFound = false;
+	let oldOrders = [];
+	let ordersReturn = [];
+	let orderIndex = -1;
+	let msg = 'Success';
+
+	deal = await Deals.findOne({
+		dealId: params.dealId,
+		status: 0
+	});
+
+	if (!deal) {
+
+		msg = 'Deal ID not found';
+	}
+	else {
+
+		config = await initConfigData(JSON.parse(JSON.stringify(deal.config)));
+		oldOrders = params.orders || JSON.parse(JSON.stringify(deal.orders));
+
+		Common.logger(colors.red.bold(`Recalculating orders for deal ID ${params.dealId}`));
+
+		try {
+
+			if (!params.exchange) {
+
+				params.exchange = await connectExchange(config);
+				await params.exchange.loadMarkets();
+			}
+		}
+		catch (error) {
+
+			Common.logger('Error connecting to exchange: ' + error.message);
+			msg = 'Error connecting to exchange';
+		}
+
+		['orderNo'].forEach(key => {
+			
+			if (params[key] !== undefined && params[key] !== null && params[key] !== '') {
+
+				params[key] = Number(params[key]);
+			}
+		});
+
+		if (params.exchange) {
+
+			if (params.orderIndex !== undefined && params.orderIndex !== null && params.orderIndex !== '') {
+
+				const parsedIndex = parseInt(params.orderIndex, 10);
+
+				if (isNaN(parsedIndex)) {
+
+					msg = 'Order index must be a valid number';
+				}
+				else if (parsedIndex < 0 || parsedIndex >= oldOrders.length) {
+
+					msg = 'Order index out of bounds';
+				}
+				else {
+
+					orderFound = true;
+					orderIndex = parsedIndex;
+				}
+			}
+			else {
+
+				if (params.orderId) {
+
+					for (let i = 0; i < oldOrders.length; i++) {
+
+						if (oldOrders[i].orderId === params.orderId) {
+
+							orderIndex = i;
+							orderFound = true;
+
+							break;
+						}
+					}
+				}
+				else if (typeof params.orderNo === 'number') {
+
+					for (let i = 0; i < oldOrders.length; i++) {
+
+						if (Number(oldOrders[i].orderNo) === params.orderNo) {
+
+							orderIndex = i;
+							orderFound = true;
+
+							break;
+						}
+					}
+				}
+			}
+
+			if (!orderFound) {
+
+				msg = 'Order ID or orderNo not found';
+			}
+			else {
+
+				// Update specified order with adjusted values
+				const updatedPrice = params.price !== undefined ? params.price : oldOrders[orderIndex].price;
+
+				const adjustedOrder = await getAdjustedOrder(
+					params.exchange,
+					config.pair,
+					updatedPrice,
+					oldOrders[orderIndex].amount,
+					oldOrders[orderIndex].qty,
+					config.exchangeFee,
+					config.minMoveAmount
+				);
+
+				oldOrders[orderIndex].price = updatedPrice;
+				oldOrders[orderIndex].amount = adjustedOrder.order_amount;
+				oldOrders[orderIndex].qty = adjustedOrder.order_qty;
+
+				// Recalculate all orders
+				let runningQtySum = 0;
+				let runningSum = 0;
+				let allTargetsValid = true;
+
+				for (let i = 0; i < oldOrders.length; i++) {
+
+					let currentOrder = oldOrders[i];
+
+					if (currentOrder.filled && currentOrder.manual) {
+
+						runningQtySum = parseFloat(currentOrder.qtySum);
+						runningSum = parseFloat(currentOrder.sum);
+					}
+					else {
+
+						// Adjust order again (skip if already done above)
+						if (i !== orderIndex) {
+
+							const adjusted = await getAdjustedOrder(
+								params.exchange,
+								config.pair,
+								currentOrder.price,
+								currentOrder.amount,
+								currentOrder.qty,
+								config.exchangeFee,
+								config.minMoveAmount
+							);
+
+							currentOrder.amount = adjusted.order_amount;
+							currentOrder.qty = adjusted.order_qty;
+						}
+
+						currentOrder.qtySum = parseFloat(runningQtySum) + parseFloat(currentOrder.qty);
+						currentOrder.sum = parseFloat(runningSum) + parseFloat(currentOrder.amount);
+
+						currentOrder.qtySum = await filterAmount(params.exchange, config.pair, currentOrder.qtySum);
+						currentOrder.sum = await filterPrice(params.exchange, config.pair, currentOrder.sum);
+
+						// Round final amount
+						currentOrder.sum = Math.round(currentOrder.sum * 100) / 100;
+
+						runningQtySum = parseFloat(currentOrder.qtySum);
+						runningSum = parseFloat(currentOrder.sum);
+
+						currentOrder.average = await filterPrice(
+							params.exchange,
+							config.pair,
+							(parseFloat(currentOrder.sum) / parseFloat(currentOrder.qtySum))
+						);
+
+						const targetPrice = await calculateTargetPrice({
+							'exchange': params.exchange,
+							'pair': config.pair,
+							'price': currentOrder.average,
+							'takeProfit': config.dcaTakeProfitPercent,
+							'exchangeFee': config.exchangeFee
+						});
+
+						if (targetPrice && targetPrice > 0) {
+
+							currentOrder.target = targetPrice;
+						}
+						else {
+
+							allTargetsValid = false;
+
+							msg = 'Unable to calculate target price: ' + JSON.stringify({
+								'price': currentOrder.average,
+								'takeProfit': config.dcaTakeProfitPercent,
+								'exchangeFee': config.exchangeFee
+							});
+						}
+					}
+				}
+
+				if (allTargetsValid) {
+
+					if (!params.dryRun) {
+
+						await updateDeal(deal.botId, params.dealId, {
+							config: deal.config,
+							orders: oldOrders
+						});
+					}
+
+					success = true;
+					ordersReturn = oldOrders;
+				}
+			}
+		}
+	}
+
+	return { 'success': success, 'data': msg, 'orders': ordersReturn };
 }
 
 
@@ -4819,40 +7584,33 @@ async function applyConfigData(data) {
 }
 
 
+// startDelay is a compatibility shim — all work delegated to requestDealStart.
+// External callers (DCABotManager, signals) pass { config, delay, notify }.
+// Returns the startId string directly so apiStartDealProcess polling still works.
 async function startDelay(dataObj) {
 
-	const data = JSON.parse(JSON.stringify(dataObj));
-
+	const data   = JSON.parse(JSON.stringify(dataObj));
 	const config = data['config'];
 	const notify = data['notify'];
+	const delay  = data['delay'] || 0;
 
-	// Check for any resuming deals before continuing
-	await processResumeDealTracker();
+	if (notify) {
 
-	const startId = await Common.uuidv4();
+		const msg = config.botName + ' (' + (config.pair || '').toUpperCase() + ') Start command received.';
+		Common.sendNotification({ 'message': msg, 'type': 'bot_start', 'telegram_id': shareData.appData.telegram_id });
+	}
 
-	startDealTracker[startId] = {};
-	startDealTracker[startId]['date'] = new Date();
+	const result = await requestDealStart(config, delay, 'api/signal');
 
-	// Start bot
-	setTimeout(() => {
-						if (notify) {
-
-							let msg = config.botName + ' (' + config.pair.toUpperCase() + ') Start command received.';
-
-							Common.sendNotification({ 'message': msg, 'type': 'bot_start', 'telegram_id': shareData.appData.telegram_id });
-						}
-
-						startVerify(config, startId);
-						//start({ 'create': true, 'config': config });
-
-					 }, (1000 * (data['delay'])));
-
-	return startId;
+	return result.startId;
 }
 
 
 async function initApp() {
+
+	// Initialise the serial deal-start queue — single path for all new deals
+	dealStartQueue = await shareData.Queue.create();
+
 
 	shareData.appData.starting_dca = true;
 
@@ -4885,13 +7643,12 @@ async function initApp() {
 	}, (60000 * 1));
 
 
-	/*
 	setInterval(() => {
 
 		getBalanceTracker();
 
 	}, (60000 * 1));
-	*/
+
 
 	setInterval(() => {
 
@@ -4901,9 +7658,11 @@ async function initApp() {
 
 	await resumeBots();
 
-	//getBalanceTracker();
+	// Prime the balance cache immediately so the portfolio bar
+	// shows correct data on first load rather than waiting 60s
+	getBalanceTracker();
 
-	startSignals();
+	Common.startSignals();
 
 	delete shareData.appData.starting_dca;
 }
@@ -4916,31 +7675,48 @@ module.exports = {
 	updateBot,
 	sendBotStatus,
 	ordersValid,
+	ordersToStructuredData,
 	updateOrders,
 	cancelDeal,
 	pauseDeal,
 	stopDeal,
+	createStartDealTracker,
+	deleteStartDealTracker,
 	updateDeal,
 	refreshUpdateDeal,
 	addFundsDeal,
+	recalculateOrders,
 	panicSellDeal,
 	connectExchange,
 	removeConfigData,
 	initBot,
 	getBots,
+	deleteBot,
+	deleteDeals,
 	getDeals,
+	getDealsMaxUsedFunds,
 	getDealInfo,
 	getDealTracker,
 	getStartDealTracker,
 	getResumeDealTracker,
+	getActiveDeals,
 	getSymbol,
 	getSymbolsAll,
+	getBalanceTracker,
+	getBalanceCache,
+	checkGlobalPairLimit,
+	canStartDeal,
 	applyConfigData,
 	startDelay,
+	requestDealStart,
 	resumeDeal,
+	getOHLCV,
 	getBalance,
 	getPairData,
+	calculateMaxFunds,
+	removeDbKeys,
 	convertDataToSandBox,
+	getExchangeAlias,
 
 	init: function(obj) {
 

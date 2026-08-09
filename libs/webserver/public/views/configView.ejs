@@ -3,7 +3,9 @@
 <script>
 
 	const token = '<%= token %>';
-	const telegram = '<%= appData['telegram_enabled'] %>';
+	const telegramEnabled = '<%= appData['telegram_enabled_config'] %>';
+	const signals3CQSEnabled = '<%= appData['signals_3cqs_enabled'] %>';
+	const configMode = '<%= appData['config_mode'] %>';
 	const pairButtons = <%- '[' + appData.bots['pair_buttons'].map(button => `'${button}'`).join(',') + ']'; %>;
 	const pairBlackList = <%- '[' + appData.bots['pair_blacklist'].map(pair => `'${pair}'`).join(',') + ']'; %>;
 
@@ -64,6 +66,186 @@
 		});
 	}
 
+	function getBackupScheduleCron() {
+
+		let success = true;
+		const checkedDays = [];
+
+		$('#backup_days input[type="checkbox"]:checked').each(function () {
+	
+			checkedDays.push($(this).val());
+		});
+
+		let time = $('#backup_time').val().trim(); // "HH:MM"
+		let dayOfMonth = $('#backup_day_month').val().trim(); // optional
+		const maxBackups = $('#backup_max').val().trim();
+		const password = $('#backup_password').val().trim();
+		const isEnabled = $('#toggleBackup').is(':checked');
+
+		let cronSchedule = '';
+		let localTime = '';
+		let utcTime = '';
+		let daysOfWeek = [];
+
+		if (isEnabled) {
+
+			if (!/^\d{1,2}:\d{2}$/.test(time)) {
+	
+				success = false;
+
+				alertBox("Backup time must be in HH:MM format");
+			}
+
+			if (password == undefined || password == null || password == '') {
+	
+				success = false;
+
+				alertBox("Backup password must be entered");
+			}
+
+			if (checkedDays.length == 0) {
+
+				success = false;
+
+				alertBox("Please select at least one day for backups");
+			}
+		}
+
+		// Convert local time string to UTC
+		const [localHour, localMinute] = time.split(':').map(Number);
+		const local = new Date();
+		local.setHours(localHour, localMinute, 0, 0);
+
+		// Get UTC values directly
+		const utcHour = local.getUTCHours();
+		const utcMinute = local.getUTCMinutes();
+
+		const cronMinute = utcMinute;
+		const cronHour = utcHour;
+		const cronDayOfMonth = dayOfMonth ? dayOfMonth : '*';
+		const cronMonth = '*';
+		const cronDayOfWeek = checkedDays.length ? checkedDays.join(',') : '*';
+
+		cronSchedule = `${cronMinute} ${cronHour} ${cronDayOfMonth} ${cronMonth} ${cronDayOfWeek}`;
+		localTime = `${String(localHour).padStart(2, '0')}:${String(localMinute).padStart(2, '0')}`;
+		utcTime = `${String(utcHour).padStart(2, '0')}:${String(utcMinute).padStart(2, '0')}`;
+		daysOfWeek = checkedDays;
+
+		return {
+			success,
+			cronSchedule,
+			localTime,
+			utcTime,
+			daysOfWeek,
+			maxBackups,
+			password,
+			enabled: isEnabled
+		}
+	}
+
+
+	function populateSettings(data) {
+
+		if (!data) return;
+
+		// Order settings
+		$('#exchange_buy_slippage').val(data.buySlippage);
+		$('#exchange_sell_slippage').val(data.sellSlippage);
+
+		const balCurrencies = Array.isArray(data.balanceCurrencies) ? data.balanceCurrencies : [];
+		$('#exchange_balance_currencies').select2({ tags: true, data: balCurrencies });
+		$('#exchange_balance_currencies').val(balCurrencies);
+		$('#exchange_balance_currencies').trigger('change');
+
+		// Context compression
+		$('#ctx_compression_threshold').val(data.ctxCompThreshold);
+		$('#ctx_compression_protect_n').val(data.ctxCompProtectN);
+		if (data.ctxCompEnabled && !$('#toggleCtxCompression').is(':checked')) $('#toggleCtxCompression').click();
+
+		$('#deal_context_router_model').val(data.dealCtxModel);
+		$('#deal_context_router_timeout_ms').val(data.dealCtxTimeout);
+		if (data.dealCtxEnabled && !$('#toggleDealContext').is(':checked')) $('#toggleDealContext').click();
+		if (data.dealCtxUseRouter && !$('#toggleDealContextRouter').is(':checked')) $('#toggleDealContextRouter').click();
+
+		// Circuit breaker
+		$('#cb_deal_ratio_threshold').val(data.cbDealRatio);
+		$('#cb_deal_ratio_window_secs').val(data.cbDealWindow);
+		$('#cb_price_drop_percent').val(data.cbPriceDrop);
+		$('#cb_price_drop_window_secs').val(data.cbPriceWindow);
+		if (data.cbPriceDropEnabled && !$('#togglePriceDrop').is(':checked')) $('#togglePriceDrop').click();
+		if (!data.cbPriceDropEnabled && $('#togglePriceDrop').is(':checked')) $('#togglePriceDrop').click();
+		$('#cb_pause_duration_secs').val(data.cbPauseDuration);
+		$('#cb_repeat_alert_window_secs').val(data.cbRepeatWindow);
+		$('#cb_price_zero_alert_count').val(data.cbPriceZeroAlert);
+		if (data.cbEnabled && !$('#toggleCircuitBreaker').is(':checked')) $('#toggleCircuitBreaker').click();
+	}
+
+
+	function populateBackupSchedule(data) {
+
+		if (!data || !data.cronSchedule) return;
+
+		const [minute, hour, dayOfMonth, , dayOfWeek] = data.cronSchedule.split(' ');
+
+		const utc = new Date();
+		utc.setUTCHours(Number(hour), Number(minute), 0, 0);
+
+		const localHour = String(utc.getHours()).padStart(2, '0');
+		const localMinute = String(utc.getMinutes()).padStart(2, '0');
+
+		$('#backup_time').val(`${localHour}:${localMinute}`);
+
+		// Set day of month
+		if (dayOfMonth !== '*') {
+
+			$('#backup_day_month').val(dayOfMonth);
+		}
+		else {
+
+			$('#backup_day_month').val('');
+		}
+
+		// Uncheck all days first
+		$('#backup_days input[type="checkbox"]').prop('checked', false);
+
+		// Set selected days
+		if (dayOfWeek !== '*') {
+
+			dayOfWeek.split(',').forEach(d => {
+
+				$(`#backup_days input[type="checkbox"][value="${d}"]`).prop('checked', true);
+			});
+		}
+
+		if (data.maxBackups !== undefined) $('#backup_max').val(data.maxBackups);
+
+		if (data.backupIncludeChats) {
+			if (!$('#toggleBackupIncludeChats').is(':checked')) $('#toggleBackupIncludeChats').click();
+		}
+
+		if (data.password !== undefined) $('#backup_password').val(data.password);
+		if (data.sftpPassword !== undefined) $('#sftp_password').val(data.sftpPassword);
+		if (data.sftpPassphrase !== undefined) $('#sftp_passphrase').val(data.sftpPassphrase);
+
+		if (data.sftpEnabled !== undefined) {
+
+			if (data.sftpEnabled) {
+
+				$('#toggleSftp').click();
+			}
+
+		}
+
+		if (data.enabled !== undefined) {
+
+			if (data.enabled) {
+
+				$('#toggleBackup').click();
+			}
+
+		}
+	}
+
 
 	function submitForm() {
 
@@ -84,12 +266,87 @@
 			return;
 		}
 
+		let cronData = getBackupScheduleCron();
+
+		if (!cronData.success) {
+
+			return;
+		}
+
 		$('#spinner-overlay').fadeIn(100);
+
+		let formData = $(form).serializeArray();
+
+		// Remove existing backup_enabled
+		formData = formData.filter(item => item.name !== 'backup_enabled');
+
+		// Private key submit logic:
+		// - If the clear flag is set, keep sftp_private_key_clear=1 in the payload
+		//   and drop the textarea value so the server removes the stored key.
+		// - If the textarea is blank with no clear flag, drop the field entirely
+		//   so the server preserves the existing encrypted key.
+		// - If the textarea has content, reset the clear flag to 0 so a new key
+		//   being pasted doesn't get accidentally cleared by a stale flag.
+		if ($('#sftp_private_key_clear').val() === '1') {
+
+			formData = formData.filter(item => item.name !== 'sftp_private_key');
+		}
+		else if (!$('#sftp_private_key').val().trim()) {
+
+			formData = formData.filter(item => item.name !== 'sftp_private_key');
+			formData = formData.filter(item => item.name !== 'sftp_private_key_clear');
+		}
+		else {
+
+			// New key being submitted — ensure clear flag is 0
+			formData = formData.filter(item => item.name !== 'sftp_private_key_clear');
+		}
+
+		formData.push({ name: 'cron_backup_schedule', value: cronData.cronSchedule });
+		formData.push({ name: 'cron_backup_days', value: cronData.daysOfWeek.join(',') });
+		formData.push({ name: 'cron_backup_local_time', value: cronData.localTime });
+		formData.push({ name: 'cron_backup_utc_time', value: cronData.utcTime });
+		formData.push({ name: 'cron_backup_max', value: cronData.maxBackups });
+		formData.push({ name: 'cron_backup_password', value: cronData.password });
+		formData.push({ name: 'cron_backup_enabled', value: cronData.enabled });
+		formData.push({ name: 'cron_backup_include_chats', value: $('#toggleBackupIncludeChats').prop('checked') });
+
+		// Remove any CB fields serialized by serializeArray to avoid duplicates
+		// exchange_buy_slippage, exchange_sell_slippage, exchange_balance_currencies
+		// are saved via botConfigSave (./api/bot-config), not the main config route
+
+		const ctxFields = ['ctx_compression_enabled','ctx_compression_threshold','ctx_compression_protect_n'];
+		formData = formData.filter(item => !ctxFields.includes(item.name));
+		formData.push({ name: 'ctx_compression_enabled',   value: String($('#toggleCtxCompression').prop('checked')) });
+		formData.push({ name: 'ctx_compression_threshold', value: $('#ctx_compression_threshold').val() });
+		formData.push({ name: 'ctx_compression_protect_n', value: $('#ctx_compression_protect_n').val() });
+
+		const dealCtxFields = ['deal_context_enabled','deal_context_use_router','deal_context_router_model','deal_context_router_timeout_ms'];
+		formData = formData.filter(item => !dealCtxFields.includes(item.name));
+		formData.push({ name: 'deal_context_enabled',           value: String($('#toggleDealContext').prop('checked')) });
+		formData.push({ name: 'deal_context_use_router',        value: String($('#toggleDealContextRouter').prop('checked')) });
+		formData.push({ name: 'deal_context_router_model',      value: $('#deal_context_router_model').val() });
+		formData.push({ name: 'deal_context_router_timeout_ms', value: $('#deal_context_router_timeout_ms').val() });
+
+		const cbFields = ['cb_enabled','cb_deal_ratio_threshold','cb_deal_ratio_window_secs',
+		                  'cb_price_drop_percent','cb_price_drop_window_secs','cb_price_drop_enabled',
+		                  'cb_pause_duration_secs','cb_repeat_alert_window_secs','cb_price_zero_alert_count'];
+		formData = formData.filter(item => !cbFields.includes(item.name));
+
+		formData.push({ name: 'cb_enabled',                  value: String($('#toggleCircuitBreaker').prop('checked')) });
+		formData.push({ name: 'cb_deal_ratio_threshold',     value: $('#cb_deal_ratio_threshold').val() });
+		formData.push({ name: 'cb_deal_ratio_window_secs',   value: $('#cb_deal_ratio_window_secs').val() });
+		formData.push({ name: 'cb_price_drop_percent',       value: $('#cb_price_drop_percent').val() });
+		formData.push({ name: 'cb_price_drop_window_secs',   value: $('#cb_price_drop_window_secs').val() });
+		formData.push({ name: 'cb_price_drop_enabled',        value: String($('#togglePriceDrop').prop('checked')) });
+		formData.push({ name: 'cb_pause_duration_secs',      value: $('#cb_pause_duration_secs').val() });
+		formData.push({ name: 'cb_repeat_alert_window_secs', value: $('#cb_repeat_alert_window_secs').val() });
+		formData.push({ name: 'cb_price_zero_alert_count',   value: $('#cb_price_zero_alert_count').val() });
 
 		$.ajax({
 					type: 'POST',
 					url: submitUrl,
-					data: $(form).serialize(),
+					data: $.param(formData),
 					dataType: 'json',
 					success: function(data) {
 
@@ -120,6 +377,463 @@
 	$(document).ready(function() {
 
 		$('[id*="toggle"]').simpleSwitch();
+		$('#msgBox').empty();
+
+		$('#backup_time').timepicker({
+			timeFormat: 'HH:mm',
+			stepHour: 1,
+			stepMinute: 5,
+			controlType: 'select',
+			oneLine: true,
+			dropdown: true,
+			scrollbar: true
+		});
+  
+		$('#showPassword').on('click', function () {
+
+			const input = $('#backup_password');
+			const type = input.attr('type') === 'password' ? 'text' : 'password';
+			
+			input.attr('type', type);
+			$(this).text(type === 'password' ? 'Show' : 'Hide');
+		});
+
+		function setBotCredStatus(field, isSet) {
+
+			const $status = $('#bot_' + field + '_status');
+
+			if (isSet) {
+
+				$status.html('&#10003; Set &nbsp;<span class="bot-cred-clear" data-field="' + field + '" style="cursor: pointer; color: var(--link-color); font-size: 12px;">[Clear]</span>');
+				$status.css('color', 'var(--green-color, #2ecc71)').show();
+			}
+			else {
+
+				$status.hide();
+				$('#bot_' + field + '_clear').val('0');
+			}
+		}
+
+		$(document).on('click', '.bot-cred-clear', function() {
+
+			const field = $(this).data('field');
+
+			$('#bot_' + field).val('');
+			$('#bot_' + field + '_clear').val('1');
+			$('#bot_' + field + '_status').html('Will be cleared on save').css('color', 'var(--warning-color, #e67e22)');
+		});
+
+		// Load exchanges dropdown, then load bot config and select current exchange
+		$.ajax({
+			type: 'GET',
+			url: './api/exchanges',
+			dataType: 'json',
+			success: function(exData) {
+
+				const $sel = $('#bot_exchange');
+				$sel.empty().append($('<option>', { value: '', text: '-- Select Exchange --' }));
+
+				if (exData.success) {
+
+					exData.data.forEach(function(ex) {
+
+						$sel.append($('<option>', { value: ex, text: ex }));
+					});
+				}
+
+				$.ajax({
+					type: 'GET',
+					url: './api/bot-config',
+					dataType: 'json',
+					success: function(data) {
+
+						if (data.success) {
+
+							const cfg = data.data;
+
+							$('#bot_exchange').val(cfg.exchange || '');
+							$('#bot_exchange').data('original', cfg.exchange || '');
+							$('#bot_exchangeFee').val(cfg.exchangeFee || '');
+							$('#bot_sandBoxWallet').val(cfg.sandBoxWallet || '');
+
+							// Show set status with clear link for each credential field
+							['apiKey', 'apiSecret', 'apiPassphrase', 'apiPassword'].forEach(function(field) {
+
+								if (cfg[field]) {
+
+									setBotCredStatus(field, true);
+								}
+							});
+
+							updateSandboxUI(cfg.sandBox);
+						}
+					}
+				});
+			}
+		});
+
+		function updateSandboxUI(isSandbox) {
+
+			if (isSandbox) {
+
+				$('#sandboxModeLabel').html('<span style="color: #e67e22; font-weight: 600;">&#9888; Sandbox Mode (Paper Trading)</span>');
+				$('#sandboxModeToggle').text('Switch to Live Trading');
+				$('#sandboxModeDesc').text('No real trades will be placed. Safe for testing.');
+			}
+			else {
+
+				$('#sandboxModeLabel').html('<span style="color: #2ecc71; font-weight: 600;">&#9654; Live Trading</span>');
+				$('#sandboxModeToggle').text('Switch to Sandbox Mode');
+				$('#sandboxModeDesc').text('Real trades are active on this exchange.');
+			}
+
+			$('#sandboxModeToggle').data('current', isSandbox);
+		}
+
+		$('#sandboxModeToggle').on('click', function() {
+
+			const currentlySandbox = $(this).data('current') === true;
+			const goingToSandbox = !currentlySandbox;
+			const goingTo = goingToSandbox ? 'SANDBOX MODE' : 'LIVE TRADING';
+			const warning = goingToSandbox
+				? '<b>WARNING:</b> You are switching to <b>SANDBOX MODE</b>. No real trades will be placed. Existing active deals are not affected.'
+				: '<b>WARNING:</b> You are switching to <b>LIVE TRADING</b>. Real orders will be placed on the exchange. Ensure your credentials and settings are correct before proceeding.';
+
+			$.confirm({
+				title: false,
+				boxWidth: '50%',
+				useBootstrap: false,
+				content: '<div style="font-size: 1.2rem; text-align: left;">' + warning + '</div>',
+				buttons: {
+					confirm: {
+						btnClass: 'btn-default',
+						text: '<div style="color: #c62828;">Switch to ' + goingTo + '</div>',
+						action: function() {
+
+							const newSandbox = goingToSandbox;
+
+							$.confirm({
+								title: false,
+								boxWidth: '40%',
+								useBootstrap: false,
+								content: '<div style="font-size: 1.2rem;">Enter your current password to confirm:</div><br><input type="password" id="sandboxConfirmPassword" class="form-field" style="width: 250px;" placeholder="Password">',
+								buttons: {
+									confirm: {
+										btnClass: 'btn-default',
+										text: '<div style="color: #c62828;">Confirm</div>',
+										action: function() {
+
+											const pw = $('#sandboxConfirmPassword').val();
+
+											if (!pw) {
+
+												alertBox('Please enter your password');
+												return false;
+											}
+
+											$('#spinner-overlay').fadeIn(100);
+
+											$.ajax({
+												type: 'POST',
+												url: './api/bot-config/sandbox',
+												data: { password: pw, sandBox: newSandbox },
+												dataType: 'json',
+												success: function(data) {
+
+													$('#spinner-overlay').fadeOut(100);
+
+													if (data.success) {
+
+														updateSandboxUI(newSandbox);
+														alertBox(data.data);
+													}
+													else {
+
+														alertBox(data.data);
+													}
+												},
+												error: function() {
+
+													$('#spinner-overlay').fadeOut(100);
+													alertBox('Error updating trading mode');
+												}
+											});
+										}
+									},
+									cancel: {
+										btnClass: 'btn-default',
+										text: '<div style="color: #000;">Cancel</div>',
+										action: function() {}
+									}
+								}
+							});
+						}
+					},
+					cancel: {
+						btnClass: 'btn-default',
+						text: '<div style="color: #000;">Cancel</div>',
+						action: function() {}
+					}
+				}
+			});
+		});
+
+		$('#botConfigSave').on('click', function() {
+
+			const originalExchange = $('#bot_exchange').data('original') || '';
+			const selectedExchange = $('#bot_exchange').val().trim();
+			const exchangeChanged = selectedExchange && selectedExchange !== originalExchange;
+
+			const updateBotsHtml = exchangeChanged
+				? '<div style="font-size: 1.2rem; margin-top: 14px; padding: 8px; background: rgba(255,160,0,0.15); border-left: 3px solid #ffa000; border-radius: 2px;">'
+					+ '<b>&#9888; Exchange settings are saved to ' + ('<%= appData.bot_config %>'.split('/').pop().split('\\\\').pop()) + ' only.</b> Existing bots retain their original exchange. '
+					+ 'Bots with no active deals can be updated below. <b>Bots with active deals will be skipped.</b>'
+					+ '</div>'
+					+ '<br><div style="font-size: 1.2rem; margin-top: 6px;"><input type="checkbox" id="updateBotsExchange" class="form-field" style="width:20px;" /> <b>Update existing bots (no active deals) to use the new exchange</b></div>'
+				: '';
+
+			$.confirm({
+				title: false,
+				boxWidth: '40%',
+				useBootstrap: false,
+				content: '<div style="font-size: 1.2rem;">Enter your current password to save exchange settings:</div>' +
+					'<br><input type="password" id="botConfigPassword" class="form-field" style="width: 250px;" placeholder="Password">' +
+					updateBotsHtml,
+				buttons: {
+					confirm: {
+						btnClass: 'btn-default',
+						text: '<div style="color: #4aa602;">Save</div>',
+						action: function() {
+
+							const pw = $('#botConfigPassword').val();
+
+							if (!pw) {
+
+								alertBox('Please enter your password');
+								return false;
+							}
+
+							const payload = {
+								password:        pw,
+								exchange:        $('#bot_exchange').val().trim(),
+								apiKey:              $('#bot_apiKey').val().trim(),
+								apiKey_clear:        $('#bot_apiKey_clear').val(),
+								apiSecret:           $('#bot_apiSecret').val().trim(),
+								apiSecret_clear:     $('#bot_apiSecret_clear').val(),
+								apiPassphrase:       $('#bot_apiPassphrase').val().trim(),
+								apiPassphrase_clear: $('#bot_apiPassphrase_clear').val(),
+								apiPassword:         $('#bot_apiPassword').val().trim(),
+								apiPassword_clear:   $('#bot_apiPassword_clear').val(),
+								exchangeFee:         $('#bot_exchangeFee').val().trim(),
+								sandBoxWallet:       $('#bot_sandBoxWallet').val().trim(),
+								exchange_buy_slippage:        $('#exchange_buy_slippage').val(),
+								exchange_sell_slippage:       $('#exchange_sell_slippage').val(),
+								exchange_balance_currencies:  $('#exchange_balance_currencies').val() || [],
+							};
+
+							$('#spinner-overlay').fadeIn(100);
+
+							$.ajax({
+								type: 'POST',
+								url: './api/bot-config',
+								data: payload,
+								dataType: 'json',
+								success: function(data) {
+
+									$('#spinner-overlay').fadeOut(100);
+									alertBox(data.data);
+
+									if (data.success) {
+
+										// If checkbox checked, propagate new exchange to bots with no active deals
+										if ($('#updateBotsExchange').prop('checked')) {
+
+											const newExchange = $('#bot_exchange').val().trim();
+
+											$.ajax({
+												type: 'POST',
+												url: './api/bots/update-exchange',
+												data: { exchange: newExchange },
+												dataType: 'json',
+												success: function(upd) {
+
+													let msg = 'Exchange settings saved.';
+													if (upd.updated > 0) msg += ' ' + upd.updated + ' bot(s) updated to ' + newExchange.toUpperCase() + '.';
+													if (upd.skipped > 0) msg += ' ' + upd.skipped + ' bot(s) skipped (active deals).';
+													alertBox(msg);
+												},
+												error: function() { alertBox('Exchange settings saved. Bot update request failed.'); }
+											});
+										}
+
+										// Clear input fields and reset clear flags, then re-fetch to get fresh status
+										['apiKey', 'apiSecret', 'apiPassphrase', 'apiPassword'].forEach(function(field) {
+
+											$('#bot_' + field).val('');
+											$('#bot_' + field + '_clear').val('0');
+											$('#bot_' + field + '_status').hide();
+										});
+
+										$.ajax({
+											type: 'GET',
+											url: './api/bot-config',
+											dataType: 'json',
+											success: function(refreshed) {
+
+												if (refreshed.success) {
+
+													['apiKey', 'apiSecret', 'apiPassphrase', 'apiPassword'].forEach(function(field) {
+
+														if (refreshed.data[field]) setBotCredStatus(field, true);
+													});
+												}
+											}
+										});
+									}
+								},
+								error: function() {
+
+									$('#spinner-overlay').fadeOut(100);
+									alertBox('Error saving exchange settings');
+								}
+							});
+						}
+					},
+					cancel: {
+						btnClass: 'btn-default',
+						text: '<div style="color: #000;">Cancel</div>',
+						action: function() {}
+					}
+				}
+			});
+		});
+
+		$('#showSftpPassword').on('click', function () {
+
+			const input = $('#sftp_password');
+			const type = input.attr('type') === 'password' ? 'text' : 'password';
+			
+			input.attr('type', type);
+			$(this).text(type === 'password' ? 'Show' : 'Hide');
+		});
+
+		$('#sftp_clear_key').on('click', function () {
+
+			// Mark the key for deletion on save — does not take effect until form is submitted
+			$('#sftp_private_key_clear').val('1');
+			$('#sftp_private_key').val('');
+			$('#sftp_private_key_status').html('Key will be cleared on save').css('color', 'var(--warning-color, #e67e22)');
+		});
+
+		$('#showSftpPassphrase').on('click', function () {
+
+			const input = $('#sftp_passphrase');
+			const type = input.attr('type') === 'password' ? 'text' : 'password';
+			
+			input.attr('type', type);
+			$(this).text(type === 'password' ? 'Show' : 'Hide');
+		});
+
+		const cronObj =	{
+			"cronSchedule": "<%= services['cron_backup']['schedule'] %>",
+			"maxBackups": "<%= services['cron_backup']['max'] %>",
+			"password": "<%= services['cron_backup']['password'] %>",
+			"enabled": convertBoolean("<%= services['cron_backup']['enabled'] %>"),
+			"sftpPassword": "<%= services['cron_backup']['sftp']['password'] %>",
+			"sftpPassphrase": "<%= services['cron_backup']['sftp']['passphrase'] %>",
+			"sftpEnabled": convertBoolean("<%= services['cron_backup']['sftp']['enabled'] %>"),
+			"backupIncludeChats": convertBoolean("<%= (services['cron_backup']['include_chats'] !== false) ? 'true' : 'false' %>"),
+			"buySlippage":         "<%= appData.bots && appData.bots.exchange && appData.bots.exchange.default && appData.bots.exchange.default.orders ? appData.bots.exchange.default.orders.buy.slippage_percent : 0 %>",
+			"sellSlippage":        "<%= appData.bots && appData.bots.exchange && appData.bots.exchange.default && appData.bots.exchange.default.orders ? appData.bots.exchange.default.orders.sell.slippage_percent : 0 %>",
+			"balanceCurrencies":   <%- JSON.stringify(appData.bots && appData.bots.exchange && appData.bots.exchange.default ? (appData.bots.exchange.default.account_balance_currencies || []) : []) %>,
+			"ctxCompEnabled":    convertBoolean("<%= services['ai'] && services['ai']['context_compression'] && services['ai']['context_compression']['enabled'] !== false ? 'true' : 'false' %>"),
+			"ctxCompThreshold": "<%= services['ai'] && services['ai']['context_compression'] ? services['ai']['context_compression']['threshold_chars'] : 80000 %>",
+			"ctxCompProtectN":  "<%= services['ai'] && services['ai']['context_compression'] ? services['ai']['context_compression']['protect_last_n'] : 10 %>",
+			"dealCtxEnabled":   convertBoolean("<%= services['ai'] && services['ai']['deal_context'] && services['ai']['deal_context']['enabled'] ? 'true' : 'false' %>"),
+			"dealCtxUseRouter": convertBoolean("<%= !services['ai'] || !services['ai']['deal_context'] || services['ai']['deal_context']['use_router'] !== false ? 'true' : 'false' %>"),
+			"dealCtxModel":     "<%= services['ai'] && services['ai']['deal_context'] ? (services['ai']['deal_context']['router_model'] || '') : '' %>",
+			"dealCtxTimeout":   "<%= services['ai'] && services['ai']['deal_context'] ? (services['ai']['deal_context']['router_timeout_ms'] || 12000) : 12000 %>",
+			"cbEnabled":          convertBoolean("<%= services['circuit_breaker'] && services['circuit_breaker']['enabled'] ? 'true' : 'false' %>"),
+			"cbDealRatio":        "<%= services['circuit_breaker'] ? services['circuit_breaker']['deal_ratio_threshold'] : 0.5 %>",
+			"cbDealWindow":       "<%= services['circuit_breaker'] ? services['circuit_breaker']['deal_ratio_window_secs'] : 30 %>",
+			"cbPriceDrop":        "<%= services['circuit_breaker'] ? services['circuit_breaker']['price_drop_percent'] : 5.0 %>",
+			"cbPriceWindow":      "<%= services['circuit_breaker'] ? services['circuit_breaker']['price_drop_window_secs'] : 60 %>",
+			"cbPriceDropEnabled": convertBoolean("<%= services['circuit_breaker'] && services['circuit_breaker']['price_drop_enabled'] !== false ? 'true' : 'false' %>"),
+			"cbPauseDuration":    "<%= services['circuit_breaker'] ? services['circuit_breaker']['pause_duration_secs'] : 60 %>",
+			"cbRepeatWindow":     "<%= services['circuit_breaker'] ? services['circuit_breaker']['repeat_alert_window_secs'] : 3600 %>",
+			"cbPriceZeroAlert":   "<%= services['circuit_breaker'] ? services['circuit_breaker']['price_zero_alert_count'] : 4 %>",
+		};
+
+		if (cronObj.password != undefined && cronObj.password != null && cronObj.password != '') {
+
+			cronObj.password = window.atob(cronObj.password);
+		}
+
+		if (cronObj.sftpPassword != undefined && cronObj.sftpPassword != null && cronObj.sftpPassword != '') {
+
+			cronObj.sftpPassword = window.atob(cronObj.sftpPassword);
+		}
+
+		if (cronObj.sftpPassphrase != undefined && cronObj.sftpPassphrase != null && cronObj.sftpPassphrase != '') {
+
+			cronObj.sftpPassphrase = window.atob(cronObj.sftpPassphrase);
+		}
+
+		populateSettings(cronObj);
+		populateBackupSchedule(cronObj);
+
+		$(document).on('keypress', '#botsCreate input', function(e) {
+
+			const id = $(this).attr('id');
+			const val = $('#' + id).val();
+
+			const charCode = (e.which) ? e.which : e.keyCode;
+			const charStr = String.fromCharCode(charCode);
+
+			if (id == undefined || id == null) {
+
+				return;
+			}
+
+			if (id.startsWith('backup_') && id.toLowerCase() != 'backup_password' && id.toLowerCase() != 'backup_include_chats' && id.toLowerCase() != 'cb_enabled' && id.toLowerCase() != 'ctx_compression_enabled') {
+
+				let regEx = /[^0-9]/g;
+
+				if (id.toLowerCase() == 'backup_time') {
+
+					regEx = /[^0-9\:]/g;
+				}
+
+				if (charCode == 58 && (val.split(':').length - 1) > 0) {
+
+					return false;
+				}
+
+				if (String.fromCharCode(charCode).match(regEx)) { return false; }
+			}
+		});
+
+
+		if (convertBoolean(configMode)) {
+
+			$('#configMongoDb').toggle();
+
+			let msgBox = '';
+
+			msgBox += '<div style="display: block;"><%= appData['name'] %> is currently in configuration mode</div>';
+
+			$('#msgBox').css({
+				'padding': '10px',
+				'margin-bottom': '30px',
+				'border-radius': '5px',
+				'background-color': 'yellow',
+				'color': '#000000',
+				'border': '1px solid rgba(0, 0, 0, 0.2)',
+				'box-shadow': '0 0 10px rgba(0, 0, 0, 0.1)'
+			});
+
+			$('#msgBox').html('<div style="display: block; font-weight: bold;">' + msgBox + '</div>');
+		}
 
 		$('#pairbuttons').select2({ tags: true, data: pairButtons });
 		$('#pairbuttons').val(pairButtons);
@@ -129,10 +843,17 @@
 		$('#pairblacklist').val(pairBlackList);
 		$('#pairblacklist').trigger('change');
 
-		if (convertBoolean(telegram)) {
+		if (convertBoolean(signals3CQSEnabled)) {
+
+			$('#toggleSignals3CQS').click();
+		}
+
+		if (convertBoolean(telegramEnabled)) {
 
 			$('#toggleTelegram').click();
 		}
+
+
 
 		$('#configChangePass').on('click', function(e) {
 
@@ -188,29 +909,40 @@
 			<b id="headerText" class="contentHeader">Configuration</b>
 		</div>
 
-		<form autocomplete="off" action="/config" method="POST" id="formConfig">
+		<span id="msgBox" style="position: relative; display: flex; justify-content: center;"></span>
+
+		<form autocomplete="off" action="./config" method="POST" id="formConfig">
 
 			<div style="padding-bottom: 5px;">
-				<label for="password">Current Password
+				<label for="password"><b>Current Password</b>
 					<span class="toolTip">?<span class="toolTipText">
 						This is the password used to login to the <%- appData.name %> web interface.
 					</span></span>
 				</label>
-				<input type="password" name="password" id="password" class="form-field" style="width: 250px;" required> <span id="configChangePass" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Change</span>
+				<input type="password" autocomplete="off" name="password" id="password" class="form-field" style="width: 250px;" required> <span id="configChangePass" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Change</span>
 			</div>
 
 			<div style="padding-bottom: 5px; display: none;" id="configNewPass">
-				<label for="passwordnew">New Password</label>
-				<input type="password" name="passwordnew" id="passwordnew" class="form-field" style="width: 250px;">
+				<label for="passwordnew"><b>New Password</b></label>
+				<input type="password" autocomplete="off" name="passwordnew" id="passwordnew" class="form-field" style="width: 250px;">
 			</div>
 
 			<div style="padding-bottom: 5px; display: none;" id="configConfirmPass">
-				<label for="passwordnew2">New Password Again</label>
-				<input type="password" name="passwordnew2" id="passwordnew2" class="form-field" style="width: 250px;">
+				<label for="passwordnew2"><b>New Password Again</b></label>
+				<input type="password" autocomplete="off" name="passwordnew2" id="passwordnew2" class="form-field" style="width: 250px;">
+			</div>
+
+			<div style="padding-bottom: 5px; display: none;" id="configMongoDb">
+				<label for="mongodburl"><b>Mongo DB URL</b>
+					<span class="toolTip">?<span class="toolTipText">
+						This is the Mongo Database URL used for <%- appData.name %> data storage.
+					</span></span>
+				</label>
+				<input name="mongodburl" id="mongodburl" value="<%- appData.mongo_db_url %>" class="form-field" style="width: 250px;" required>
 			</div>
 
 			<div style="padding-bottom: 5px;">
-				<label for="apikey">API Key <span style="font-size: 0.99rem;"><i>(Not displayed for security)</i></span>
+				<label for="apikey"><b>API Key</b> <span style="font-size: 0.99rem;"><i>(Not displayed for security)</i></span>
 					<span class="toolTip">?<span class="toolTipText">
 						This is the key used for <%- appData.name %> API access
 					</span></span>
@@ -219,7 +951,7 @@
 			</div>
 
 			<div style="padding-bottom: 5px;">
-				<label for="apitoken">Webhook API Token
+				<label for="apitoken"><b>Webhook API Token</b>
 					<span class="toolTip">?<span class="toolTipText">
 						This is the token used for <%- appData.name %> webhook access
 					</span></span>
@@ -228,8 +960,10 @@
 				<span id="apitoken" style="display: none; overflow-wrap: break-word;"></span>
 			</div>
 
-			<div style="padding-top: 10px; padding-bottom: 5px;">
-				<label for="pairbuttons">Pair Buttons
+			<div class="divHr"></div>
+
+			<div>
+				<label for="pairbuttons"><b>Pair Buttons</b>
 					<span class="toolTip">?<span class="toolTipText">
 						These are buttons used to automatically fill in all pairs after clicking on one when creating or updating bots.
 					</span></span>
@@ -239,7 +973,7 @@
 			</div>
 
 			<div style="padding-top: 10px; padding-bottom: 5px;">
-				<label for="pairblacklist">Pair Blacklist
+				<label for="pairblacklist"><b>Pair Blacklist</b>
 					<span class="toolTip">?<span class="toolTipText">
 						These are pairs that you do not want to trade. You can use full pairs such as BTC/USD or wildcards such as BTC/*.
 					</span></span>
@@ -247,11 +981,846 @@
 				<select id="pairblacklist" name="pairblacklist" class="form-select-pair" style="width: 200px;" multiple="multiple"></select>
 			</div>
 
+			<div class="divHr"></div>
+
 			<div style="padding-top: 10px; padding-bottom: 5px;">
-				<input id="toggleTelegram" name="telegram" type=checkbox> Telegram Notifications
+
+				<b>3CQS Signals</b>
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+				
+				<tr>
+					<td>
+						<label for="password">API Key:
+							<span class="toolTip">?<span class="toolTipText">
+								This is your API key for accessing and using 3CQS signals. Please note that you may encounter repeated error messages if the key is invalid or if too many connection attempts are made.
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+					<input type="password" autocomplete="off" name="signals_3cqs_api_key" id="signals_3cqs_api_key" class="form-field" style="width: 250px; margin-bottom: 5px;" value="<%= services['signals']['3CQS']['api_key'] %>">
+					<br>
+					Register at <a href="https:///www.3cqs.com" target=_blank>3CQS.com</a> to get your API key
+					</td>
+				</tr>
+
+				<tr>
+					<td>Enabled:</td>
+
+					<td>
+						<input id="toggleSignals3CQS" name="signals_3cqs_enabled" type=checkbox>
+					</td>
+				</tr>
+
+				</table>
 			</div>
 
-			<button style="margin-top: 20px" type="button" id="checkUpdates" class="btn" style="cursor: pointer;">
+			<div class="divHr"></div>
+
+			<div style="padding-top: 10px; padding-bottom: 5px;">
+
+				<b>Telegram Settings</b>
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+				
+				<tr>
+					<td>
+						<label for="password">Token ID:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the token ID created using Telegram's Bot Father
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+					<input type="password" autocomplete="off" name="telegram_token_id" id="telegram_token_id" class="form-field" style="width: 250px;" value="<%= services['telegram']['token_id'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="password">User ID:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the Telegram user ID notifications will be sent to
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+					<input name="telegram_user_id" id="telegram_user_id" class="form-field" style="width: 250px;" value="<%= services['telegram']['notify_user_id'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>Enabled:</td>
+
+					<td>
+						<input id="toggleTelegram" name="telegram_enabled" type=checkbox>
+					</td>
+				</tr>
+
+				</table>
+			</div>
+
+			<div class="divHr"></div>
+
+			<div style="padding-top: 10px; padding-bottom: 5px;">
+
+				<b>Artificial Intelligence (AI)</b>
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+
+				<tr>
+					<td>
+						<label for="ai_provider">Active Provider:
+							<span class="toolTip">?<span class="toolTipText">
+								Select which AI provider to use. Only one provider can be active at a time. Select None to disable AI.
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<select name="ai_provider" id="ai_provider" class="form-field" style="width: 256px;">
+							<option value="none"<%= services['ai']['provider'] === 'none' || (!services['ai']['ollama']['enabled'] && !services['ai']['openai']['enabled']) ? ' selected' : '' %>>None</option>
+							<option value="ollama"<%= services['ai']['ollama']['enabled'] ? ' selected' : '' %>>Ollama</option>
+							<option value="openai"<%= services['ai']['openai']['enabled'] ? ' selected' : '' %>>OpenAI</option>
+						</select>
+					</td>
+				</tr>
+
+				<tr><td colspan=2 style="padding-top: 6px; padding-bottom: 2px;"><b>Ollama</b> &mdash; <small><a href="https://ollama.com/" target=_blank>ollama.com</a> &mdash; local or cloud hosted</small></td></tr>
+
+				<tr>
+					<td>
+						<label for="ollama_host">Host:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the host URL to the server running Ollama
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="ollama_host" id="ollama_host" class="form-field" style="width: 250px;" value="<%= services['ai']['ollama']['host'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="ollama_api_key">API Key:
+							<span class="toolTip">?<span class="toolTipText">
+								Your API key when using Ollama cloud services
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="password" autocomplete="off" name="ollama_api_key" id="ollama_api_key" class="form-field" style="width: 250px;" value="<%= services['ai']['ollama']['api_key'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="ollama_model">Model:
+							<span class="toolTip">?<span class="toolTipText">
+								The Large Language Model (LLM) to use, e.g. llama3.2
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="ollama_model" id="ollama_model" class="form-field" style="width: 250px;" value="<%= services['ai']['ollama']['model'] %>">
+					</td>
+				</tr>
+
+				<tr><td colspan=2 style="padding-top: 6px; padding-bottom: 2px;"><b>OpenAI</b> &mdash; <small><a href="https://platform.openai.com/" target=_blank>platform.openai.com</a> &mdash; compatible with any OpenAI-compatible API</small></td></tr>
+
+				<tr>
+					<td>
+						<label for="openai_api_key">API Key:
+							<span class="toolTip">?<span class="toolTipText">
+								Your OpenAI API key, or the key for any OpenAI-compatible provider
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="password" autocomplete="off" name="openai_api_key" id="openai_api_key" class="form-field" style="width: 250px;" value="<%= services['ai']['openai']['api_key'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="openai_model">Model:
+							<span class="toolTip">?<span class="toolTipText">
+								The model to use, e.g. gpt-4o or gpt-4o-mini
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="openai_model" id="openai_model" class="form-field" style="width: 250px;" value="<%= services['ai']['openai']['model'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="openai_base_url">Base URL:
+							<span class="toolTip">?<span class="toolTipText">
+								Optional. Override the base URL for OpenAI-compatible providers. Leave blank to use the default OpenAI endpoint.
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="openai_base_url" id="openai_base_url" class="form-field" style="width: 250px;" value="<%= services['ai']['openai']['base_url'] %>">
+					</td>
+				</tr>
+
+				<tr><td colspan="2" style="padding-top: 8px; padding-bottom: 2px; font-size: 0.9rem; opacity: 0.6;">Context Compression</td></tr>
+
+				<tr>
+					<td>
+						<label for="ctx_compression_threshold">Threshold (chars):
+							<span class="toolTip">?<span class="toolTipText">
+								Compress conversation history when total characters exceed this value. ~4 chars per token — 80000 ≈ 20K tokens
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="number" id="ctx_compression_threshold" name="ctx_compression_threshold" class="form-field" min="10000" max="500000" step="10000" style="width:100px;">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="ctx_compression_protect_n">Protect Last N:
+							<span class="toolTip">?<span class="toolTipText">
+								Number of most recent messages to always preserve verbatim when compressing
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="number" id="ctx_compression_protect_n" name="ctx_compression_protect_n" class="form-field" min="2" max="50" style="width:80px;">
+					</td>
+				</tr>
+
+				<tr>
+					<td>Enabled:</td>
+
+					<td>
+						<input type="checkbox" id="toggleCtxCompression" name="ctx_compression_enabled" class="form-field">
+					</td>
+				</tr>
+
+				</table>
+
+				<b style="display: block; padding-top: 12px;">AI Deal Context</b>
+				<small style="display: block; padding-bottom: 4px;">Lets the AI chat look up your deal records and read matching lines from SymBot's own log files when you ask about a deal. Read-only: it can describe deals, never change them. Deal analysis is unaffected.</small>
+
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+
+				<tr>
+					<td>
+						<label for="deal_context_router_model">Router Model:
+							<span class="toolTip">?<span class="toolTipText">
+								Optional. Model used only for the short routing step that decides which deal or logs a question needs. Leave blank to use the default chat model.
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="text" id="deal_context_router_model" name="deal_context_router_model" class="form-field" placeholder="(default chat model)" style="width:200px;">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="deal_context_router_timeout_ms">Router Timeout (ms):
+							<span class="toolTip">?<span class="toolTipText">
+								How long to wait for the routing step before falling back to keyword matching. 1000-60000 ms
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="number" id="deal_context_router_timeout_ms" name="deal_context_router_timeout_ms" class="form-field" min="1000" max="60000" step="1000" style="width:100px;">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="toggleDealContextRouter">Use AI Router:
+							<span class="toolTip">?<span class="toolTipText">
+								Use a short AI pass to work out which deal or log events a question refers to. This is what resolves follow-ups such as "why did it pause?" to the deal discussed earlier. When off, keyword matching is used instead
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="checkbox" id="toggleDealContextRouter" name="deal_context_use_router" class="form-field">
+					</td>
+				</tr>
+
+				<tr>
+					<td>Enabled:</td>
+
+					<td>
+						<input type="checkbox" id="toggleDealContext" name="deal_context_enabled" class="form-field">
+					</td>
+				</tr>
+
+				</table>
+
+			</div>
+
+			<div class="divHr"></div>
+
+			<div id="scheduleBox" style="padding-top: 10px; padding-bottom: 5px;">
+
+				<b>Database Backups</b>
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+				
+				<tr>
+					<td>
+						<label for="backups">Select Days:
+							<span class="toolTip">?<span class="toolTipText">
+								These are the days to schedule database backups
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+
+						<div id="backup_days" style="display: block; width: 50px;">
+							<label style="display: flex; align-items: center;">
+								<input type="checkbox" class="form-field" value="0"> Sunday
+							</label>
+							<label style="display: flex; align-items: center;">
+								<input type="checkbox" class="form-field" value="1"> Monday
+							</label>
+							<label style="display: flex; align-items: center;">
+								<input type="checkbox" class="form-field" value="2"> Tuesday
+							</label>
+							<label style="display: flex; align-items: center;">
+								<input type="checkbox" class="form-field" value="3"> Wednesday
+							</label>
+							<label style="display: flex; align-items: center;">
+								<input type="checkbox" class="form-field" value="4"> Thursday
+							</label>
+							<label style="display: flex; align-items: center;">
+								<input type="checkbox" class="form-field" value="5"> Friday
+							</label>
+							<label style="display: flex; align-items: center;">
+								<input type="checkbox" class="form-field" value="6"> Saturday
+							</label>
+						</div>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Time:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the time to schedule database backups
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="text" id="backup_time" style="width: 60px;" class="form-field" placeholder="HH:MM">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Day of Month:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the day of the month to schedule database backups
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="number" id="backup_day_month" min="1" max="31" class="form-field" placeholder="1-31"> (Optional)
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Maximum Backups:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the maximum number of backups to keep
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="number" id="backup_max" class="form-field" placeholder="">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Encryption Password:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the password that will be used to encrypt the database backup archives
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="password" autocomplete="off" id="backup_password" class="form-field" style="width: 200px;" placeholder="">
+						<span id="showPassword" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Show</span>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backup_include_chats">Include AI Chats:
+							<span class="toolTip">?<span class="toolTipText">
+								When enabled, AI chat conversations are included in scheduled automatic backups
+							</span></span>
+						</label>
+					</td>
+					<td style="width: 325px;">
+						<input type="checkbox" id="toggleBackupIncludeChats" name="backup_include_chats" class="form-field">
+					</td>
+				</tr>
+
+				<tr>
+					<td>Enabled:</td>
+
+					<td>
+						<input id="toggleBackup" name="backup_enabled" type=checkbox>
+					</td>
+				</tr>
+				</table>
+			</div>
+
+			<div class="divHr"></div>
+
+			<div style="padding-top: 10px; padding-bottom: 5px;">
+
+				<b>SFTP Credentials For Backups</b>
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+
+				<tr>
+					<td>
+						<label for="backups">Host:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the SFTP host to upload backups
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="sftp_host" id="sftp_host" class="form-field" style="width: 250px;" value="<%= services['cron_backup']['sftp']['host'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Port:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the SFTP port
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="sftp_port" id="sftp_port" class="form-field" style="width: 50px;" value="<%= services['cron_backup']['sftp']['port'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Username:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the SFTP username
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="sftp_username" id="sftp_username" class="form-field" style="width: 250px;" value="<%= services['cron_backup']['sftp']['username'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Password:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the SFTP password
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="password" autocomplete="off" name="sftp_password" id="sftp_password" class="form-field" style="width: 250px;" value="">
+						<span id="showSftpPassword" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Show</span>
+					</td>
+				</tr>
+
+				<tr>
+					<td style="vertical-align: top; padding-top: 6px;">
+						<label for="sftp_private_key">Private Key:
+							<span class="toolTip">?<span class="toolTipText">
+								Paste the contents of your private key file (e.g. id_rsa or id_ed25519). The key will be encrypted and stored securely. Leave blank to keep the existing key.
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="hidden" name="sftp_private_key_clear" id="sftp_private_key_clear" value="0">
+						<textarea name="sftp_private_key" id="sftp_private_key" class="form-field" style="width: 350px; height: 120px; font-family: monospace; font-size: 11px; resize: vertical;" placeholder="Paste private key here (leave blank to keep existing)"></textarea>
+						<% if (services['cron_backup']['sftp']['private_key_set']) { %>
+							<div id="sftp_private_key_status" style="margin-top: 4px; font-size: 12px; color: var(--green-color, #2ecc71);">&#10003; Private key is set &nbsp;<span id="sftp_clear_key" style="cursor: pointer; color: var(--link-color); font-size: 12px;">[Clear]</span></div>
+						<% } else { %>
+							<div id="sftp_private_key_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+						<% } %>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Passphrase:
+							<span class="toolTip">?<span class="toolTipText">
+								This an optional passphrase for your private key
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="password" autocomplete="off" name="sftp_passphrase" id="sftp_passphrase" class="form-field" style="width: 250px;" value="">
+						<span id="showSftpPassphrase" style="margin-left: 10px; cursor: pointer; color: var(--link-color);">Show</span>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="backups">Upload Directory:
+							<span class="toolTip">?<span class="toolTipText">
+								This is the path on the remote host where your backups will be uploaded.
+								<br><br>
+								NOTE: This should be a unique and empty directory as files will be automatically removed according to the value set for maximum backups
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input name="sftp_remote_directory" id="sftp_remote_directory" class="form-field" style="width: 250px;" value="<%= services['cron_backup']['sftp']['remote_directory'] %>">
+					</td>
+				</tr>
+
+				<tr>
+					<td>Enabled:</td>
+
+					<td>
+						<input id="toggleSftp" name="sftp_enabled" type=checkbox>
+					</td>
+				</tr>
+				</table>
+			</div>
+
+
+			<div class="divHr"></div>
+
+			<div style="padding-top: 10px; padding-bottom: 5px;">
+
+				<b>Circuit Breaker</b>
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+
+					<tr>
+						<td>
+							<label for="cb_deal_ratio_threshold">Deal Ratio:
+								<span class="toolTip">?<span class="toolTipText">
+									Fraction of active deals that must trigger safety orders within the window to activate (e.g. 0.5 = 50%)
+								</span></span>
+							</label>
+						</td>
+
+						<td style="width: 325px;">
+							<input type="number" id="cb_deal_ratio_threshold" name="cb_deal_ratio_threshold" class="form-field" step="0.1" min="0.1" max="1.0" style="width:80px;">
+						</td>
+					</tr>
+
+					<tr>
+						<td>
+							<label for="cb_deal_ratio_window_secs">Deal Ratio Window:
+								<span class="toolTip">?<span class="toolTipText">
+									Rolling time window in seconds for counting simultaneous safety order triggers
+								</span></span>
+							</label>
+						</td>
+
+						<td style="width: 325px;">
+							<input type="number" id="cb_deal_ratio_window_secs" name="cb_deal_ratio_window_secs" class="form-field" min="5" max="300" style="width:80px;">
+						</td>
+					</tr>
+
+					<tr>
+						<td>
+							<label for="cb_price_drop_percent">Price Drop %:
+								<span class="toolTip">?<span class="toolTipText">
+									Percentage price drop within the window that triggers the circuit breaker for that pair
+								</span></span>
+							</label>
+						</td>
+
+						<td style="width: 325px;">
+							<input type="number" id="cb_price_drop_percent" name="cb_price_drop_percent" class="form-field" step="0.5" min="1" max="50" style="width:80px;">
+						</td>
+					</tr>
+
+					<tr>
+						<td>
+							<label for="cb_price_drop_window_secs">Price Drop Window:
+								<span class="toolTip">?<span class="toolTipText">
+									Rolling time window in seconds for measuring price drops
+								</span></span>
+							</label>
+						</td>
+
+						<td style="width: 325px;">
+							<input type="number" id="cb_price_drop_window_secs" name="cb_price_drop_window_secs" class="form-field" min="10" max="600" style="width:80px;">
+						</td>
+					</tr>
+
+					<tr>
+						<td>
+							<label for="togglePriceDrop">Price Drop Trigger:
+								<span class="toolTip">?<span class="toolTipText">
+									When disabled, only the deal ratio trigger is active.
+								</span></span>
+							</label>
+						</td>
+
+						<td style="width: 325px;">
+							<input type="checkbox" id="togglePriceDrop" name="cb_price_drop_enabled" class="form-field">
+						</td>
+					</tr>
+
+					<tr>
+						<td>
+							<label for="cb_pause_duration_secs">Pause Duration:
+								<span class="toolTip">?<span class="toolTipText">
+									How long in seconds to pause all deal processing when the circuit breaker activates
+								</span></span>
+							</label>
+						</td>
+
+						<td style="width: 325px;">
+							<input type="number" id="cb_pause_duration_secs" name="cb_pause_duration_secs" class="form-field" min="10" max="600" style="width:80px;">
+						</td>
+					</tr>
+
+					<tr>
+						<td>
+							<label for="cb_repeat_alert_window_secs">Elevated Alert Window:
+								<span class="toolTip">?<span class="toolTipText">
+									If the circuit breaker activates more than once within this window (seconds), an elevated 🚨 Telegram alert is sent indicating deteriorating market conditions. Default: 3600 (1 hour)
+								</span></span>
+							</label>
+						</td>
+
+						<td style="width: 325px;">
+							<input type="number" id="cb_repeat_alert_window_secs" name="cb_repeat_alert_window_secs" class="form-field" min="60" max="86400" style="width:80px;">
+						</td>
+					</tr>
+
+					<tr>
+						<td>
+							<label for="cb_price_zero_alert_count">Price Zero Alert Count:
+								<span class="toolTip">?<span class="toolTipText">
+									Number of consecutive Invalid Price: 0 events for the same deal before a Telegram alert is sent. Default: 4
+								</span></span>
+							</label>
+						</td>
+
+						<td style="width: 325px;">
+							<input type="number" id="cb_price_zero_alert_count" name="cb_price_zero_alert_count" class="form-field" min="2" max="20" style="width:80px;">
+						</td>
+					</tr>
+
+					<tr>
+						<td>Enabled:</td>
+
+						<td>
+							<input type="checkbox" id="toggleCircuitBreaker" name="cb_enabled" class="form-field">
+						</td>
+					</tr>
+
+				</table>
+			</div>
+
+			<div class="divHr"></div>
+
+			<div style="padding-top: 10px; padding-bottom: 5px;">
+
+				<b>Exchange Settings</b>
+				<table id="botsCreate" style="margin-top: 5px;" cellpadding=0 cellspacing=0>
+
+				<tr>
+					<td>
+						<label for="bot_exchange">Name:
+							<span class="toolTip">?<span class="toolTipText">
+								The exchange this instance will trade on
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<select name="bot_exchange" id="bot_exchange" class="form-field" style="width: 256px; cursor: pointer;">
+							<option value="">Loading exchanges...</option>
+						</select>
+					</td>
+				</tr>
+
+				<tr><td colspan="2" style="padding-top: 8px; padding-bottom: 2px; font-size: 0.9rem; opacity: 0.6;">API Credentials <i>(leave blank to keep existing)</i></td></tr>
+
+				<tr>
+					<td>
+						<label for="bot_apiKey">API Key:</label>
+					</td>
+
+					<td>
+						<input type="hidden" id="bot_apiKey_clear" value="0">
+						<input type="password" autocomplete="off" name="bot_apiKey" id="bot_apiKey" class="form-field" style="width: 250px;" placeholder="••••••••">
+						<div id="bot_apiKey_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="bot_apiSecret">API Secret:</label>
+					</td>
+
+					<td>
+						<input type="hidden" id="bot_apiSecret_clear" value="0">
+						<input type="password" autocomplete="off" name="bot_apiSecret" id="bot_apiSecret" class="form-field" style="width: 250px;" placeholder="••••••••">
+						<div id="bot_apiSecret_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="bot_apiPassphrase">Passphrase: <span style="font-size:0.9rem;"><i>(if required)</i></span></label>
+					</td>
+
+					<td>
+						<input type="hidden" id="bot_apiPassphrase_clear" value="0">
+						<input type="password" autocomplete="off" name="bot_apiPassphrase" id="bot_apiPassphrase" class="form-field" style="width: 250px;" placeholder="••••••••">
+						<div id="bot_apiPassphrase_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="bot_apiPassword">Password: <span style="font-size:0.9rem;"><i>(if required)</i></span></label>
+					</td>
+
+					<td>
+						<input type="hidden" id="bot_apiPassword_clear" value="0">
+						<input type="password" autocomplete="off" name="bot_apiPassword" id="bot_apiPassword" class="form-field" style="width: 250px;" placeholder="••••••••">
+						<div id="bot_apiPassword_status" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+					</td>
+				</tr>
+
+				<tr><td colspan="2" style="padding-top: 8px; padding-bottom: 2px; font-size: 0.9rem; opacity: 0.6;">Fees &amp; Sandbox</td></tr>
+
+				<tr>
+					<td>
+						<label for="bot_exchangeFee">Fee %:
+							<span class="toolTip">?<span class="toolTipText">
+								The fee percentage applied to both buys and sells on your exchange, e.g. 0.65
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="number" step="0.01" min="0" name="bot_exchangeFee" id="bot_exchangeFee" class="form-field" style="width: 100px;">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="bot_sandBoxWallet">Sandbox Wallet ($):
+							<span class="toolTip">?<span class="toolTipText">
+								Simulated wallet balance used when Sandbox mode is enabled
+							</span></span>
+						</label>
+					</td>
+
+					<td>
+						<input type="number" step="1" min="0" name="bot_sandBoxWallet" id="bot_sandBoxWallet" class="form-field" style="width: 100px;">
+					</td>
+				</tr>
+
+				<tr><td colspan="2" style="padding-top: 8px; padding-bottom: 2px; font-size: 0.9rem; opacity: 0.6;">Order Settings</td></tr>
+
+				<tr>
+					<td>
+						<label for="exchange_buy_slippage">Buy Slippage %:
+							<span class="toolTip">?<span class="toolTipText">
+								Percentage slippage applied to buy order prices to improve fill rate
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="number" step="0.01" min="0" max="10" id="exchange_buy_slippage" name="exchange_buy_slippage" class="form-field" style="width: 100px;">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="exchange_sell_slippage">Sell Slippage %:
+							<span class="toolTip">?<span class="toolTipText">
+								Percentage slippage applied to sell order prices to improve fill rate
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<input type="number" step="0.01" min="0" max="10" id="exchange_sell_slippage" name="exchange_sell_slippage" class="form-field" style="width: 100px;">
+					</td>
+				</tr>
+
+				<tr>
+					<td>
+						<label for="exchange_balance_currencies">Balance Currencies:
+							<span class="toolTip">?<span class="toolTipText">
+								Currencies shown in the dashboard balance dropdown. Type a currency code and press Enter to add it (e.g. USD, USDT, USDC)
+							</span></span>
+						</label>
+					</td>
+
+					<td style="width: 325px;">
+						<select id="exchange_balance_currencies" name="exchange_balance_currencies" class="form-select-pair" style="width: 200px;" multiple="multiple"></select>
+					</td>
+				</tr>
+
+				</table>
+
+				<div style="margin-top: 15px;">
+					<button type="button" id="botConfigSave" class="btn" style="cursor: pointer;">Save Exchange Settings</button>
+				</div>
+
+				<div class="divHr" style="margin-top: 20px;"></div>
+
+				<div style="padding-top: 10px;">
+					<b>Trading Mode</b>
+					<div style="margin-top: 8px; display: flex; align-items: center; gap: 12px;">
+						<span id="sandboxModeLabel" style="font-size: 1.1rem;"></span>
+						<button type="button" id="sandboxModeToggle" class="btn" style="cursor: pointer;"></button>
+					</div>
+					<div style="margin-top: 6px; font-size: 0.95rem; color: var(--table-content-color); opacity: 0.7;" id="sandboxModeDesc"></div>
+				</div>
+
+			</div>
+
+
+		<button style="margin-top: 20px" type="button" id="checkUpdates" class="btn" style="cursor: pointer;">
 				Check for Updates
 			</button>
 
@@ -266,5 +1835,134 @@
 
 </main>
 
+
+
+<script>
+(function() {
+
+	// Sections that start collapsed. Key is the exact bold text of the section header.
+	const COLLAPSED_BY_DEFAULT = new Set([
+		'3CQS Signals',
+		'Telegram Settings',
+		'Artificial Intelligence (AI)',
+		'Database Backups',
+		'SFTP Credentials For Backups'
+	]);
+
+	const STORAGE_KEY = 'symbot_config_sections';
+
+	function loadState() {
+		try {
+			return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+		} catch(e) {
+			return {};
+		}
+	}
+
+	function saveState(state) {
+		try {
+			localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+		} catch(e) {}
+	}
+
+	function initCollapsibleSections() {
+
+		const state = loadState();
+
+		// Find every bold tag that is a direct section header — i.e. the first
+		// element child of a padding-top div, not inside a table or label.
+		const candidates = document.querySelectorAll('#formConfig > div > b');
+
+		candidates.forEach(function(header) {
+
+			const title = header.textContent.trim();
+
+			if (!COLLAPSED_BY_DEFAULT.has(title)) {
+				return;
+			}
+
+			const sectionDiv = header.parentElement;
+
+			// Collect all siblings after the header <b> tag — these are the
+			// table rows and other elements to hide/show.
+			const siblings = [];
+			let node = header.nextSibling;
+
+			while (node) {
+				siblings.push(node);
+				node = node.nextSibling;
+			}
+
+			// Wrap siblings in a collapsible container
+			const body = document.createElement('div');
+			body.className = 'config-section-body';
+			siblings.forEach(function(n) { body.appendChild(n); });
+			sectionDiv.appendChild(body);
+
+			// Determine initial open/closed state
+			const savedOpen = state[title];
+			const isOpen = savedOpen === undefined
+				? false   // collapsed by default
+				: savedOpen;
+
+			body.style.display = isOpen ? '' : 'none';
+
+			// Build the clickable header row
+			const toggle = document.createElement('span');
+			toggle.className = 'config-section-toggle';
+			toggle.setAttribute('aria-expanded', String(isOpen));
+			toggle.style.cssText = [
+				'display: inline-flex',
+				'align-items: center',
+				'gap: 6px',
+				'cursor: pointer',
+				'user-select: none',
+				'width: 100%',
+				'padding: 2px 0 4px 0'
+			].join(';');
+
+			const arrow = document.createElement('span');
+			arrow.className = 'config-section-arrow';
+			arrow.textContent = isOpen ? '▾' : '▸';
+			arrow.style.cssText = [
+				'font-size: 0.85rem',
+				'opacity: 0.6',
+				'transition: transform 120ms ease',
+				'flex-shrink: 0'
+			].join(';');
+
+			// Move the <b> tag into the toggle wrapper
+			toggle.appendChild(arrow);
+			toggle.appendChild(header);
+
+			sectionDiv.insertBefore(toggle, sectionDiv.firstChild);
+
+			toggle.addEventListener('click', function() {
+
+				const open = body.style.display === 'none';
+
+				body.style.display = open ? '' : 'none';
+				arrow.textContent = open ? '▾' : '▸';
+				toggle.setAttribute('aria-expanded', String(open));
+
+				const s = loadState();
+				s[title] = open;
+				saveState(s);
+			});
+		});
+	}
+
+	// Run after the DOM is ready and after any existing $(document).ready
+	// handlers have finished, so toggles (e.g. toggleTelegram) are already set.
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', function() {
+			setTimeout(initCollapsibleSections, 0);
+		});
+	} else {
+		setTimeout(initCollapsibleSections, 0);
+	}
+
+})();
+</script>
 
 <%- include('./partialsFooterView'); %>

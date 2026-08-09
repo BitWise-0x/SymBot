@@ -1,101 +1,57 @@
 'use strict';
 
-const async = require('async');
-
 let shareData;
 
 
-async function create(concurrency) {
+// Creates a serial async queue — tasks run one at a time, each waiting for
+// the previous to complete before starting. This prevents race conditions
+// when multiple deal start requests arrive simultaneously.
+//
+// Usage:
+//   const queue = await create();
+//   await queue.enqueue(() => myAsyncFn(arg1, arg2));
+//
+// The enqueued function must return a Promise (async functions qualify).
+// The queue resolves each task's Promise before starting the next one.
 
-	const queue = async.queue((task, completed) => {
+async function create() {
 
-		const req = task.req;
-		const res = task.res;
-		const taskName = task.name;
-		const initCallBack = task.init_callback;
+	// The chain is a Promise that always resolves. Each new task is appended
+	// via .then() so it only runs after the previous task settles.
+	let chain = Promise.resolve();
 
-		//console.log('Queued task: ' + taskName);
+	const enqueue = (fn) => {
 
-		if (taskName == 'start_deal') {
+		const taskPromise = new Promise((resolve, reject) => {
 
-			initCallBack(req, res, { 'task': task, 'completed': completed });
-		}
-		else {
-
-			const remaining = queue.length();
-
-			return completed('Unknown task name', { task, remaining });
-		}
-
-	}, concurrency);
-
-
-	const add = async function(taskObj, initCallBack) {
-
-		taskObj['init_callback'] = initCallBack;
-
-		queue.push(taskObj, (error, { task, remaining }) => {
-
-			if (error) {
-
-				let msg = `Queue error: Task ${task.name}: ${error}`;
-
-				shareData.Common.logger(msg);
+			chain = chain.then(async () => {
 
 				try {
 
-					const res = task.res;
+					const result = await fn();
 
-					let obj = {
-
-						'date': new Date(),
-						'error': msg
-					};
-
-					res.status(404).send(obj);
+					resolve(result);
 				}
-				catch(e) {}
-			}
-			else {
+				catch (err) {
 
-				//const data = JSON.stringify(task.data);
-				//console.log(`Finished task ${task.name}. Data: ${data}. ${remaining} tasks remaining`);
-			}
+					// Log but don't break the chain — the next task should still run
+					try {
+
+						shareData.Common.logger('Queue task error: ' + (err?.message || String(err)));
+					}
+					catch(e) {}
+
+					reject(err);
+				}
+			});
 		});
-	}
+
+		return taskPromise;
+	};
 
 
-	const callBack = async function(res, resObj, taskObj) {
-
-		let task = taskObj['task'];
-		let completed = taskObj['completed'];
-
-		task.data = resObj;
-
-		const remaining = queue.length();
-
-		completed(null, { task, remaining });
-
-		if (res) {
-
-			try {
-
-				res.send(resObj);
-			}
-			catch(e) {}
-		}
-	}
-
-
-	queue.drain(() => {
-
-		//console.log('Queue complete.');
-	});
-
-
-	return { 'queue': queue, 'add': add, 'callBack': callBack };
+	return { enqueue };
 }
-
 
 
 module.exports = {

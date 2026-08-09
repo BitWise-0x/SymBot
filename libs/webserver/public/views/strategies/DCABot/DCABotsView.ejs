@@ -33,7 +33,7 @@
 
 		$.ajax({
 					type: 'POST',
-					url: '/api/bots/' + api,
+					url: './api/bots/' + api,
 					data: {},
 					dataType: 'json',
 					success: function(data) {
@@ -46,7 +46,7 @@
 						}
 						else {
 
-							alertBox('Bot is now ' + status);
+							alertBox((data.botName ? data.botName : 'Bot') + ' is now ' + status);
 						}
 					},
 					error: function(data) {
@@ -117,15 +117,107 @@
 			});
 		}
 	}
-	
+
+
+	function deleteBot(botId, botName) {
+
+		$.confirm({
+			title: false,
+			boxWidth: '50%',
+			useBootstrap: false,
+			content: '<div style="font-size: 1.2rem; text-align: left;">' +
+				'<b style="color: #d80f08;">Delete ' + botName + '?</b><br><br>' +
+				'<div style="font-size: 1.0rem; padding: 8px; background: rgba(255,0,0,0.1); border-left: 3px solid #d80f08; border-radius: 2px;">' +
+				'<b>This cannot be undone.</b> The bot and all of its deal history will be permanently deleted. Active deals must be closed or cancelled first.' +
+				'</div><br>' +
+				'Type the bot name to confirm:<br>' +
+				'<form action="" style="display: inline;"><input type="text" id="deleteBotConfirmName" class="form-field" style="width: 100%; margin-top: 6px; box-sizing: border-box;" required /></form>' +
+				'</div>',
+			buttons: {
+				confirm: {
+					btnClass: 'btn-default',
+					text: '<div style="color: #d80f08;">Delete Bot</div>',
+					action: function() {
+
+						const typed = this.$content.find('#deleteBotConfirmName').val().trim();
+
+						if (typed !== botName) {
+
+							alertBox('Bot name does not match.');
+							return false;
+						}
+
+						processDeleteBot(botId, botName);
+					}
+				},
+				cancel: {
+					btnClass: 'btn-default',
+					text: '<div style="color: #000000;">Cancel</div>',
+					action: function() {}
+				}
+			},
+			onContentReady: function() {
+
+				let jc = this;
+
+				this.$content.find('form').on('submit', function(e) {
+
+					e.preventDefault();
+					jc.$$confirm.trigger('click');
+				});
+			}
+		});
+	}
+
+
+	function processDeleteBot(botId, botName) {
+
+		$('#spinner-overlay').fadeIn(100);
+
+		$.ajax({
+			type: 'DELETE',
+			url: './api/bots/' + botId,
+			dataType: 'json',
+			success: function(data) {
+
+				$('#spinner-overlay').fadeOut(100);
+
+				if (data.success) {
+
+					alertBox('Bot "' + botName + '" and all deal history deleted.', function() {
+						window.location.reload(true);
+					});
+				}
+				else {
+
+					alertBox('Failed: ' + data.message);
+				}
+			},
+			error: function(xhr) {
+
+				$('#spinner-overlay').fadeOut(100);
+				alertBox('Error: ' + xhr.responseText);
+			}
+		});
+	}
+
 
 	$(document).ready(function() {
+		
+		document.querySelectorAll('.date-cell').forEach(cell => {
+			
+			const rawDate = cell.getAttribute('data-date');
+			
+			if (rawDate) {
+
+				cell.textContent = dateConvertLocal(rawDate);
+			}
+		});
 
 		$(window).resize(function() {
 
 			resizeBotsDeals();
 		});
-
 
 		$('[id="showActive"]').simpleSwitch();
 		$('[id*="toggle"]').simpleSwitch();
@@ -162,7 +254,12 @@
 
 			if (col == (colCount - 1)) {
 
-				// Set timeout to avoid double event firing in some cases
+				// Delete column — last
+				if (botId && botName) deleteBot(botId, botName);
+			}
+			else if (col == (colCount - 2)) {
+
+				// Toggle column — second to last
 				clearTimeout(timerId);
 
 				timerId = setTimeout( function(){
@@ -180,7 +277,7 @@
 			}
 			else if (botId) {
 
-				window.location.href = '/bots/' + botId;
+				window.location.href = './bots/' + botId;
 			}
 		});
 
@@ -212,17 +309,7 @@
 		});
 
 
-		$('#botDealSelectorShow').click(function() {
-
-			if ($('.botDealSelectorWrapper').is(':visible')) {
-
-				$('.botDealSelectorWrapper').fadeOut(300);
-			}
-			else {
-
-				$('.botDealSelectorWrapper').fadeIn(300);
-			}
-		});
+		SymBot.UI.initColumnSelector();
 
 
 		// Check last active state
@@ -240,15 +327,7 @@
 <center>
 <main>
 
-	<div class="botDealSelectorWrapper">
-		<div id="botDealSelector" class="botDealSelector">
-		  <!-- this div is where the column selector is added -->
-		</div>
-	  
-		<div class="botDealSelectorHidden">
-			<div id="popover-botdeals"></div>
-		</div>
-	</div>
+	<%- include('../../partialsColumnSelector') %>
 
 	<div id="contentBox">
 
@@ -256,7 +335,9 @@
 
 			<div class="contentHeaderBox">
 				<b id="headerText" class="contentHeader">DCA Bots</b>
-				<span id="botDealSelectorShow">&#9881;</span>
+				<span class="viewSettings">
+					<span id="botDealSelectorShow" class="viewIconBtn"><span class="icon icon-columns" style="width:13px;height:13px;"></span></span>
+				</span>
 				<span style="display: flex; justify-content: center; font-size: 1.2rem; gap: 10px; margin-top: 10px; margin-bottom: 0;">
 					<input id="showActive" name="showActive" type=checkbox> Show Active
 				</span>
@@ -268,7 +349,7 @@
 
 					<thead style="position: sticky; top: 0; z-index: 1000;">
 						<tr class="tableHeader">
-							<th>Bot Name</th> <th>Pairs</th> <th>BO</th> <th>SO</th> <th>Max SO</th> <th>Deviation</th> <th>Volume Scale</th> <th>Step Scale</th> <th>TP</th> <th>Max Deals</th> <th>Max Pairs</th> <th>Start</th> <th>Sandbox</th> <th>Active</th>
+							<th>Created</th> <th>Updated</th> <th>Bot Name</th> <th>Exchange</th> <th>Pairs</th> <th>BO</th> <th>SO</th> <th>Max SO</th> <th>Deviation</th> <th>Volume Scale</th> <th>Step Scale</th> <th>TP</th> <th>Max Deals</th> <th>Max Pairs</th> <th>Max Funds</th> <th>Start</th> <th>Sandbox</th> <th>Active</th> <th data-sorter="false" class="columnSelector-disable"></th>
 						</tr>
 					</thead>
 
@@ -285,8 +366,11 @@
 			let bot = bots[i];
 
 			let active = bot['active'];
+			let exchange = (bot['config']['exchange'] || '').toUpperCase();
 			let dealMax = bot['config']['dealMax'];
 			let pairMax = bot['config']['pairMax'];
+			let maxFunds = Math.round(bot['config']['maxFunds']);
+			let botMaxFunds = Math.round(bot['config']['botMaxFunds']);
 			let sandBox = bot['config']['sandBox'];
 
 			if (bot['config']['startConditions'] != undefined && bot['config']['startConditions'] != null && bot['config']['startConditions'] != '') {
@@ -361,7 +445,10 @@
 	%>
 
 					<tr data-botid="<%- bot['botId'] %>" data-botname="<%- bot['botName'] %>" style="vertical-align: top;">
+						<td class="date-cell" data-date="<%= bot['createdAt'] %>"></td>
+						<td class="date-cell" data-date="<%= bot['updatedAt'] %>"></td>						
 						<td><%- bot['botName'] %></td>
+						<td><%- exchange %></td>
 						<td style="max-width: 150px;"><%- pair.toUpperCase() %></td>
 						<td><%- bot['config']['firstOrderAmount'] %></td>
 						<td><%- bot['config']['dcaOrderAmount'] %></td>
@@ -372,9 +459,19 @@
 						<td><%- bot['config']['dcaTakeProfitPercent'] %>%</td>
 						<td><%- dealMax %></td>
 						<td><%- pairMax %></td>
+						<td><%-
+							(function() {
+								const p = typeof bot['config']['pair'] === 'string' ? bot['config']['pair'] : (bot['config']['pair'] || [])[0] || '';
+								const quote = p.split('/')[1] || 'USD';
+								return getCurrencySymbol(quote);
+							})()
+						%><%- botMaxFunds %></td>
 						<td><%- startCondition %></td>
 						<td><%- sandBox %></td>
 						<td><input id="toggle<%- bot['botId'] %>" type=checkbox <%- active %>></td>
+						<td style="width: 1%; white-space: nowrap; text-align: center;">
+							<button class="hub-remove-btn" title="Delete bot" style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;"><span class="icon icon-cancel" style="width:13px;height:13px;pointer-events:none;"></span></button>
+						</td>
 					</tr>
 
 	<% 	} %>

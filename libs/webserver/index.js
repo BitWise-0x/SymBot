@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const pathRoot = path.dirname(fs.realpathSync(__dirname)).split(path.sep).join(path.posix.sep);
+const pathRoot = path.resolve(__dirname, ...Array(1).fill('..'));
 
 const bodyParser = require('body-parser');
 const compression = require('compression');
@@ -11,13 +11,12 @@ const cookieParser = require('cookie-parser');
 const express = require('express');
 const session = require('express-session');
 const multer = require('multer');
-const MongoDBStore = require('connect-mongodb-session')(session);
+const MongoStore = require('connect-mongo').default;
 const app = express();
 const router = express.Router();
 const Routes = require(pathRoot + '/webserver/routes.js');
 
 const serverTimeoutMins = 3;
-const roomAuth = 'logs';
 
 let shareData;
 let socket;
@@ -39,31 +38,50 @@ const shouldCompress = (req, res) => {
 function initApp() {
 
 	const sessionExpireMins = 60 * 24;
-	const sessionSecret = shareData.appData.server_id;
+	const sessionCookieName = 'SymBot' + shareData.appData.instance_name;
 
-	const store = new MongoDBStore({
+	let sessionSecret = shareData.appData.server_id;
 
-		'uri': shareData.appData.mongo_db_url,
-		'collection': 'sessions'
-	},
-	function(err) {
+	let store;
 
-		if (err) {
+	if (!shareData.appData.config_mode) {
 
-			shareData.Common.logger(JSON.stringify(err));
-		}
-	});
+		store = MongoStore.create({
+			'mongoUrl': shareData.appData.mongo_db_url,
+			'collectionName': 'sessions',
+			'ttl': sessionExpireMins * 60,
+			'autoRemove': 'native'
+		});
+	}
+	else {
+
+		sessionSecret = 'SymBot' + Math.floor(Math.random() * 1000000) + 1;
+
+		const FileStore = require('session-file-store')(session);
+
+		store = new FileStore({
+			'path': path.join(pathRoot, '..', 'sessions'),
+			'logFn': function() {}
+		});
+	}
 
 	const sessionMiddleware = session({
 
 		'secret': sessionSecret,
+		'name': sessionCookieName,
 		'resave': false,
 		'saveUninitialized': false,
 		'store': store,
+		'rolling': true,
 		'cookie': {
-			'expires': (sessionExpireMins * 60) * 1000
+			'maxAge:': sessionExpireMins * 60 * 1000,
+			'sameSite': 'lax'
 		}
 	});
+
+	app.disable('x-powered-by');
+
+	app.use(sessionMiddleware);
 
 	// Compress all HTTP responses
 	app.use(compression({
@@ -73,14 +91,39 @@ function initApp() {
 
 	}));
 
-	app.disable('x-powered-by');
+	app.use(function(err, req, res, next) {
+
+		shareData.Common.logger(JSON.stringify(err.stack));
+	});
+
+	app.set('views', pathRoot + '/webserver/public/views');
+	app.set('view engine', 'ejs');
+
+	app.use('/js', express.static(pathRoot + '/webserver/public/js'));
+	app.use('/css', express.static(pathRoot + '/webserver/public/css'));
+	app.use('/data', express.static(pathRoot + '/webserver/public/data'));
+	app.use('/images', express.static(pathRoot + '/webserver/public/images'));
+
+	app.use(express.json());
+
+	app.use(cookieParser());
 
 	app.use((req, res, next) => {
+
+		const allowedRoutes = ['/login', '/config'];
 
 		const timeOut = (60 * 1000) * serverTimeoutMins;
 
 		req.setTimeout((timeOut - (1000 * 5)));
 		res.append('Server', shareData.appData.name + ' v' + shareData.appData.version);
+
+		if (shareData.appData.config_mode && allowedRoutes.length > 0 && !allowedRoutes.includes(req.path)) {
+
+			//return res.status(403).send('Access Forbidden: This route is not allowed.');
+			res.redirect('/login');
+
+			return;
+		}
 
 		if (shareData.appData.database_error || shareData.appData.system_pause) {
 
@@ -97,28 +140,9 @@ function initApp() {
 		}
 	});
 
-	app.use(function(err, req, res, next) {
-
-		shareData.Common.logger(JSON.stringify(err.stack));
-	});
-
-	app.set('views', pathRoot + '/webserver/public/views');
-	app.set('view engine', 'ejs');
-
-	app.use('/js', express.static(pathRoot + '/webserver/public/js'));
-	app.use('/css', express.static(pathRoot + '/webserver/public/css'));
-	app.use('/data', express.static(pathRoot + '/webserver/public/data'));
-	app.use('/images', express.static(pathRoot + '/webserver/public/images'));
-	
-	app.use(sessionMiddleware);
-
-	app.use(express.json());
-
-	app.use(cookieParser());
-
 	const upload = multer({
 		dest: 'uploads/',
-		limits: { fileSize: 100000000 }
+		limits: { fileSize: 262144000 }
 	});
 
 	app.use(bodyParser.json({
@@ -151,8 +175,8 @@ function initSocket(sessionMiddleware, server) {
 				methods: ['PUT', 'GET', 'POST', 'DELETE', 'OPTIONS'],
 				credentials: false
 		},
-		path: '/ws',
-		serveClient: false,
+		path: '/' + shareData.appData['web_socket_path'],
+		serveClient: true,
 		pingInterval: 10000,
 		pingTimeout: 5000,
 		maxHttpBufferSize: 1e6,
@@ -169,52 +193,147 @@ function initSocket(sessionMiddleware, server) {
 		return next();
 	});
 
+	// Tracks number of in-flight api_action requests per client.
+	// Passed into routesWebSocket.api() so it can enforce the per-client
+	// concurrency limit without shared module-level state.
+	const inflightMap = new Map();
+
 	socket.on('connect', function (client) {
 
 		let clientId = client.id;
 		let loggedIn = client.request.session.loggedIn;
+		let apiKey = client.handshake.headers['api-key'];
+		let userAgent = client.handshake.headers['user-agent'];
 		let query = client.handshake.query;
+		const ip = shareData.Common.getClientIp(client);
+
+		if (apiKey && shareData.Common.validateApiKey(apiKey)) {
+
+			loggedIn = true;
+		}
 
 		//console.log('Connected ID:', clientId, loggedIn);
 
 		if (!loggedIn) {
+
+			if (apiKey) {
+
+				const msg = `Invalid API KEY used by ${ip} (WebSocket)`;
+
+				shareData.Common.sendNotification({ 'message': msg, 'type': 'info', 'telegram_id': shareData.appData.telegram_id });
+			}
 
 			client.emit('error', 'Unauthorized');
 			client.disconnect();			
 		}
 		else {
 
+			const API_ROOM = 'api';
+
 			if (query.room == undefined || query.room == null || query.room == '') {
 
-				client.join(roomAuth);
+				//const roomAuth = 'notifications';
+
+				//client.join(roomAuth);
 			}
 			else {
 
 				client.join(query.room);
 			}
 
+			client.on('register_client', (data, ack) => {
+
+				client.join(API_ROOM);
+
+				// Acknowledge so the client knows the join succeeded
+				if (typeof ack === 'function') {
+
+					ack({ success: true });
+				}
+			});
+
+			// Track rooms with active AI generations so disconnect can clean them up
+			const clientGenerationRooms = new Set();
+
+			client.on('disconnect', () => {
+
+				inflightMap.delete(client.id);
+
+				// Abort any in-progress AI generation when the client disconnects
+				if (shareData.AIClient) {
+
+					clientGenerationRooms.forEach(room => shareData.AIClient.abortGeneration(room));
+				}
+
+				clientGenerationRooms.clear();
+			});
+
+			client.on('joinRooms', ({ rooms }) => {
+
+				if (!rooms) return;
+
+				const roomList = Array.isArray(rooms) ? rooms : [rooms];
+
+				roomList.forEach(room => {
+
+					if (room === API_ROOM) {
+
+						//console.log(`Client ${client.id} attempted to join forbidden room: ${room}`);
+						return;
+					}
+
+					client.join(room);
+					//console.log(`Client ${client.id} joined room: ${room}`);
+
+					// Track as a potential AI generation room for disconnect cleanup
+					clientGenerationRooms.add(room);
+				});
+			});
+
+			client.on('leaveRoom', (room) => {
+
+				client.leave(room);
+				//console.log(`Client left room: ${room}`);
+			});
+
+			client.on('stopGeneration', (room) => {
+
+				if (room && shareData.AIClient) {
+
+					shareData.AIClient.abortGeneration(room);
+					clientGenerationRooms.delete(room);
+				}
+			});
+
 			client.on('notifications_history', function (data) {
 
 				shareData.Common.getNotificationHistory(client, data);
+			});
+
+			client.on('api_action', async (data) => {
+
+				Routes.processWebSocketApi(client, data, inflightMap);
 			});
 		}
 	});
 }
 
 
-async function sendSocketMsg(msg, room) {
+async function disconnectAllClients() {
 
-	let sendRoom = roomAuth;
+	try {
 
-	if (room != undefined && room != null && room != '') {
-
-		sendRoom = room;
+		socket.disconnectSockets();
 	}
+	catch(e) {
 
-	if (socket) {
-
-		socket.to(sendRoom).emit('data', msg);
 	}
+}
+
+
+async function getSocket() {
+
+	return socket;
 }
 
 
@@ -236,7 +355,7 @@ function start(port) {
 
 			shareData.Common.logger(`Port ${port} already in use`, true);
 
-			process.exit(1);
+			shareData.System.shutDown();
 		}
 		else {
 
@@ -263,15 +382,18 @@ function start(port) {
 }
 
 
+
 module.exports = {
 
 	app,
 	start,
-	sendSocketMsg,
+	getSocket,
+	disconnectAllClients,
 
 	init: function(obj) {
 
 		shareData = obj;
+
 		Routes.init(shareData);
     }
 }

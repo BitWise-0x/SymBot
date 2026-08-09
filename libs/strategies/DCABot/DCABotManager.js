@@ -1,13 +1,17 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+const ejs = require('ejs');
+
+const pathRoot = path.resolve(__dirname, ...Array(3).fill('..'));
+
 let shareData;
-let queueStartDeal;
+// Deal starts are serialised by DCABot.requestDealStart via dealStartQueue
 let symbolList = {};
 
 
 async function viewCreateUpdateBot(req, res, botId) {
-
-	let maxMins = 60;
 
 	let errMsg;
 	let botData;
@@ -31,82 +35,27 @@ async function viewCreateUpdateBot(req, res, botId) {
 		}
 	}
 
-	const botConfig = await shareData.Common.getConfig('bot.json');
-
-	const exchangeName = botConfig.data.exchange;
-
-	if (symbolList[exchangeName] == undefined || symbolList[exchangeName] == null) {
-
-		symbolList[exchangeName] = {};
-		symbolList[exchangeName]['symbols'] = [];
-		symbolList[exchangeName]['updated'] = 0;
-	}
-	
-	const diffSec = (new Date().getTime() - new Date(symbolList[exchangeName]['updated']).getTime()) / 1000;
-
-	// Get new list of symbols only after n minutes have passed
-	if (diffSec > (60 * maxMins)) {
-
-		const exchange = await shareData.DCABot.connectExchange(botConfig.data);
-
-		if (exchange) {
-
-			let symbolData;
-			let count = 0;
-
-			let success = false;
-			let finished = false;
-
-			while (!finished) {
-
-				symbolData = await shareData.DCABot.getSymbolsAll(exchange);
-
-				if (symbolData.success) {
-
-					success = true;
-					finished = true;
-				}
-				else if (count >= 5) {
-
-					// Timeout
-					errMsg = symbolData.msg;
-
-					success = false;
-					finished = true;
-				}
-				else {
-
-					await shareData.Common.delay(1000);
-				}
-
-				count++;
-			}
-
-			if (success) {
-
-				symbolList[exchangeName]['updated'] = new Date();
-				symbolList[exchangeName]['symbols'] = [];
-				symbolList[exchangeName]['symbols'] = symbolData.symbols;
-			}
-		}
-		else {
-
-			errMsg = 'Unable to connect to exchange';
-		}
-	}
+	const symbols = await getSymbolList();
 
 	if (!botUpdate) {
+
+		const botConfigFile = shareData.appData.bot_config;
+		const botConfig     = await shareData.Common.getConfig(botConfigFile);
 
 		botData = botConfig.data;
 	}
 
-	res.render( 'strategies/DCABot/DCABotCreateUpdateView', { 'formAction': formAction, 'appData': shareData.appData, 'botUpdate': botUpdate, 'symbols': symbolList[exchangeName]['symbols'], 'botData': botData, 'errorData': errMsg } );
+	const { startConditionString, startConditionSubString } = buildStartConditionStrings(shareData.appData.bots, botData);
+	const symbolString  = buildSymbolString(symbols, botData);
+	const activeChecked = buildActiveChecked(botData);
+
+	res.render( 'strategies/DCABot/DCABotCreateUpdateView', { 'formAction': formAction, 'appData': shareData.appData, 'botUpdate': botUpdate, 'botData': botData, 'errorData': errMsg, 'startConditionString': startConditionString, 'startConditionSubString': startConditionSubString, 'symbolString': symbolString, 'activeChecked': activeChecked } );
 }
 
 
 async function viewActiveDeals(req, res) {
 
-	res.render( 'strategies/DCABot/DCABotDealsActiveView', { 'appData': shareData.appData, 'convertBoolean': shareData.Common.convertBoolean.toString() } );
+	res.render( 'strategies/DCABot/DCABotDealsActiveView', { 'appData': shareData.appData, 'convertBoolean': shareData.Common.convertBoolean.toString(), 'getCurrencySymbol': shareData.Common.getCurrencySymbol.toString() } );
 }
 
 
@@ -127,27 +76,263 @@ async function viewBots(req, res) {
 			const botId = bot.botId;
 			const botName = bot.botName;
 
-			bot = await removeDbKeys(bot);
+			bot = await shareData.DCABot.removeDbKeys(bot);
+
+			const config = JSON.parse(JSON.stringify(bot.config));
+
+			const maxFundsObj = await shareData.DCABot.calculateMaxFunds(config);
+
+			const maxFundsCamelCaseObj = shareData.Common.convertToCamelCase(maxFundsObj);
+
+			bot.config = Object.assign({}, config, maxFundsCamelCaseObj);
 		}
 
 		botsSort = shareData.Common.sortByKey(bots, 'date');
 		botsSort = botsSort.reverse();
 	}
 
-	res.render( 'strategies/DCABot/DCABotsView', { 'appData': shareData.appData, 'getDateParts': shareData.Common.getDateParts, 'timeDiff': shareData.Common.timeDiff, 'bots': botsSort } );
+	res.render( 'strategies/DCABot/DCABotsView', { 'appData': shareData.appData, 'getDateParts': shareData.Common.getDateParts, 'timeDiff': shareData.Common.timeDiff, 'getCurrencySymbol': shareData.Common.getCurrencySymbol, 'bots': botsSort } );
 }
 
 
 async function viewHistoryDeals(req, res) {
 
-	res.render( 'strategies/DCABot/DCABotDealsHistoryView', { 'appData': shareData.appData } );
+	res.render( 'strategies/DCABot/DCABotDealsHistoryView', { 'appData': shareData.appData, 'getCurrencySymbol': shareData.Common.getCurrencySymbol.toString() } );
 }
 
 
-async function apiGetMarkets(req, res) {
+async function apiAiAnalyzeDeal(req, res, sendResponse = true) {
+
+	let dataOut;
+	let prompt = {};
+	let success = false;
+
+	const body = req.body;
+
+	const queryOverride = {			
+		'dealId': body.dealId,
+		'timeframe': body.timeframe ?? '1h',
+		'limit': body.limit ?? 200,
+		'prompt': body.prompt,
+		'template': body.template,
+		'timeZoneOffset': body.timeZoneOffset ?? '+00:00'
+	}
+
+	req.queryOverride = queryOverride;
+
+	if (queryOverride.prompt && queryOverride.prompt != '') {
+
+		const data = await shareData.DCABot.getDeals({ 'dealId': queryOverride.dealId });
+
+		if (data && data.length > 0) {
+
+			prompt.success = true;
+			prompt.data = queryOverride.prompt;
+
+			success = true;
+		}
+		else {
+
+			prompt.error = 'Deal ID ' + queryOverride.dealId + ' not found';
+
+			success = false;
+		}
+	}
+	else {
+
+		prompt = await apiAiAnalyzeDealPrompt(req, res, false);
+	}
+
+	if (prompt.success) {
+
+		const aiBody = {
+						'message': {
+							'content': prompt.data,
+ 							'room': 'aiAnalyze' + Math.floor(1000 + Math.random() * 90000),
+							'stream': false
+						}
+					};
+
+		let aiOut;
+
+		try {
+
+			aiOut = await shareData.AIClient.streamChat(JSON.stringify(aiBody));
+
+		}
+		catch (e) {
+
+			aiOut = { success: false, data: e.message };
+		}
+
+		if (aiOut.success) {
+
+			success = true;
+		}
+
+		dataOut = aiOut.data;
+	}
+	else {
+
+		success = false;
+
+		dataOut = prompt.error;
+	}
+
+	const obj = { 'date': new Date(), 'success': success, 'data': dataOut };
+
+	if (sendResponse) {
+
+		res.send(obj);
+	}
+	else {
+
+		return obj;
+	}
+}
+
+
+async function apiAiAnalyzeDealPrompt(req, res, sendResponse = true) {
+
+	let success = true;
+	let error = null;
+
+	let sumTotal = 0;
+	let qtySumTotal = 0;
+	let ohlcvData = null;
+	let indicators = null;
+	let renderedHtml = null;
+
+	const query = req.queryOverride ?? req.query;
+
+	const dealId = query.dealId;
+	const timeframe = query.timeframe;
+	const since = query.since;
+	const limit = query.limit;
+	const timeZoneOffset = query.timeZoneOffset;
+
+	const template = (typeof query.template === 'string' && query.template.trim())
+		? query.template
+		: 'aiAnalyzeDealView.ejs';
+
+	try {
+
+		const dealTracker = await shareData.DCABot.getDealTracker();
+		const dealEntry = dealTracker?.[dealId];
+
+		if (!dealEntry?.deal) {
+
+			throw new Error(`Deal ID not found: ${dealId}`);
+		}
+
+		const deal = dealEntry.deal;
+		const pair = deal.config.pair;
+		const exchangeName = deal.exchange;
+		const orders = deal.orders;
+
+		const filledOrders = (orders || []).filter(o => o && o.filled);
+
+		const exchange = await shareData.DCABot.connectExchange({
+			exchange: exchangeName.toLowerCase()
+		});
+
+		const dataObj = await shareData.DCABot.getOHLCV(
+			exchange,
+			pair,
+			timeframe,
+			since,
+			limit
+		);
+
+		if (dataObj.success) {
+
+			ohlcvData = dataObj.data;
+		}
+
+		if (Array.isArray(ohlcvData)) {
+
+			try {
+
+				indicators = shareData.TradingSignals.computeMarketIndicators(ohlcvData, { timeframe });
+			}
+			catch {
+
+				indicators = null;
+			}
+		}
+
+		for (const order of filledOrders) {
+
+			sumTotal += order.amount || 0;
+			qtySumTotal += order.qty || 0;
+		}
+
+		// ---------- RENDER ----------
+		const renderData = {
+			dealId,
+			dealInfo: dealTracker[dealId].info,
+			dealDate: deal.date,
+			config: deal.config,
+			pair,
+			orders: filledOrders,
+			sumTotal,
+			qtySumTotal,
+			ohlcvData: JSON.stringify(ohlcvData),
+			indicators,
+			timeframe,
+			timeZoneOffset,
+			getDateParts: shareData.Common.getDateParts
+		};
+
+		// Inline template support
+		if (template && template.includes('<%')) {
+
+			renderedHtml = await ejs.render(template, renderData, {
+				async: true
+			});
+		}
+		else {
+
+			const viewPath = pathRoot + '/libs/webserver/public/views/strategies/DCABot/ai/' + template;
+
+			renderedHtml = await ejs.renderFile(viewPath, renderData, {
+				async: true
+			});
+		}
+	}
+	catch (err) {
+
+		success = false;
+		error = err?.message || err.toString();
+	}
+
+	const obj = {
+		date: new Date(),
+		success,
+		error,
+		data: renderedHtml
+	};
+
+	if (sendResponse) {
+
+		res.send(obj);
+	}
+	else {
+
+		return obj;
+	}
+}
+
+
+async function apiGetMarkets(req, res, sendResponse = true) {
+
+	const apiPath = req.params.path;
 
 	let pair = req.query.pair;
 	let exchangeName = req.query.exchange;
+	let timeframe = req.query.timeframe ?? '5m';
+	let since = req.query.since || undefined;
+	let limit = req.query.limit || undefined;
 
 	let success = true;
 	let data;
@@ -165,8 +350,8 @@ async function apiGetMarkets(req, res) {
 		const exchange = await shareData.DCABot.connectExchange(config);
 
 		// Get all market symbols
-		if (pair == undefined || pair == null || pair == '') {
-		
+		if (!apiPath && (pair == undefined || pair == null || pair == '')) {
+
 			data = await shareData.DCABot.getSymbolsAll(exchange);
 
 			if (!data['success']) {
@@ -185,28 +370,52 @@ async function apiGetMarkets(req, res) {
 		}
 		else {
 
-			// Get pair information
-			pair = pair.replace(/[_-]/g, '/');
+			if (apiPath != undefined && apiPath != null && apiPath != '') {
 
-			data = await shareData.DCABot.getSymbol(exchange, pair.toUpperCase());
+				if (apiPath == 'ohlcv' && exchange.has['fetchOHLCV']) {
 
-			if (data['invalid'] || (data['error'] != undefined && data['error'] != null && data['error'] != '')) {
+					const dataObj = await shareData.DCABot.getOHLCV(exchange, pair, timeframe, since, limit);
 
-				success = false;
-				data = data['error'];
+					data = dataObj.data;
+					success = dataObj.success;
+				}
+				else {
+
+					success = false;
+					data = 'Invalid path or unable to retrieve data';
+				}
 			}
 			else {
 
-				data = data['data'];
+				data = await shareData.DCABot.getSymbol(exchange, pair.toUpperCase());
+
+				if (data['invalid'] || (data['error'] != undefined && data['error'] != null && data['error'] != '')) {
+
+					success = false;
+					data = data['error'];
+				}
+				else {
+
+					data = data['data'];
+				}
 			}
 		}
 	}
 
-	res.send( { 'date': new Date(), 'success': success, 'data': data } );
+	const obj = { 'date': new Date(), 'success': success, 'data': data };
+
+	if (sendResponse) {
+
+		res.send(obj);
+	}
+	else {
+
+		return obj;
+	}
 }
 
 
-async function apiGetBots(req, res) {
+async function apiGetBots(req, res, sendResponse = true) {
 
 	let query = {};
 	let botsSort = [];
@@ -228,14 +437,18 @@ async function apiGetBots(req, res) {
 
 			let bot = bots[i];
 
-			bot = await removeDbKeys(bot);
+			bot = await shareData.DCABot.removeDbKeys(bot);
 
 			const config = JSON.parse(JSON.stringify(bot.config));
+
+			const maxFundsObj = await shareData.DCABot.calculateMaxFunds(config);
 
 			delete bot.date;
 			delete bot.config;
 
-			const botData = Object.assign({}, bot, config);
+			const maxFundsCamelCaseObj = shareData.Common.convertToCamelCase(maxFundsObj);
+
+			const botData = Object.assign({}, bot, config, maxFundsCamelCaseObj);
 
 			bots[i] = botData;
 		}
@@ -244,7 +457,16 @@ async function apiGetBots(req, res) {
 		botsSort = botsSort.reverse();
 	}
 
-	res.send( { 'date': new Date(), 'data': botsSort } );
+	const resObj = { 'date': new Date(), 'data': botsSort };
+
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+	else {
+
+		return resObj;
+	}
 }
 
 
@@ -253,97 +475,35 @@ async function apiGetDealsHistory(req, res, sendResponse) {
 	const days = 1;
 	const maxResults = 100;
 
-	let dateTo;
-	let dateFrom;
-	let dealsArr = [];
-
 	let fromDate = req.query.from;
-	let toDate = req.query.to;
+	let toDate = req.query.to || fromDate;
+	const timeZoneOffset = req.query.timeZoneOffset;
 	const botId = req.query.botId;
 
-	if (toDate == undefined || toDate == null || toDate == '') {
-		
-		toDate = fromDate;
-	}
+	let query = { 'sellData': { '$exists': true }, 'status': 1 };
+	let queryOptions = { sort: { 'sellData.date': -1 } };
 
-	const tzData = shareData.Common.getTimeZone();
-
-	const timeZoneOffset = tzData['offset'];
-
-	let	query = { 'sellData': { '$exists': true }, 'status': 1 };
-
-	let queryOptions = {
-							'sort': { 'sellData.date': -1 }
-					   };
-
-	if (fromDate == undefined || fromDate == null || fromDate == '') {
+	if (!fromDate) {
 
 		queryOptions['limit'] = maxResults;
-		
-		//dateFrom = new Date(new Date().getTime() - (days * 24 * 60 * 60 * 1000));
-		//dateTo = new Date(new Date(dateFrom).getTime() + (days * 24 * 60 * 60 * 1000));
 	}
 	else {
 
-		dateFrom = new Date(fromDate + 'T00:00:00' + timeZoneOffset);
-		dateTo = new Date(toDate + 'T23:59:59' + timeZoneOffset);
+		const dateFrom = new Date(`${fromDate}T00:00:00${timeZoneOffset}`);
+		const dateTo = new Date(new Date(`${toDate}T00:00:00${timeZoneOffset}`).getTime() + 86400000);
 
-		query['sellData.date'] = { '$gte': dateFrom, '$lte': dateTo };
+		query['sellData.date'] = { '$gte': dateFrom, '$lt': dateTo };
 	}
 
-	if (botId && botId != 'Default') {
+	if (botId && botId !== 'Default') {
 
 		query['botId'] = botId;
 	}
 
 	const dealsHistory = await shareData.DCABot.getDeals(query, queryOptions);
+	const dealsArr = await getProcessedDeals(dealsHistory || []);
 
-	if (dealsHistory != undefined && dealsHistory != null && dealsHistory != '') {
-
-		for (let i = 0; i < dealsHistory.length; i++) {
-
-			const deal = dealsHistory[i];
-			const sellData = deal.sellData;
-			const orders = deal.orders;
-
-			let orderCount = 0;
-
-			for (let x = 0; x < orders.length; x++) {
-
-				const order = orders[x];
-
-				if (order['filled']) {
-
-					orderCount++;
-				}
-			}
-
-			if (orderCount > 0 && (sellData.date != undefined && sellData.date != null)) {
-
-				const profitPerc = Number(sellData.profit);
-
-				const profit = shareData.Common.roundAmount(Number((Number(orders[orderCount - 1]['sum']) * (profitPerc / 100))));
-
-				const dataObj = {
-									'bot_id': deal.botId,
-									'bot_name': deal.botName,
-									'deal_id': deal.dealId,
-									'pair': deal.pair.toUpperCase(),
-									'date_start': new Date(deal.date),
-									'date_end': new Date(sellData.date),
-									'profit': profit,
-									'profit_percent': profitPerc,
-									'safety_orders': orderCount - 1
-								};
-
-				dealsArr.push(dataObj);
-			}
-		}
-	}
-
-	dealsArr = shareData.Common.sortByKey(dealsArr, 'date_end');
-
-	let obj = { 'date': new Date(), 'data': dealsArr.reverse() };
+	const obj = { date: new Date(), data: dealsArr };
 
 	if (sendResponse) {
 
@@ -356,7 +516,7 @@ async function apiGetDealsHistory(req, res, sendResponse) {
 }
 
 
-async function apiShowDeal(req, res, dealId) {
+async function apiShowDeal(req, res, dealId, sendResponse = true) {
 
 	let content;
 	let priceLast;
@@ -370,7 +530,7 @@ async function apiShowDeal(req, res, dealId) {
 
 		let price;
 
-		const dealDataDb = await removeDbKeys(JSON.parse(JSON.stringify(data[0])));
+		const dealDataDb = await shareData.DCABot.removeDbKeys(JSON.parse(JSON.stringify(data[0])));
 
 		const updated = dealDataDb['updatedAt'];
 		const sellData = dealDataDb['sellData'];
@@ -411,85 +571,221 @@ async function apiShowDeal(req, res, dealId) {
 		content = 'Invalid Deal ID';
 	}
 
-	res.send({ 'date': new Date(), 'success': success, 'data': content });
+	const resObj = { 'date': new Date(), 'success': success, 'data': content };
+
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+	else {
+
+		return resObj;
+	}
 }
 
 
-async function apiGetActiveDeals(req, res) {
+async function apiGetActiveDeals(req, res, sendResponse = true) {
 
-	let query = {};
-	let dealsArr = [];
-	let dealsSort = [];
-
-	let botsActiveObj = {};
-
-	const body = req.body;
+	const body = req.query;
 
 	let active = body.active;
 
-	if (active == undefined || active == null || active == '') {
+	const deals = await shareData.DCABot.getActiveDeals(active);
 
-		active = true;
-	}
+	const cbActive = shareData.appData.circuit_breaker_active || null;
+	const cbClearsAt = shareData.appData.circuit_breaker_clears_at || null;
 
-	const bots = await shareData.DCABot.getBots({ 'active': active });
+	// Portfolio summary — balance from cache (no blocking exchange call) and
+	// total max funds computed across all active deals from their configs.
+	let portfolioSummary = null;
 
-	const dealTracker = await shareData.DCABot.getDealTracker();
+	try {
 
-	if (bots && bots.length > 0) {
+		// Get account_balance_currencies from config (e.g. ['USD','USDT','USDC'])
+		const exchangeConfig = shareData.appData.bots?.exchange?.default || {};
+		const balanceCurrencies = Array.isArray(exchangeConfig.account_balance_currencies)
+			? exchangeConfig.account_balance_currencies
+			: [];
 
-		for (let i = 0; i < bots.length; i++) {
+		// Detect sandbox mode from active deals.
+		// Always read sandBoxWallet from the live bot config so changes in the
+		// UI take effect immediately without needing to restart deals.
+		// When running under Hub, prefer the per-instance sandbox_wallet_override
+		// stored in shareData.appData (set from hub.json overrides) so each
+		// instance maintains its own wallet value independently of the shared bot.json.
+		let isSandbox     = false;
+		let sandboxWallet = 0;
 
-			let bot = bots[i];
+		if (Array.isArray(deals) && deals.length > 0) {
 
-			const botId = bot.botId;
-			const botName = bot.botName;
+			const sandboxDeal = deals.find(d => d?.config?.sandBox);
 
-			botsActiveObj[botId] = botName;
+			if (sandboxDeal) {
+
+				isSandbox = true;
+
+				// Hub per-instance override takes priority
+				if (shareData.appData.sandbox_wallet_override !== undefined && shareData.appData.sandbox_wallet_override !== null) {
+
+					sandboxWallet = parseFloat(shareData.appData.sandbox_wallet_override) || 0;
+				}
+				else {
+
+					// Read from live bot config — updated immediately when user saves in UI
+					const botConfigFile = shareData.appData.bot_config;
+					const botConfig     = await shareData.Common.getConfig(botConfigFile);
+					sandboxWallet       = parseFloat(botConfig?.data?.sandBoxWallet) || 0;
+				}
+			}
 		}
-	}
 
-	// Remove sensitive data
-	for (let dealId in dealTracker) {
+		// Build per-exchange balances filtered to configured currencies only
+		const filteredBalances = {};
+		let portfolioTotal = 0;
 
-		let botActive = true;
+		if (isSandbox) {
 
-		let obj = {};
+			// Sandbox mode — use configured wallet amount as portfolio total
+			// Show it under the first configured currency
+			const quoteCcy = balanceCurrencies[0] || 'USD';
+			filteredBalances['Sandbox'] = { [quoteCcy]: { free: sandboxWallet, total: sandboxWallet } };
+			portfolioTotal = sandboxWallet;
+		}
+		else {
 
-		let deal = dealTracker[dealId];
+			// Live mode — read from balance cache populated by background refresh in DCABot.js.
+			// Fall back to getBalanceTracker() on first load before the interval has fired.
+			let balanceTracker = shareData.DCABot.getBalanceCache();
 
-		let botId = deal['deal']['botId'];
-		let config = deal['deal']['config'];
-		let info = JSON.parse(JSON.stringify(deal['info']));
+			if (!balanceTracker?.updated) {
 
-		let dealRoot = deal['deal'];
+				balanceTracker = await shareData.DCABot.getBalanceTracker();
+			}
 
-		dealRoot = await removeDbKeys(dealRoot);
-		dealRoot['config'] = await shareData.DCABot.removeConfigData(config);
+			const balances = balanceTracker?.balances || {};
 
-		if (botsActiveObj[botId] == undefined || botsActiveObj[botId] == null) {
+			for (const exchangeName in balances) {
 
-			botActive = false;
+				const exchangeData = balances[exchangeName];
+
+				filteredBalances[exchangeName] = {};
+
+				for (const currency of balanceCurrencies) {
+
+					const entry = exchangeData[currency];
+
+					if (entry != null) {
+
+						const free  = parseFloat(entry?.free  ?? entry ?? 0) || 0;
+						const total = parseFloat(entry?.total ?? entry ?? 0) || 0;
+
+						filteredBalances[exchangeName][currency] = { free, total };
+						portfolioTotal += free;
+					}
+				}
+			}
+
+			portfolioSummary = portfolioSummary || {};
+			portfolioSummary['balance_updated'] = balanceTracker?.updated || null;
 		}
 
-		obj = Object.assign({}, obj, dealRoot);
+		// Total max funds across all active deals
+		let totalMaxFunds = 0;
 
-		obj['info'] = info;
-		obj['info']['bot_active'] = botActive;
+		if (Array.isArray(deals)) {
 
-		obj = shareData.Common.convertStringToNumeric(obj);
+			for (const deal of deals) {
 
-		dealsArr.push(obj);
+				const mf = parseFloat(deal?.info?.max_funds ?? 0);
+
+				if (!isNaN(mf)) totalMaxFunds += mf;
+			}
+		}
+
+		totalMaxFunds = Math.round(totalMaxFunds * 100) / 100;
+
+		// Risk % = total max funds / portfolio total * 100
+		const riskPercent = portfolioTotal > 0
+			? Math.round((totalMaxFunds / portfolioTotal) * 100)
+			: null;
+
+		// In deals = sum of filled order amounts (USD cost) across all active deals.
+		// Each order.amount = price × qty = quote currency cost (e.g. USD).
+		// order.sum is the cumulative cost up to that order — use the last filled
+		// order's sum per deal for the total capital deployed in that deal.
+		let inDeals = 0;
+
+		if (Array.isArray(deals)) {
+
+			for (const deal of deals) {
+
+				const orders = deal?.orders;
+
+				if (!Array.isArray(orders)) continue;
+
+				const filledOrders = orders.filter(o => o.filled == 1 || o.filled === true);
+
+				if (filledOrders.length > 0) {
+
+					// sum on the last filled order is the cumulative USD cost
+					const lastFilled = filledOrders[filledOrders.length - 1];
+					const dealCost   = parseFloat(lastFilled?.sum ?? 0);
+
+					if (!isNaN(dealCost) && dealCost > 0) {
+
+						inDeals += dealCost;
+					}
+					else {
+
+						// Fallback: sum individual order amounts
+						inDeals += filledOrders.reduce((acc, o) => acc + (parseFloat(o.amount) || 0), 0);
+					}
+				}
+			}
+		}
+
+		const availFunds = Math.round((portfolioTotal - inDeals) * 100) / 100;
+
+		portfolioSummary = {
+			'balances':           filteredBalances,
+			'balance_currencies': balanceCurrencies,
+			'portfolio_total':    Math.round(portfolioTotal * 100) / 100,
+			'total_max_funds':    totalMaxFunds,
+			'in_deals':           Math.round(inDeals * 100) / 100,
+			'avail_funds':        availFunds,
+			'risk_percent':       riskPercent,
+			'is_sandbox':         isSandbox,
+			'balance_updated':    isSandbox ? null : (portfolioSummary?.balance_updated || null),
+		};
+	}
+	catch (e) {
+
+		shareData.Common.logger('Portfolio summary error: ' + e.message);
 	}
 
-	dealsSort = shareData.Common.sortByKey(dealsArr, 'date');
-	dealsSort = dealsSort.reverse();
+	const obj = {
+		'date': new Date(),
+		'data': deals,
+		'circuit_breaker': cbActive ? {
+			'active': true,
+			'reason': cbActive,
+			'clears_at': cbClearsAt
+		} : null,
+		'portfolio': portfolioSummary,
+	};
 
-	res.send( { 'date': new Date(), 'data': dealsSort } );
+	if (sendResponse) {
+
+		res.send(obj);
+	}
+	else {
+
+		return obj;
+	}
 }
 
 
-async function apiUpdateDeal(req, res) {
+async function apiUpdateDeal(req, res, sendResponse = true, directDealId = null, directData = null) {
 
 	let success = true;
 	let isUpdate = false;
@@ -497,18 +793,20 @@ async function apiUpdateDeal(req, res) {
 
 	let content;
 
-	const body = req.body;
-	const dealId = req.params.dealId;
+	// Extract params from req for HTTP path, or from direct params for Worker path
+	const dealId          = directDealId   ?? req?.params?.dealId;
+	const body            = directData     ?? req?.body ?? {};
 
-	let dealLast = body.dealLast;
-	const dcaMaxOrder = body.dcaMaxOrder;
+	let dealLast              = body.dealLast;
+	const dcaMaxOrder         = body.dcaMaxOrder;
 	const dcaTakeProfitPercent = body.dcaTakeProfitPercent;
+	const profitCurrency      = body.profitCurrency;
 
 	const data = await shareData.DCABot.getDeals({ 'dealId': dealId });
 
 	if (data && data.length > 0) {
 
-		let dealData = await removeDbKeys(JSON.parse(JSON.stringify(data[0])));
+		let dealData = await shareData.DCABot.removeDbKeys(JSON.parse(JSON.stringify(data[0])));
 
 		const status = dealData['status'];
 		const filledOrders = dealData.orders.filter(item => item.filled == 1);
@@ -562,6 +860,12 @@ async function apiUpdateDeal(req, res) {
 				dealLastUpdate = true;
 			}
 
+			// Set profitCurrency if defined to not change current status
+			if (profitCurrency != undefined && profitCurrency != null && profitCurrency != '') {
+
+				config['profitCurrency'] = profitCurrency;
+			}
+
 			// Override max safety orders if set
 			if (dcaMaxOrder != undefined && dcaMaxOrder != null) {
 
@@ -592,8 +896,8 @@ async function apiUpdateDeal(req, res) {
 			// Block updating until refactoring calculations can be implemented
 			if (isUpdate && manualOrders.length > 0) {
 
-				success = false;
-				content = 'Take profit percentage or max safety orders cannot be changed when manual orders are placed';
+				//success = false;
+				//content = 'Take profit percentage or max safety orders cannot be changed when manual orders are placed';
 			}
 
 			if (success) {
@@ -617,10 +921,11 @@ async function apiUpdateDeal(req, res) {
 				// Only calculate if orders or tp were set
 				if (data && data['orders']['success']) {
 
-					let orderHeaders = data['orders']['data']['orders']['headers'];
-					let orderSteps = data['orders']['data']['orders']['steps'];
 					let orderContent = data['orders']['data']['content'];
 					let ordersMetadata = data['orders']['data']['metadata'];
+
+					// Use structured data directly — no text parsing needed
+					let orderSteps = data['orders']['data']['orders']['structured'] || data['orders']['data']['orders']['steps'];
 
 					let maxDeviationPercent = orderContent['max_deviation_percent'];
 
@@ -635,6 +940,13 @@ async function apiUpdateDeal(req, res) {
 					}
 					else {
 
+						// Reserve the pair slot in startDealTracker before stopping the deal.
+						// This prevents the fast pre-enqueue pairMax check in requestDealStart
+						// from allowing a competing signal or ASAP start to claim the slot
+						// during the gap between stopDeal and resumeDeal.
+						const editReserveId = shareData.Common.uuidv4();
+						await shareData.DCABot.createStartDealTracker(editReserveId, botId);
+
 						let stopData = await shareData.DCABot.stopDeal(dealId);
 
 						// Verify deal is stopped
@@ -645,6 +957,16 @@ async function apiUpdateDeal(req, res) {
 
 							// Update deal in database
 							let dataUpdate = await shareData.DCABot.updateDeal(botId, dealId, { 'config': config, 'orders': ordersNew });
+
+							let recalcObj = await shareData.DCABot.recalculateOrders({
+								'exchange': undefined,
+								'dealId': dealId,
+								'orderIndex': undefined,
+								'orderNo': 1,
+								'orderId': undefined,
+								'price': undefined,
+								'dryRun': false
+							});
 
 							// Check for active deal and resume
 							let dealActive = await shareData.DCABot.getDeals({ 'status': 0, 'dealId': dealId });
@@ -668,6 +990,9 @@ async function apiUpdateDeal(req, res) {
 							success = false;
 							content = stopData['data'];
 						}
+
+						// Release the reservation once resumeDeal has completed (or failed)
+						await shareData.DCABot.deleteStartDealTracker(editReserveId);
 					}
 				}
 				else {
@@ -699,11 +1024,18 @@ async function apiUpdateDeal(req, res) {
 
 	shareData.Common.logger('API Update Deal: ' + JSON.stringify(resObj));
 
-	res.send(resObj);
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+	else {
+
+		return resObj;
+	}
 }
 
 
-async function apiPanicSellDeal(req, res) {
+async function apiPanicSellDeal(req, res, sendResponse = true) {
 
 	let success = true;
 
@@ -715,7 +1047,7 @@ async function apiPanicSellDeal(req, res) {
 
 	if (data && data.length > 0) {
 
-		let dealData = await removeDbKeys(JSON.parse(JSON.stringify(data[0])));
+		let dealData = await shareData.DCABot.removeDbKeys(JSON.parse(JSON.stringify(data[0])));
 
 		const status = dealData['status'];
 
@@ -745,11 +1077,16 @@ async function apiPanicSellDeal(req, res) {
 
 	shareData.Common.logger('API Panic Sell Deal: ' + JSON.stringify(resObj));
 
-	res.send(resObj);
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+
+	return resObj;
 }
 
 
-async function apiPauseDeal(req, res) {
+async function apiPauseDeal(req, res, sendResponse = true) {
 
 	let success = true;
 
@@ -765,7 +1102,7 @@ async function apiPauseDeal(req, res) {
 
 	if (data && data.length > 0) {
 
-		let dealData = await removeDbKeys(JSON.parse(JSON.stringify(data[0])));
+		let dealData = await shareData.DCABot.removeDbKeys(JSON.parse(JSON.stringify(data[0])));
 
 		const botId = dealData.botId;
 		const status = dealData['status'];
@@ -785,7 +1122,8 @@ async function apiPauseDeal(req, res) {
 				pauseSell = false;
 			}
 
-			const pauseData = await shareData.DCABot.pauseDeal(botId, dealId, pause, pauseBuy, pauseSell);
+			// Clear pauseReason on manual pause/resume — user is taking control
+			const pauseData = await shareData.DCABot.pauseDeal(botId, dealId, pause, pauseBuy, pauseSell, '');
 
 			if (!pauseData['success']) {
 
@@ -804,11 +1142,16 @@ async function apiPauseDeal(req, res) {
 
 	shareData.Common.logger('API Pause Deal: ' + JSON.stringify(resObj));
 
-	res.send(resObj);
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+
+	return resObj;
 }
 
 
-async function apiCancelDeal(req, res) {
+async function apiCancelDeal(req, res, sendResponse = true) {
 
 	let success = true;
 
@@ -820,7 +1163,7 @@ async function apiCancelDeal(req, res) {
 
 	if (data && data.length > 0) {
 
-		let dealData = await removeDbKeys(JSON.parse(JSON.stringify(data[0])));
+		let dealData = await shareData.DCABot.removeDbKeys(JSON.parse(JSON.stringify(data[0])));
 
 		const status = dealData['status'];
 		
@@ -850,11 +1193,16 @@ async function apiCancelDeal(req, res) {
 
 	shareData.Common.logger('API Cancel Deal: ' + JSON.stringify(resObj));
 
-	res.send(resObj);
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+
+	return resObj;
 }
 
 
-async function apiAddFundsDeal(req, res) {
+async function apiAddFundsDeal(req, res, sendResponse = true) {
 
 	let success = true;
 	let isValid = true;
@@ -872,7 +1220,7 @@ async function apiAddFundsDeal(req, res) {
 
 	if (isValid && data && data.length > 0) {
 
-		let dealData = await removeDbKeys(JSON.parse(JSON.stringify(data[0])));
+		let dealData = await shareData.DCABot.removeDbKeys(JSON.parse(JSON.stringify(data[0])));
 
 		const status = dealData['status'];
 		
@@ -931,7 +1279,33 @@ async function apiAddFundsDeal(req, res) {
 
 	shareData.Common.logger('API Add Funds: ' + JSON.stringify(resObj));
 
-	res.send(resObj);
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+
+	return resObj;
+}
+
+
+async function apiGetBalances(req, res, sendResponse = true) {
+
+	let success = true;
+
+	const balances = await shareData.DCABot.getBalanceCache();
+
+	const resObj = { 'date': new Date(), 'success': success, 'data': balances };
+
+	shareData.Common.logger('API Get Balances: ' + JSON.stringify(resObj));
+
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+	else {
+
+		return resObj;
+	}
 }
 
 
@@ -957,7 +1331,7 @@ async function apiCreateUpdateBot(req, res) {
 	const body = req.body;
 
 	const botNamePassed = body.botName;
-	const createStep = body.createStep;
+	const createStep = body.createStep ?? '';
 
 	if (body.pair == undefined || body.pair == null || body.pair == '') {
 
@@ -1009,6 +1383,11 @@ async function apiCreateUpdateBot(req, res) {
 
 		// Add property bot_max_funds to orders object by calculating deal max funds multiplied by numbers of pairs
 		orders['data']['content']['bot_max_funds'] = bot_maxFunds();
+
+		// Add currency symbol derived from quote of first selected pair
+		const previewPair = Array.isArray(pairs) ? (pairs[0] || '') : (pairs || '');
+		const previewQuote = previewPair.split('/')[1] || '';
+		orders['data']['content']['currency_symbol'] = shareData.Common.getCurrencySymbol(previewQuote);
 	}
 
 	if (botData.startConditions != undefined && botData.startConditions != null) {
@@ -1047,37 +1426,22 @@ async function apiCreateUpdateBot(req, res) {
 					let pairCount = 0;
 					let notify = true;
 
-					let pairMax = configObj.pairMax;
-
-					if (pairMax == undefined || pairMax == null || pairMax == '') {
-
-						pairMax = 0;
-					}
-
-					// Start bot
+					// requestDealStart handles all checks (blacklist, pairMax, globalPairLimit)
+					// inside the serial queue — no pre-check needed here
 					for (let i = 0; i < pairs.length; i++) {
 
-						if (pairMax == 0 || pairCount < pairMax) {
+						const pair = pairs[i];
 
-							let pair = pairs[i];
+						let config = JSON.parse(JSON.stringify(configObj));
+						config['pair'] = pair;
 
-							const isPairBlackListed = await shareData.Common.pairBlackListed(pair);
+						if (i === 0 && notify) {
 
-							if (!isPairBlackListed) {
-
-								let config = JSON.parse(JSON.stringify(configObj));
-								config['pair'] = pair;
-
-								if (pairCount > 0) {
-
-									notify = false;
-								}
-
-								pairCount++;
-
-								shareData.DCABot.startDelay({ 'config': config, 'delay': i + 1, 'notify': notify });
-							}
+							const msg = config.botName + ' (' + pair.toUpperCase() + ') Start command received.';
+							shareData.Common.sendNotification({ 'message': msg, 'type': 'bot_start', 'telegram_id': shareData.appData.telegram_id });
 						}
+
+						shareData.DCABot.requestDealStart(config, i + 1, 'bot create');
 					}
 				}
 			}
@@ -1131,31 +1495,17 @@ async function apiCreateUpdateBot(req, res) {
 
 						let pair = pairs[i];
 
-						const isPairBlackListed = await shareData.Common.pairBlackListed(pair);
+						const dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
 
-						if (!isPairBlackListed) {
+						let config = bot[0]['config'];
+						config['pair'] = pair;
+						config = await shareData.DCABot.applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
 
-							let dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
+						if (bot && bot.length > 0 && bot[0]['active'] && startCondition == 'asap') {
 
-							let config = bot[0]['config'];
-
-							let pairMax = config.pairMax;
-
-							if (pairMax == undefined || pairMax == null || pairMax == '') {
-
-								pairMax = 0;
-							}
-
-							config['pair'] = pair;
-							config = await shareData.DCABot.applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
-
-							// Start bot if active, no deals are currently running and start condition is now asap
-							if (bot && bot.length > 0 && bot[0]['active'] && dealsActive.length == 0 && (pairMax == 0 || pairCount < pairMax) && startCondition == 'asap') {
-
-								pairCount++;
-
-								shareData.DCABot.startDelay({ 'config': config, 'delay': i + 1, 'notify': false });
-							}
+							// requestDealStart handles all checks inside the serial queue
+							shareData.DCABot.requestDealStart(config, i + 1, 'bot update');
+							pairCount++;
 						}
 					}
 				}
@@ -1203,24 +1553,23 @@ async function apiCreateUpdateBot(req, res) {
 }
 
 
-async function apiEnableDisableBot(req, res) {
+async function apiEnableDisableBot(req, res, sendResponse = true, directBotId = null, directActive = null) {
 
 	let msg;
 	let active;
 	let success = true;
 
-	const body = req.body;
+	// Extract params from req for HTTP path, or from direct params for Worker path
+	if (directActive !== null && directActive !== undefined) {
 
-	if (req.path.indexOf('enable') > -1) {
-
-		active = true;
+		active = directActive;
 	}
 	else {
-	
-		active = false;
+
+		active = req?.path?.indexOf('enable') > -1;
 	}
 
-	const botId = req.params.botId;
+	const botId = directBotId ?? req?.params?.botId;
 
 	const bots = await shareData.DCABot.getBots({ 'botId': botId });
 
@@ -1250,45 +1599,28 @@ async function apiEnableDisableBot(req, res) {
 
 			let pairCount = botDealsActive.length;
 
+			const pairMax = Number(bot['config']['pairMax']) || 0;
+
 			for (let i = 0; i < pairs.length; i++) {
 
-				let pair = pairs[i];
-				let dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
+				// Early exit — no point enqueueing starts that are guaranteed to be blocked
+				if (pairMax > 0 && pairCount >= pairMax) break;
+
+				const pair = pairs[i];
+				const dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
 
 				let config = bot['config'];
+				config['pair'] = pair;
+				config = await shareData.DCABot.applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
 
-				let pairMax = config.pairMax;
+				const startCondition = config['startConditions']?.[0]?.toLowerCase() || 'asap';
 
-				if (pairMax == undefined || pairMax == null || pairMax == '') {
+				// Only start if first condition is asap
+				// requestDealStart handles all checks inside the serial queue
+				if (startCondition === 'asap') {
 
-					pairMax = 0;
-				}
-
-				const isPairBlackListed = await shareData.Common.pairBlackListed(pair);
-
-				// Start bot if active and no deals currently running and not blacklisted
-				if (dealsActive.length == 0 && !isPairBlackListed) {
-
-					let startCondition;
-
-					config['pair'] = pair;
-					config = await shareData.DCABot.applyConfigData({ 'bot_id': botId, 'bot_name': botName, 'config': config });
-
-					if (config['startConditions'] != undefined && config['startConditions'] != null && config['startConditions'] != '') {
-
-						startCondition = config['startConditions'][0].toLowerCase();
-					}
-
-					// Only start bot if first condition is asap
-					if (startCondition == undefined || startCondition == null || startCondition == '' || startCondition == 'asap') {
-
-						if (pairMax == 0 || pairCount < pairMax) {
-
-							pairCount++;
-
-							shareData.DCABot.startDelay({ 'config': config, 'delay': i + 1, 'notify': false });
-						}
-					}
+					shareData.DCABot.requestDealStart(config, i + 1, 'bot enable');
+					pairCount++;
 				}
 			}
 		}
@@ -1328,25 +1660,79 @@ async function apiEnableDisableBot(req, res) {
 		msg = 'Invalid Bot ID';
 	}
 
-	const resObj = { 'date': new Date(), 'success': success, 'data': msg };
+	const resObj = { 'date': new Date(), 'success': success, 'data': msg, 'botName': (bots[0] ? bots[0].botName : '') };
 
 	shareData.Common.logger('API Enable / Disable Bot: ' + JSON.stringify(resObj));
 
-	res.send(resObj);
+	if (sendResponse) {
+
+		res.send(resObj);
+	}
+	else {
+
+		return resObj;
+	}
 }
 
 
-async function apiStartDeal(req, res) {
+async function apiDeleteBot(req, res) {
 
-	const taskObj = { 'req': req, 'res': res, 'name': 'start_deal' };
+	let success = false;
+	let message = '';
 
-	queueStartDeal.add(taskObj, apiStartDealProcess);
+	try {
+
+		const botId = req?.params?.botId;
+
+		if (!botId) {
+
+			message = 'Bot ID is required.';
+		}
+		else {
+
+			// Check for active deals
+			const activeDeals = await shareData.DCABot.getDeals({ 'botId': botId, 'status': 0 });
+
+			if (activeDeals && activeDeals.length > 0) {
+
+				message = `Cannot delete bot: ${activeDeals.length} active deal(s) exist. Close or cancel all deals before deleting.`;
+			}
+			else {
+
+				// Delete all deal history for this bot
+				const dealsDeleted = await shareData.DCABot.deleteDeals({ 'botId': botId });
+
+				// Delete the bot
+				const botDeleted = await shareData.DCABot.deleteBot({ 'botId': botId });
+
+				if (botDeleted) {
+
+					success = true;
+					message = 'Bot and all associated deal history deleted successfully.';
+
+					shareData.Common.logger(`Bot deleted: ${botId} — ${dealsDeleted} deal history records removed.`);
+				}
+				else {
+
+					message = 'Bot not found.';
+				}
+			}
+		}
+	}
+	catch (error) {
+
+		message = 'Error deleting bot: ' + error.message;
+		shareData.Common.logger(message);
+	}
+
+	res.json({ success, message });
 }
 
 
-async function apiStartDealProcess(req, res, taskObj) {
+async function apiStartDeal(req, res, sendResponse = true) {
 
 	let msg;
+	let dealId;
 	let startDelayConfig;
 
 	let success = true;
@@ -1405,69 +1791,15 @@ async function apiStartDealProcess(req, res, taskObj) {
 				msg = 'Pair is not in bot configuration';
 			}
 
-			if (pairFound) {
-
-				const isPairBlackListed = await shareData.Common.pairBlackListed(pair);
-
-				if (isPairBlackListed) {
-
-					success = false;
-					msg = 'Pair is blacklisted';
-				}
-			}
-
-			if (success) {
-
-				let dealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'pair': pair, 'status': 0 });
-
-				// Get total active pairs currently running on bot
-				let botDealsActive = await shareData.DCABot.getDeals({ 'botId': botId, 'status': 0 });
-
-				let pairCount = botDealsActive.length;
+			if (pairFound && success) {
 
 				let config = bot['config'];
+				config['pair'] = pair;
+				config = await shareData.DCABot.applyConfigData({ 'signal_id': signalId, 'bot_id': botId, 'bot_name': botName, 'config': config });
 
-				let pairMax = config.pairMax;
-				let pairDealsMax = config.pairDealsMax;
-
-				if (pairMax == undefined || pairMax == null || pairMax == '') {
-
-					pairMax = 0;
-				}
-
-				if (pairDealsMax == undefined || pairDealsMax == null || pairDealsMax == '') {
-
-					pairDealsMax = 0;
-				}
-
-				// Start bot if active and no deals currently running or pair deals is less than max set
-				if (dealsActive.length == 0 || dealsActive.length < pairDealsMax) {
-
-					if (pairMax == 0 || pairCount < pairMax) {
-
-						config['pair'] = pair;
-						config = await shareData.DCABot.applyConfigData({ 'signal_id': signalId, 'bot_id': botId, 'bot_name': botName, 'config': config });
-
-						startDelayConfig = config;
-					}
-					else {
-
-						success = false;
-						msg = 'Bot max ' + pairMax + ' pairs reached';
-					}
-				}
-				else {
-
-					let displayMax = pairDealsMax;
-
-					if (displayMax < 2) {
-
-						displayMax = 1;
-					}
-
-					success = false;
-					msg = pair + ' pair max ' + displayMax + ' deals already running';
-				}
+				// All further checks (blacklist, pairMax, globalPairLimit, active deals)
+				// are handled authoritatively inside requestDealStart on the serial queue.
+				startDelayConfig = config;
 			}
 		}
 	}
@@ -1480,23 +1812,38 @@ async function apiStartDealProcess(req, res, taskObj) {
 
 	if (startDelayConfig != undefined && startDelayConfig != null) {
 
-		let finished = false;
-
 		const startId = await shareData.DCABot.startDelay({ 'config': startDelayConfig, 'delay': startDelaySec, 'notify': false });
 
-		// Wait for start deal tracker to be removed to confirm deal started
-		while (!finished) {
+		// Poll until the startDealTracker entry is removed, which confirms the
+		// deal has been committed to the database and entered the deal tracker.
+		// Timeout after 30 seconds to avoid hanging the response indefinitely.
+		const maxWaitMs  = 30000;
+		const pollMs     = 250;
+		const startedAt  = Date.now();
 
-			let trackerData = await shareData.DCABot.getStartDealTracker(startId);
+		while (Date.now() - startedAt < maxWaitMs) {
+
+			const trackerData = await shareData.DCABot.getStartDealTracker(startId);
 
 			if (trackerData == undefined || trackerData == null) {
 
-				finished = true;
-			}
-			else {
+				// Start tracker removed — deal is live. Find the dealId from meta.
+				const dealTracker = await shareData.DCABot.getDealTracker();
 
-				await shareData.Common.delay(500);
+				if (dealTracker && typeof dealTracker === 'object') {
+
+					dealId = Object.keys(dealTracker).find(id => dealTracker[id].meta?.start_id === startId);
+				}
+
+				if (dealId) {
+
+					msg = { 'deal_id': dealId };
+				}
+
+				break;
 			}
+
+			await shareData.Common.delay(pollMs);
 		}
 	}
 
@@ -1504,21 +1851,12 @@ async function apiStartDealProcess(req, res, taskObj) {
 
 	shareData.Common.logger('API Start Deal: ' + JSON.stringify(resObj));
 
-	queueStartDeal.callBack(res, resObj, taskObj);
-}
+	if (sendResponse) {
 
-
-async function removeDbKeys(bot) {
-
-	for (let key in bot) {
-
-		if (key.substr(0, 1) == '$' || key.substr(0, 1) == '_') {
-
-			delete bot[key];
-		}
+		res.send(resObj);
 	}
-	
-	return bot;
+
+	return resObj;
 }
 
 
@@ -1528,7 +1866,9 @@ async function calculateOrders(body) {
 	let active;
 
 	let pairs = body.pair;
-	const botConfig = await shareData.Common.getConfig('bot.json');
+
+	const botConfigFile = shareData.appData.bot_config;
+	const botConfig = await shareData.Common.getConfig(botConfigFile);
 
 	let botData = botConfig.data;
 
@@ -1570,8 +1910,10 @@ async function calculateOrders(body) {
 	botData.pair = pair;
 	botData.dealMax = body.dealMax;
 	botData.dealCoolDown = body.dealCoolDown;
+	botData.profitCurrency = body.profitCurrency;
 	botData.pairMax = body.pairMax;
 	botData.pairDealsMax = body.pairDealsMax;
+	botData.pairBotsDealsMax = body.pairBotsDealsMax;
 	botData.volumeMin = body.volumeMin;
 	botData.firstOrderPrice = body.firstOrderPrice;
 	botData.firstOrderAmount = body.firstOrderAmount;
@@ -1603,6 +1945,16 @@ async function calculateOrders(body) {
 		botData.pairDealsMax = 0;
 	}
 
+	if (botData.pairBotsDealsMax == undefined || botData.pairBotsDealsMax == null || botData.pairBotsDealsMax == '') {
+
+		botData.pairBotsDealsMax = 0;
+	}
+
+	if (botData.profitCurrency == undefined || botData.profitCurrency == null || botData.profitCurrency == '') {
+
+		botData.profitCurrency = 'quote';
+	}
+
 	// Check for bot id passed in from body for update
 	if (body.botId != undefined && body.botId != null && body.botId != '') {
 
@@ -1626,208 +1978,609 @@ async function calculateOrders(body) {
 }
 
 
-function insertValueToMap(map, key, value) {
-	if(!map[key]) {
-		map[key] = Number(value);
-	} else {
-		map[key] += Number(value);
-	}
+async function calculateMaxFundsExchange(configObj) {
+
+	let config = JSON.parse(JSON.stringify(configObj));
+
+	config['createStep'] = 'getOrders';
+	config['pair'] = config['pair'][0];
+
+	// Remove data to only calculate orders
+	delete config['botId'];
+	delete config['botName'];
+
+	// Set first start condition for calculate orders
+	config['startCondition'] = config['startConditions'][0];
+
+	const orderData = await calculateOrders(config);
+	const maxFunds = orderData.orders.data.content;
+
+	return maxFunds;
 }
 
-async function getDashboardData({ duration }) {
-	const { year, month, day } = shareData.Common.getDateParts(new Date());
-	const today = new Date(`${year}-${month}-${day}` + 'T23:59:59');
-	const X_DAYS_AGO = new Date();
-	X_DAYS_AGO.setDate(X_DAYS_AGO.getDate() - duration);
-	X_DAYS_AGO.setHours(0, 0, 0);
 
-	const { data } = await shareData.Common.getConfig('bot.json');
+async function getProcessedDeals(deals) {
 
-	const active_deals = await shareData.DCABot.getDeals({ status: 0 });
-	const complete_deals = await shareData.DCABot.getDeals({ status: 1, "sellData.date": { $gte: X_DAYS_AGO, $lte: today } });
-	const deal_tracker = await shareData.DCABot.getDealTracker();
-	const period = `${X_DAYS_AGO.toLocaleDateString()} - ${today.toLocaleDateString()}`
+	const processedDeals = [];
 
-	const isLoading = active_deals.length != Object.keys(deal_tracker).length;
+	const extractQtyValues = obj => Object.entries(obj).flatMap(([k, v]) => k === 'qty' ? [v] : (typeof v === 'object' && v ? extractQtyValues(v) : []));
 
-	let profit_by_bot_map = {};
-	let active_pl_map = {};
-	let profit_by_day_map = {};
-	let adjusted_pl_map = {};
-	let bot_deal_duration_map = {};
-	let bot_funds_in_use_map = {};
-	let total_profit = 0;
-	let total_in_deals = 0;
-	let total_pl = 0;
+	for (const deal of deals) {
 
-	let currencies = [];
+		const sellData = deal.sellData;
+		const orders = deal.orders;
+		const config = deal.config;
+		const profitCurrency = config?.profitCurrency || 'quote';
 
-	const available_balance = await (async () => {
+		let orderCount = orders.filter(o => o.filled).length;
 
-		if (shareData.appData.bots['exchange'] != undefined && shareData.appData.bots['exchange'] != null && typeof shareData.appData.bots['exchange'] == 'object') {
+		if (orderCount > 0 && sellData?.date) {
 
-			const exchangeObj = shareData.appData.bots['exchange'];
-	
-			for (let exchangeName in exchangeObj) {
-	
-				if (exchangeName.toLowerCase() == 'default') {
-	
-					const exchangeSingleObj = exchangeObj[exchangeName];
-	
-					const currenciesArr = exchangeSingleObj['account_balance_currencies'];
+			let profitBase, profitQuote, minMoveAmount;
 
-					if (typeof currenciesArr == 'object') {
+			const feeData = sellData.feeData;
+			const profitPerc = Number(sellData.profit);
 
-						currencies = currenciesArr;
-					}
+			const profitQuoteEstimate = shareData.Common.roundAmount(Number(orders[orderCount - 1]?.sum) * (profitPerc / 100));
+
+			minMoveAmount = feeData?.minMoveAmount ?? orders[orderCount - 1]?.orderMetadata?.minimum_movement_amount;
+
+			profitQuote = sellData.profitQuote ? Number(sellData.profitQuote) : profitQuoteEstimate;
+
+			if (sellData.profitBase) {
+
+				profitBase = Number(sellData.profitBase);
+			}
+			else {
+
+				let profitBaseEstimate = profitQuote / Number(sellData.price);
+				let adjusted = shareData.Common.adjustDecimals(profitBaseEstimate, minMoveAmount);
+
+				if (adjusted == 0) {
+
+					const qtyArr = extractQtyValues(orders);
+					adjusted = shareData.Common.adjustDecimals(profitBaseEstimate, minMoveAmount, qtyArr);
 				}
-			}
-		}
 
-		if (data.sandBox) {
-
-			let resObj = {};
-
-			for (let i = 0; i < currencies.length; i++) {
-
-				let currency = currencies[i];
-
-				resObj[currency] = data.sandBoxWallet;
+				profitBase = Number(adjusted);
 			}
 
-			return resObj;
-		}
-
-		const exchange = await shareData.DCABot.connectExchange(data);
-		const { success, balance } = await shareData.DCABot.getBalance(exchange);
-		if(!success) return {};
-		return balance;
-	})();
-
-	complete_deals.forEach((deal) => {
-		let orderCount = 0;
-
-		const { sellData, orders} = deal;
-
-		for(let i = 0; i<orders.length;i++) {
-			const order = orders[i];
-
-			if (order['filled']) {
-
-				orderCount++;
-			}
-		}
-
-		if (orderCount > 0 && (sellData.date != undefined && sellData.date != null)) {
-			if(sellData.profit && typeof sellData.profit == 'number') {
-				const profitPer = Number(sellData.profit);
-				const deal_profit = shareData.Common.roundAmount(Number((Number(orders[orderCount - 1]['sum']) * (profitPer / 100))));
-				insertValueToMap(profit_by_bot_map, deal.botName, deal_profit);
-				insertValueToMap(profit_by_day_map, deal.sellData.date.toDateString(), deal_profit);
-				total_profit += Number(deal_profit ?? 0);
-			}
-		}
-
-		// Add to Deal Duration Obj
-		const { date: dateStarted, sellData: { date: dateEnd } } = deal;
-		const duration = shareData.Common.dealDurationMinutes(dateStarted, dateEnd);
-		if(!bot_deal_duration_map[deal.botName]) {
-			bot_deal_duration_map[deal.botName] = [duration];
-		} else {
-			bot_deal_duration_map[deal.botName].push(duration);
-		}
-	})
-
-	for (const key in bot_deal_duration_map) {
-		const durations = bot_deal_duration_map[key];
-		const average = durations.reduce((acc, curr) => acc + curr, 0) / durations.length;
-		bot_deal_duration_map[key] = Math.round(average);
-	}
-
-	// Sort the object by date
-	profit_by_day_map = Object.fromEntries(Object.entries(profit_by_day_map).sort((a, b) => new Date(a[0]) - new Date(b[0])));
-
-
-	for(const key in deal_tracker) {
-		const { deal: { botName }, info: { profit } } = deal_tracker[key];
-		if(!profit || !botName) { continue; };
-		insertValueToMap(active_pl_map, botName, profit);
-		total_pl += profit;
-
-		const orders = deal_tracker[key].deal.orders;
-		let in_deal = 0;
-		for(let i=0; i < orders.length; i++) {
-			if(orders[i].filled) {
-				in_deal = Number(orders[i].sum);
-			} else {
-				break;
-			}
-		}
-		insertValueToMap(bot_funds_in_use_map, botName, in_deal);
-		total_in_deals += in_deal;
-	}
-
-	for(const key in profit_by_bot_map) {
-		const total = profit_by_bot_map[key] + active_pl_map[key];
-		if(total) {
-			adjusted_pl_map[key] = total;
+			processedDeals.push({
+				bot_id: deal.botId,
+				bot_name: deal.botName,
+				deal_id: deal.dealId,
+				pair: deal.pair.toUpperCase(),
+				date_start: new Date(deal.date),
+				date_end: new Date(sellData.date),
+				price: Number(sellData.price),
+				profit: profitQuote,
+				profit_base: profitBase,
+				profit_percent: profitPerc,
+				profit_currency: profitCurrency,
+				minimum_movement_amount: minMoveAmount,
+				safety_orders: orderCount - 1
+			});
 		}
 	}
 
-	// -- Sort Maps -- //
-	const bot_profit_array = Object.entries(profit_by_bot_map);
-	bot_profit_array.sort((a,b) =>  b[1] - a[1]);
-	profit_by_bot_map = Object.fromEntries(bot_profit_array)
-
-	const active_profit_array = Object.entries(active_pl_map);
-	active_profit_array.sort((a,b) =>  a[1] - b[1] );
-	active_pl_map = Object.fromEntries(active_profit_array);
-
-	const adjusted_pl_array = Object.entries(adjusted_pl_map);
-	adjusted_pl_array.sort((a,b) =>  b[1] - a[1]);
-	adjusted_pl_map = Object.fromEntries(adjusted_pl_array);
-
-	const bot_deal_duration_array = Object.entries(bot_deal_duration_map);
-	bot_deal_duration_array.sort((a,b) =>  b[1] - a[1]);
-	bot_deal_duration_map = Object.fromEntries(bot_deal_duration_array);
-
-	const bot_funds_in_use_array = Object.entries(bot_funds_in_use_map);
-	bot_funds_in_use_array.sort((a,b) =>  b[1] - a[1]);
-	bot_funds_in_use_map = Object.fromEntries(bot_funds_in_use_array);
+	return shareData.Common.sortByKey(processedDeals, 'date_end').reverse();
+}
 
 
-	return {
-		kpi: {
-			active_deals: Object.keys(deal_tracker).length,
-			total_in_deals,
-			available_balance,
-			total_profit,
-			total_pl
-		},
-		charts: {
-			profit_by_bot_map,
-			profit_by_day_map,
-			active_pl_map,
-			adjusted_pl_map,
-			bot_deal_duration_map,
-			bot_funds_in_use_map
-		},
-		currencies: currencies,
-		isLoading,
-		period
-	}
+async function getDashboardData({ duration, timeZoneOffset }) {
+
+	let maxDealsPerBot = 1;
+
+	const cleanedOffset = timeZoneOffset.replace(':', '');
+    const offsetSign = cleanedOffset.startsWith('-') ? -1 : 1;
+    const offsetHours = parseInt(cleanedOffset.slice(1, 3), 10);
+    const offsetMinutes = parseInt(cleanedOffset.slice(3), 10);
+    const totalOffsetMinutes = offsetSign * (offsetHours * 60 + offsetMinutes);
+
+    const localNow = new Date(Date.now() + totalOffsetMinutes * 60000);
+    const localDateOnly = new Date(localNow.getFullYear(), localNow.getMonth(), localNow.getDate());
+    const localMidnightUTC = new Date(localDateOnly.getTime() - totalOffsetMinutes * 60000);
+
+    const dateTo = new Date(localMidnightUTC.getTime() + 86400000 - 1);
+    const X_DAYS_AGO = new Date(localMidnightUTC.getTime() - duration * 86400000);
+
+    const botConfigFile = shareData.appData.bot_config;
+    const { data } = await shareData.Common.getConfig(botConfigFile);
+
+    const active_deals = await shareData.DCABot.getDeals({ status: 0 });
+    const raw_deals = await shareData.DCABot.getDeals({
+        status: 1,
+        'sellData.date': { $gte: X_DAYS_AGO, $lt: new Date(dateTo.getTime() + 1) }
+    });
+    const complete_deals = await getProcessedDeals(raw_deals);
+
+    const max_funds_deals = await shareData.DCABot.getDealsMaxUsedFunds(maxDealsPerBot);
+    const deal_tracker = await shareData.DCABot.getDealTracker();
+
+    const adjustedEndDate = new Date(dateTo.getTime() - 86400000);
+    const startParts = shareData.Common.getDateParts(X_DAYS_AGO, false);
+    const endParts = shareData.Common.getDateParts(adjustedEndDate, false);
+    const period = `${startParts.month}/${startParts.day}/${startParts.year} - ${endParts.month}/${endParts.day}/${endParts.year}`;
+
+    const isLoading = active_deals.length !== Object.keys(deal_tracker).length;
+
+    let profit_by_bot_map = {};
+    let active_pl_map = {};
+    let profit_by_day_map = {};
+    let adjusted_pl_map = {};
+    let bot_deal_duration_map = {};
+    let bot_funds_in_use_map = {};
+    let max_funds_deals_map = {};
+    let win_rate_map = {};
+    let pair_profit_map = {};
+    let so_utilisation_map = {};
+    let total_profit = 0;
+    let total_in_deals = 0;
+    let total_pl = 0;
+    let currencies = [];
+
+    // Available balance
+    const available_balance = await (async () => {
+        const exchangeObj = shareData.appData.bots?.exchange;
+        if (exchangeObj) {
+            for (let exchangeName in exchangeObj) {
+                if (exchangeName.toLowerCase() === 'default') {
+                    const exchangeSingleObj = exchangeObj[exchangeName];
+                    const currenciesArr = exchangeSingleObj['account_balance_currencies'];
+                    if (Array.isArray(currenciesArr)) currencies = currenciesArr;
+                }
+            }
+        }
+
+        if (data.sandBox) return Object.fromEntries(currencies.map(c => [c, data.sandBoxWallet]));
+
+        // Use the background balance cache instead of calling the exchange directly
+        // Cache is refreshed every 60s by the interval in DCABot.js initApp()
+        const balanceTracker = await shareData.DCABot.getBalanceCache();
+        const allBalances = balanceTracker?.balances || {};
+
+        // Merge all exchanges and filter to configured currencies
+        const merged = {};
+        for (const exName in allBalances) {
+            for (const currency of currencies) {
+                const entry = allBalances[exName]?.[currency];
+                if (entry != null) {
+                    const free = parseFloat(entry?.free ?? entry ?? 0) || 0;
+                    merged[currency] = (merged[currency] || 0) + free;
+                }
+            }
+        }
+        return merged;
+    })();
+
+    // Bot map helpers
+    const allBots = await shareData.DCABot.getBots();
+    const botIdNameMap = {};
+    allBots.forEach(bot => botIdNameMap[bot.botId] = bot.botName || `Bot (${bot.botId})`);
+
+    const getBotKey = (botIdOrName) => botIdNameMap[botIdOrName] || botIdOrName;
+
+    // Process completed deals
+    complete_deals.forEach(deal => {
+        const botKey = getBotKey(deal.botId || deal.bot_name);
+
+        // Profit by bot
+        if (!profit_by_bot_map[botKey]) profit_by_bot_map[botKey] = 0;
+        if (typeof deal.profit === 'number') {
+            profit_by_bot_map[botKey] += deal.profit;
+            total_profit += deal.profit;
+        }
+
+        // Profit by day
+        const localDealEnd = new Date(deal.date_end.getTime() + totalOffsetMinutes * 60000);
+        const dayKey = localDealEnd.toDateString();
+        profit_by_day_map[dayKey] = (profit_by_day_map[dayKey] || 0) + (deal.profit || 0);
+
+        // Deal duration
+        const durationMinutes = shareData.Common.dealDurationMinutes(deal.date_start, deal.date_end);
+        if (!bot_deal_duration_map[botKey]) bot_deal_duration_map[botKey] = [];
+        bot_deal_duration_map[botKey].push(durationMinutes);
+
+        // Win rate
+        if (!win_rate_map[botKey]) win_rate_map[botKey] = { wins: 0, total: 0 };
+        win_rate_map[botKey].total++;
+        if ((deal.profit || 0) > 0) win_rate_map[botKey].wins++;
+
+        // Profit by pair
+        const pairKey = deal.pair || 'Unknown';
+        pair_profit_map[pairKey] = (pair_profit_map[pairKey] || 0) + (deal.profit || 0);
+
+        // Safety order utilisation
+        if (!so_utilisation_map[botKey]) so_utilisation_map[botKey] = [];
+        so_utilisation_map[botKey].push(deal.safety_orders || 0);
+    });
+
+    // Average deal durations
+    for (const key in bot_deal_duration_map) {
+        const durations = bot_deal_duration_map[key];
+        bot_deal_duration_map[key] = Math.round(durations.reduce((a, b) => a + b, 0) / durations.length);
+    }
+
+    // Average SO utilisation
+    for (const key in so_utilisation_map) {
+        const sos = so_utilisation_map[key];
+        so_utilisation_map[key] = Number((sos.reduce((a, b) => a + b, 0) / sos.length).toFixed(1));
+    }
+
+    // Win rate as percentage
+    for (const key in win_rate_map) {
+        const { wins, total } = win_rate_map[key];
+        win_rate_map[key] = total > 0 ? Math.round((wins / total) * 100) : 0;
+    }
+
+    // Sort profit by day
+    profit_by_day_map = Object.fromEntries(
+        Object.entries(profit_by_day_map).sort((a, b) => new Date(a[0]) - new Date(b[0]))
+    );
+
+    // Equity curve — cumulative profit over time
+    let running = 0;
+    const equity_curve_map = Object.fromEntries(
+        Object.entries(profit_by_day_map).map(([day, profit]) => {
+            running += profit;
+            return [day, Number(running.toFixed(2))];
+        })
+    );
+
+    // Active P/L and Funds in Use
+    for (const key in deal_tracker) {
+
+        const { deal: { botId, botName, orders }, info: { profit } } = deal_tracker[key];
+        const botKey = getBotKey(botId || botName);
+        if (!profit) continue;
+
+        active_pl_map[botKey] = (active_pl_map[botKey] || 0) + profit;
+        total_pl += profit;
+
+        let inDeal = 0;
+        for (const order of orders) {
+            if (order.filled) inDeal = Number(order.sum);
+            else break;
+        }
+        bot_funds_in_use_map[botKey] = (bot_funds_in_use_map[botKey] || 0) + inDeal;
+        total_in_deals += inDeal;
+    }
+
+    // Adjusted P/L
+    for (const botKey in profit_by_bot_map) {
+
+        if (active_pl_map[botKey] != null) {
+            adjusted_pl_map[botKey] = active_pl_map[botKey] + profit_by_bot_map[botKey];
+        }
+    }
+
+    // Max funds deals
+    max_funds_deals.data.forEach(bot => {
+        const botKey = getBotKey(bot.botId);
+        if (botKey) max_funds_deals_map[botKey] = bot.maxLastSum || 0;
+    });
+
+    const sortDesc = obj => Object.fromEntries(Object.entries(obj).sort((a, b) => b[1] - a[1]));
+    const sortAsc = obj => Object.fromEntries(Object.entries(obj).sort((a, b) => a[1] - b[1]));
+
+    profit_by_bot_map = sortDesc(profit_by_bot_map);
+    active_pl_map = sortAsc(active_pl_map);
+
+    // Adjusted P/L follows active P/L order
+    const adjustedPlSorted = {};
+    for (const botKey of Object.keys(active_pl_map)) {
+        if (adjusted_pl_map[botKey] !== undefined) {
+            adjustedPlSorted[botKey] = adjusted_pl_map[botKey];
+        }
+    }
+    adjusted_pl_map = adjustedPlSorted;
+
+    bot_deal_duration_map = sortDesc(bot_deal_duration_map);
+    bot_funds_in_use_map = sortDesc(bot_funds_in_use_map);
+    so_utilisation_map = sortDesc(so_utilisation_map);
+    win_rate_map = sortDesc(win_rate_map);
+    // Split pair profit into profitable and losing
+    const pair_profit_pos_map = Object.fromEntries(
+        Object.entries(pair_profit_map)
+            .filter(([, v]) => v > 0)
+            .sort((a, b) => b[1] - a[1])
+    );
+
+    const pair_profit_neg_map = Object.fromEntries(
+        Object.entries(pair_profit_map)
+            .filter(([, v]) => v <= 0)
+            .sort((a, b) => a[1] - b[1])
+    );
+
+    pair_profit_map = sortDesc(pair_profit_map);
+
+    // Derive KPI display symbol from most common quote currency in completed deals
+    const quoteCounts = {};
+    complete_deals.forEach(deal => {
+        const quote = deal.profit_currency === 'base'
+            ? (deal.pair || '').split('/')[0]
+            : (deal.pair || '').split('/')[1];
+        if (quote) quoteCounts[quote] = (quoteCounts[quote] || 0) + 1;
+    });
+    const kpiCurrency = Object.keys(quoteCounts).sort((a, b) => quoteCounts[b] - quoteCounts[a])[0] || currencies[0] || 'USD';
+    const kpiSymbol = shareData.Common.getCurrencySymbol(kpiCurrency);
+
+    return {
+        kpi: {
+            active_deals: Object.keys(deal_tracker).length,
+            total_in_deals,
+            available_balance,
+            total_profit,
+            total_pl
+        },
+        charts: {
+            profit_by_bot_map,
+            profit_by_day_map,
+            active_pl_map,
+            adjusted_pl_map,
+            bot_deal_duration_map,
+            bot_funds_in_use_map,
+            max_funds_deals_map,
+            equity_curve_map,
+            win_rate_map,
+            pair_profit_map,
+            pair_profit_pos_map,
+            pair_profit_neg_map,
+            so_utilisation_map
+        },
+        botIdNameMap,
+        currencies,
+        kpiSymbol,
+        isLoading,
+        period
+    };
 }
 
 
 async function initApp() {
 
-	queueStartDeal = await shareData.Queue.create(1);
+	// queueStartDeal removed — deal serialisation handled by DCABot.dealStartQueue
+}
+
+
+
+
+async function apiUpdateBotsExchange(req, res) {
+
+	const body     = req.body;
+	const exchange = (body.exchange || '').trim().toLowerCase();
+
+	let updated = 0;
+	let skipped = 0;
+	let success = exchange !== '';
+
+	if (success) {
+
+		try {
+
+			const bots = await shareData.DCABot.getBots({});
+
+			if (bots && bots.length > 0) {
+
+				for (const bot of bots) {
+
+					const botId = bot.botId;
+
+					// Check for active deals — skip bots that have live trading
+					const activeDeals = await shareData.DCABot.getDeals({ 'botId': botId, 'status': 0 });
+
+					if (activeDeals && activeDeals.length > 0) {
+
+						skipped++;
+						continue;
+					}
+
+					// No active deals — safe to update exchange
+					const result = await shareData.DCABot.updateBot(botId, { 'config.exchange': exchange });
+
+					if (result.success) {
+
+						updated++;
+					}
+					else {
+
+						skipped++;
+					}
+				}
+			}
+		}
+		catch (err) {
+
+			success = false;
+			shareData.Common.logger('apiUpdateBotsExchange error: ' + err.message);
+		}
+	}
+
+	const resObj = { 'success': success, 'updated': updated, 'skipped': skipped };
+
+	shareData.Common.logger('API Update Bots Exchange: ' + JSON.stringify(resObj));
+
+	res.send(resObj);
+}
+
+
+function getBotsConfig() {
+
+	// Returns the signal-derived start_conditions data from this instance's
+	// shareData — used by the Hub Worker to send to the Hub UI.
+	const bots = shareData?.appData?.bots || {};
+
+	return {
+		'start_conditions':          bots['start_conditions']          || {},
+		'start_conditions_sub':      bots['start_conditions_sub']      || {},
+		'start_conditions_metadata': bots['start_conditions_metadata'] || {},
+		'pair_buttons':              bots['pair_buttons']              || []
+	};
+}
+
+
+async function getDefaultBotConfig() {
+
+	// Returns bot.json defaults — used by Hub create bot page.
+	// Accesses shareData via DCABotManager's own module-level reference
+	// since SymBot.shareData is not exported from symbot.js.
+	const botConfigFile = shareData?.appData?.bot_config;
+
+	if (!botConfigFile) return {};
+
+	const botConfig = await shareData.Common.getConfig(botConfigFile);
+
+	return botConfig?.data || {};
+}
+
+
+async function getSymbolList() {
+
+	const maxMins = 60;
+
+	const botConfigFile = shareData.appData.bot_config;
+	const botConfig     = await shareData.Common.getConfig(botConfigFile);
+	const botConfigData = botConfig?.data;
+	const exchangeName  = botConfigData?.exchange;
+
+	if (!exchangeName) return [];
+
+	if (symbolList[exchangeName] == undefined || symbolList[exchangeName] == null) {
+
+		symbolList[exchangeName] = {};
+		symbolList[exchangeName]['symbols'] = [];
+		symbolList[exchangeName]['updated'] = 0;
+	}
+
+	const diffSec = (new Date().getTime() - new Date(symbolList[exchangeName]['updated']).getTime()) / 1000;
+
+	if (diffSec > (60 * maxMins)) {
+
+		const exchange = await shareData.DCABot.connectExchange(botConfigData);
+
+		if (exchange) {
+
+			const symbolData = await shareData.DCABot.getSymbolsAll(exchange);
+
+			if (symbolData.success) {
+
+				symbolList[exchangeName]['updated'] = new Date();
+				symbolList[exchangeName]['symbols'] = symbolData.symbols;
+			}
+		}
+	}
+
+	return symbolList[exchangeName]['symbols'] || [];
+}
+
+
+function buildStartConditionStrings(bots, botData) {
+
+	const conds = (bots && bots['start_conditions'])          || {};
+	const subs  = (bots && bots['start_conditions_sub'])      || {};
+	const ops   = [
+		{ operator: '==', display: '=' },
+		{ operator: '!=', display: '!=' },
+		{ operator: '>=', display: '>=' },
+		{ operator: '<=', display: '<=' }
+	];
+
+	// Parse existing bot start conditions for pre-selection
+	const scSubObj = {};
+
+	if (botData && botData.startConditions && botData.startConditions.length > 1) {
+
+		for (let i = 1; i < botData.startConditions.length; i++) {
+
+			const parts = botData.startConditions[i].split('|');
+			const key   = parts[1]; const id = parts[2]; const op = parts[3]; const ct = parts[4];
+
+			if (!scSubObj[key]) scSubObj[key] = {};
+
+			scSubObj[key][id] = { operator: op, content: ct };
+		}
+	}
+
+	// Build main select options string
+	let startConditionString = '<option value="">';
+
+	for (const key in conds) {
+
+		const desc = conds[key]['description'] || key;
+		const sel  = (botData && botData.startConditions && botData.startConditions[0] === key) ? ' selected' : '';
+
+		startConditionString += '<option value="' + key + '"' + sel + '>' + desc;
+	}
+
+	// Build sub-condition rows string
+	let startConditionSubString = '';
+	let countSub = 1;
+
+	for (const keySub in subs) {
+
+		const parts = keySub.split('|');
+		const key   = parts[1]; const id = parts[2];
+		const desc  = subs[keySub]['description'] || id;
+
+		let content = ''; let operator = '';
+
+		if (scSubObj[key] && scSubObj[key][id]) {
+
+			content  = scSubObj[key][id]['content']  || '';
+			operator = scSubObj[key][id]['operator'] || '';
+		}
+
+		let str = '<tr id="startConditionSub-' + key + '-' + countSub + '" data-id="' + id + '" style="display: none;"><td style="padding-left: 15px;">' + desc + ':</td><td>';
+
+		str += '<select id="startConditionOp-' + key + '-' + countSub + '" name="startConditionOp" class="form-field"><option value="">';
+
+		for (const o of ops) {
+
+			str += '<option value="' + o.operator + '"' + (operator === o.operator ? ' selected' : '') + '>' + o.display;
+		}
+
+		str += '</select>';
+		str += ' <input id="startConditionVal-' + key + '-' + countSub + '" name="startCondition' + countSub + '" class="form-field" style="cursor: auto;" value="' + content + '">';
+		str += '</td></tr>';
+
+		startConditionSubString += str;
+		countSub++;
+	}
+
+	return { startConditionString, startConditionSubString };
+}
+
+
+function buildSymbolString(symbols, botData) {
+
+	const botPairs = Array.isArray(botData.pair)
+		? botData.pair.map(p => p.toUpperCase())
+		: (botData.pair ? [botData.pair.toUpperCase()] : []);
+
+	let symbolString = '';
+
+	for (const sym of (symbols || [])) {
+
+		const upper    = sym.toUpperCase();
+		const selected = botPairs.includes(upper) ? 'selected' : '';
+
+		symbolString += '<option value="' + upper + '" ' + selected + '>' + upper;
+	}
+
+	return symbolString;
+}
+
+
+function buildActiveChecked(botData) {
+
+	return botData && botData.active ? 'checked' : '';
 }
 
 
 module.exports = {
 
 	apiStartDeal,
+	apiUpdateBotsExchange,
 	apiGetMarkets,
 	apiGetBots,
 	apiGetActiveDeals,
@@ -1840,11 +2593,22 @@ module.exports = {
 	apiPanicSellDeal,
 	apiCreateUpdateBot,
 	apiEnableDisableBot,
+	apiDeleteBot,
+	apiGetBalances,
+	apiAiAnalyzeDeal,
+	apiAiAnalyzeDealPrompt,
+	getProcessedDeals,
 	viewBots,
 	viewCreateUpdateBot,
 	viewActiveDeals,
 	viewHistoryDeals,
 	getDashboardData,
+	getSymbolList,
+	getBotsConfig,
+	getDefaultBotConfig,
+	buildStartConditionStrings,
+	buildSymbolString,
+	buildActiveChecked,
 
 	init: function(obj) {
 

@@ -6,6 +6,7 @@
 	let dealTracker = {};
 	let dealTrackerErrors = {};
 	let activeBots = [];
+	let csvDataArr = [];
 	let modalId = 'activeDealsView';
 
 	const tooltipDelayMs = 250;
@@ -13,31 +14,35 @@
 
 	const actionButtons = {
 							'add': {
-										'button': '<span class="disableButton">$+</span>',
+										'button': '<span class="pill-btn" title="Add funds to deal"><span class="icon icon-add" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Add funds to deal'
 									},
+							'ai': {
+										'button': '<span class="pill-btn" title="AI Analyze deal"><span class="icon icon-ai" style="width:13px;height:13px;pointer-events:none;"></span></span>',
+										'tooltip': 'AI Analyze deal'
+									},
 							'cancel': {
-										'button': '<span class="disableButton">X</span>',
+										'button': '<span class="pill-btn pill-danger" title="Cancel deal"><span class="icon icon-cancel" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Cancel deal'
 									},
 							'edit': {
-										'button': '<span class="disableButton">&#9998;</span>',
+										'button': '<span class="pill-btn" title="Edit deal"><span class="icon icon-edit" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Edit deal'
 									},
 							'panic': {
-										'button': '<span class="disableButton" style="font-size: 1.0rem;">&#128176</span>',
+										'button': '<span class="pill-btn" title="Close deal"><span class="icon icon-close" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Close deal'
 									},
 							'pause': {
-										'button': '<span class="disableButton">&#8545;</span>',
+										'button': '<span class="pill-btn pill-warn" title="Pause deal"><span class="icon icon-pause" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Pause deal'
 									},
 							'resume': {
-										'button': '<span class="disableButton">&#9658;</span>',
+										'button': '<span class="pill-btn pill-warn" title="Resume deal"><span class="icon icon-resume" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Resume deal'
 									},
 							'stop': {
-										'button': '<span class="disableButton">&#9726;</span>',
+										'button': '<span class="pill-btn pill-danger" title="Stop bot"><span class="icon icon-stop" style="width:13px;height:13px;pointer-events:none;"></span></span>',
 										'tooltip': 'Stop bot'
 									}
 						  };
@@ -46,7 +51,112 @@
 	const convertBoolean = new Function('return ' + `<%- convertBoolean %>`)();
 
 
+	var cbCountdownTimer = null;
+
+	function updateCircuitBreakerBanner(cb) {
+
+		const $banner = $('#circuitBreakerBanner');
+
+		if (!cb || !cb.active) {
+
+			$banner.hide();
+			if (cbCountdownTimer) { clearInterval(cbCountdownTimer); cbCountdownTimer = null; }
+			return;
+		}
+
+		$('#cbReason').text(cb.reason);
+		$banner.show();
+
+		// Countdown timer
+		if (cbCountdownTimer) clearInterval(cbCountdownTimer);
+
+		function updateCountdown() {
+
+			const secsLeft = cb.clears_at ? Math.max(0, Math.round((cb.clears_at - Date.now()) / 1000)) : 0;
+			$('#cbCountdown').text(secsLeft + 's');
+
+			if (secsLeft <= 0) {
+				clearInterval(cbCountdownTimer);
+				cbCountdownTimer = null;
+			}
+		}
+
+		updateCountdown();
+		cbCountdownTimer = setInterval(updateCountdown, 1000);
+	}
+
+
+	function updatePortfolioBar(portfolio) {
+
+		if (!portfolio) {
+
+			$('#portfolioRiskBar').hide();
+			return;
+		}
+
+		// Currency symbol — use first configured currency as the quote
+		const currencies  = portfolio.balance_currencies || [];
+		const quoteCcy    = currencies[0] || 'USD';
+		const sym         = (typeof getCurrencySymbol === 'function') ? getCurrencySymbol(quoteCcy) : '$';
+
+		// Portfolio total
+		$('#portfolioTotal').text(sym + (portfolio.portfolio_total || 0).toFixed(2) + ' ' + quoteCcy);
+
+		// Max Funds
+		$('#portfolioMaxFunds').text(sym + (portfolio.total_max_funds || 0).toFixed(2));
+
+		// Risk % with colour coding
+		const risk = portfolio.risk_percent;
+		let riskClass = 'portfolio-risk-low';
+
+		if (risk !== null && risk !== undefined) {
+
+			if (risk >= 90)      riskClass = 'portfolio-risk-high';
+			else if (risk >= 70) riskClass = 'portfolio-risk-mid';
+		}
+
+		$('#portfolioRisk')
+			.attr('class', riskClass)
+			.text(risk !== null && risk !== undefined ? risk + '%' : 'N/A');
+
+		// Balance age indicator — hidden in sandbox mode, shows freshness in live mode
+		if (portfolio.is_sandbox) {
+
+			$('#portfolioBalanceAge').text('Sandbox');
+		}
+		else if (portfolio.balance_updated) {
+
+			const ageSecs = Math.round((Date.now() - new Date(portfolio.balance_updated).getTime()) / 1000);
+			const ageMins = Math.floor(ageSecs / 60);
+			const ageText = ageMins > 0 ? ageMins + 'm ago' : ageSecs + 's ago';
+			$('#portfolioBalanceAge').text('Balance: ' + ageText);
+		}
+		else {
+
+			$('#portfolioBalanceAge').text('');
+		}
+
+		$('#portfolioRiskBar').show();
+	}
+
+
+	$(document).on('click', '#cbClearBtn', function() {
+
+		$.ajax({
+			type: 'POST',
+			url: './api/circuit-breaker/clear',
+			dataType: 'json',
+			success: function() { getActiveDeals(); }
+		});
+	});
+
+
 	function setReloadTimeout() {
+
+		if (timeOutId) {
+
+			clearTimeout(timeOutId);
+		}
 
 		timeOutId = setTimeout(() => { getActiveDeals(); }, 5000);
 	}
@@ -59,6 +169,7 @@
 		//const dcaMaxOrder = deal['info']['safety_orders_max'];
 		const dcaMaxOrder = deal['config']['dcaMaxOrder'];
 		const dcaTakeProfitPercent = deal['config']['dcaTakeProfitPercent'];
+		const profitCurrency = deal['config']['profitCurrency'];
 		const dealLast = deal['config']['dealLast'];
 
 		$('#dealEditId').val(dealId);
@@ -68,6 +179,15 @@
 
 		$('#dealLast').prop('checked', false);
 		$('#dealLast').switchToggle(false);
+
+		if (!profitCurrency) {
+			
+			$('#profitCurrency').val('quote');
+		}
+		else {
+			
+			$('#profitCurrency').val(profitCurrency);
+		}
 
 		if (dealLast != undefined && dealLast != null && dealLast != '') {
 
@@ -160,13 +280,167 @@
 	}
 
 
+	function csvDownloadConfirm(data) {
+
+		$.confirm({
+
+					title: false,
+					boxWidth: '50%',
+					useBootstrap: false,
+					content: '<div style="font-size: 1.2rem; text-align: left;">Download active deals CSV?</div>',
+					buttons: {
+
+								ok: {
+										btnClass: 'btn-default',
+										text: '<div style="color: #1a9f00;">Download CSV</div>',
+										action: function () {
+
+											const appName = '<%- appData.name %>';
+
+											jsonToCsv(appName + '-Active-Deals', appName + ' Active DCA Bot Deals', true, true, data);
+										}
+									 },
+								cancel: {
+
+										 btnClass: 'btn-default',
+										 text: '<div style="color: #000000;">Cancel</div>',	
+										 action: function () { }
+								 	}
+						 }
+		});
+	}
+
+
+	function renderAIContent(dealId) {
+
+		const tz = getTimeZone(new Date());
+
+		const header = 'AI Analysis ' + dealId;
+
+		const htmlContent = `
+			<div class="aiChatContainer">
+				<div id="aiChatSpinner" class="spinner-dynamic-container" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);"><div class="spinner-dynamic"></div></div>
+
+				Please wait...
+			</div>
+		`;
+
+		const orders = dealTracker[dealId]['orders'];
+		const pair = dealTracker[dealId]['config']['pair'];
+		const exchange = dealTracker[dealId]['config']['exchange'];
+
+		// Open modal immediately with spinner
+		openModal(modalId, '#modal', header, htmlContent);
+
+		// Params for OHLCV fetch
+		const params = {
+			exchange,
+			pair,
+			dealId,
+			timeframe: '1h',
+			limit: 200,
+			timeZoneOffset: tz.offset
+		};
+
+		getAiAnalyzeDealPrompt(params).then(renderedTemplate => {
+
+			openAiChat(modalId, 'modal', header, renderedTemplate);
+		});
+	}
+
+
+	function getMarketOHLCV(params) {
+
+		return new Promise((resolve) => {
+
+			$.ajax({
+				type: 'GET',
+				url: './api/markets/ohlcv',
+				data: params,
+				dataType: 'json',
+				timeout: 10000,
+				success: function(data) {
+					try {
+						if (data && data.success && Array.isArray(data.data) && data.data.length > 0) {
+
+							const ohlcv = data.data;
+
+							let formatted = '';
+
+							//formatted += "Date | Open | High | Low | Close | Volume\n";
+							//formatted += "------------------------------------------------------\n";
+
+							ohlcv.forEach(row => {
+
+								const [ts, open, high, low, close, volume] = row;
+								const date = dateConvertLocal(new Date(ts));
+
+								formatted += `Date: ${date} | Close Price: $${close}\n`;
+
+								//formatted += `${date} | ${open} | ${high} | ${low} | ${close} | ${volume}\n`;
+							});
+
+							//resolve(formatted);
+							resolve(ohlcv);
+						}
+						else {
+
+							resolve('');
+						}
+					}
+					catch (err) {
+
+						//alertBox('Error formatting OHLCV: ' + err.message);
+						resolve('');
+					}
+				},
+				error: function(err) {
+
+					//alertBox('Error fetching OHLCV: ' + JSON.stringify(err));
+					resolve('');
+				}
+			});
+		});
+	}
+
+
+	function getAiAnalyzeDealPrompt(params) {
+
+		return new Promise((resolve) => {
+
+			$.ajax({
+						type: 'GET',
+						url: './api/ai/analyze_deal_prompt',
+						data: params,
+						dataType: 'json',
+						success: function(data) {
+
+							if (data.success) {
+
+								resolve(data.data);
+							}
+							else {
+
+								resolve(data.error);
+							}
+						},
+						error: function(data) {
+
+							// Some error in ajax call
+							resolve('Error: ' + JSON.stringify(data));
+					}
+			});
+		});
+	}
+
+
 	function getActiveDeals() {
 
 		//$('#spinner-overlay').fadeIn(100);
 
 		$.ajax({
 					type: 'GET',
-					url: '/api/deals',
+					url: './api/deals',
 					data: {},
 					dataType: 'json',
 					success: function(data) {
@@ -176,7 +450,11 @@
 						let date = data.date;
 						let deals = data.data;
 
-						populateDeals(date, deals);
+						csvDataArr = populateDeals(date, deals);
+
+						updateCircuitBreakerBanner(data.circuit_breaker);
+
+					updatePortfolioBar(data.portfolio);
 
 						setReloadTimeout();
 					},
@@ -197,7 +475,7 @@
 
 		$.ajax({
 					type: 'POST',
-					url: '/api/deals/' + dealId + '/panic_sell',
+					url: './api/deals/' + dealId + '/panic_sell',
 					data: {},
 					dataType: 'json',
 					success: function(data) {
@@ -206,11 +484,11 @@
 
 						if (!data.success) {
 
-							alertBox('Unable to close deal: ' + data['data']);
+							alertBox('Unable to close deal: ' + data['data'], function() { getActiveDeals(); });
 						}
 						else {
 
-							alertBox('Deal ID ' + dealId + ' closed');
+							alertBox('Deal ID ' + dealId + ' closed', function() { getActiveDeals(); });
 						}
 					},
 					error: function(data) {
@@ -218,7 +496,7 @@
 						// Some error in ajax call
 						$('#spinner-overlay').fadeOut(100);
 
-						alertBox('Error: ' + JSON.stringify(data));
+						alertBox('Error: ' + JSON.stringify(data), function() { getActiveDeals(); });
 					}
 		});
 	}
@@ -230,7 +508,7 @@
 
 		$.ajax({
 					type: 'POST',
-					url: '/api/deals/' + dealId + '/update_deal',
+					url: './api/deals/' + dealId + '/update_deal',
 					data: data,
 					dataType: 'json',
 					success: function(data) {
@@ -239,11 +517,11 @@
 
 						if (!data.success) {
 
-							alertBox('Unable to update deal: ' + data['data'], function() { });
+							alertBox('Unable to update deal: ' + data['data'], function() { getActiveDeals(); });
 						}
 						else {
 
-							alertBox('Deal ID ' + dealId + ' updated', function() { });
+							alertBox('Deal ID ' + dealId + ' updated', function() { getActiveDeals(); });
 						}
 					},
 					error: function(data) {
@@ -251,7 +529,7 @@
 						// Some error in ajax call
 						$('#spinner-overlay').fadeOut(100);
 
-						alertBox('Error: ' + JSON.stringify(data), function() { });
+						alertBox('Error: ' + JSON.stringify(data), function() { getActiveDeals(); });
 					}
 		});
 	}
@@ -265,7 +543,7 @@
 
 		$.ajax({
 					type: 'POST',
-					url: '/api/bots/' + botId + '/disable',
+					url: './api/bots/' + botId + '/disable',
 					data: data,
 					dataType: 'json',
 					success: function(data) {
@@ -295,10 +573,18 @@
 	}
 
 
-	function pauseDeal(pair, dealId, pause, pauseBuy, pauseSell) {
+	function pauseDeal(pair, dealId, pause, pauseBuy, pauseSell, pauseReason) {
 
 		let pairSplit = pair.split('/');
 		let quote = pairSplit[1];
+
+		const isSystemPaused = pauseReason === 'order_verify_buy' || pauseReason === 'order_verify_sell';
+		const systemPauseType = pauseReason === 'order_verify_buy' ? 'buy order' : 'sell order';
+		const systemWarning = isSystemPaused
+			? '<div style="font-size: 1.0rem; padding: 8px; margin-bottom: 10px; background: rgba(255,140,0,0.15); border-left: 3px solid #ffa000; border-radius: 2px;">' +
+			  '<b>⚠ System paused:</b> This deal was automatically paused due to a ' + systemPauseType + ' verification failure. ' +
+			  'Resuming manually may cause issues if the underlying problem has not resolved.</div>'
+			: '';
 
 		$.confirm({
 			title: false,
@@ -306,6 +592,7 @@
 			useBootstrap: false,
 	 		content: `<div style="font-size: 1.2rem; text-align: left;">Pause / Resume deal ${dealId}?<br><br>
 			<form action="" style="display: inline;">
+			${systemWarning}
 			This will pause or resume any further buying and / or selling for this deal
 			<br><br>
 
@@ -390,7 +677,7 @@
 		$.ajax({
 
 			type: 'POST',
-	  		url: '/api/deals/' + dealId + '/pause',
+	  		url: './api/deals/' + dealId + '/pause',
 	  		data: requestBody,
 	  		dataType: 'json',
 	  		success: function(data) {
@@ -398,17 +685,17 @@
 				$('#spinner-overlay').fadeOut(100);
 
 				if (!data.success) {
-					alertBox('Unable to update pause status for deal: ' + data['data'], function() {});
+					alertBox('Unable to update pause status for deal: ' + data['data'], function() { getActiveDeals(); });
 				}
 				else {
-					alertBox('Successfully updated pause status for deal: ' + dealId, function() {});
+					alertBox('Successfully updated pause status for deal: ' + dealId, function() { getActiveDeals(); });
 				}
 			},
 			error: function(data) {
 				// Some error in ajax call
 				$('#spinner-overlay').fadeOut(100);
 
-				alertBox('Error: ' + JSON.stringify(data), function() {});
+				alertBox('Error: ' + JSON.stringify(data), function() { getActiveDeals(); });
 			},
 		});
 	}
@@ -478,7 +765,7 @@
 		$.ajax({
 
 			type: 'POST',
-	  		url: '/api/deals/' + dealId + '/cancel',
+	  		url: './api/deals/' + dealId + '/cancel',
 	  		data: requestBody,
 	  		dataType: 'json',
 	  		success: function(data) {
@@ -486,17 +773,17 @@
 				$('#spinner-overlay').fadeOut(100);
 
 					if (!data.success) {
-						alertBox('Unable to cancel deal: ' + data['data'], function() {});
+						alertBox('Unable to cancel deal: ' + data['data'], function() { getActiveDeals(); });
 					}
 				else {
-					alertBox('Successfully canceled deal: ' + dealId, function() {});
+					alertBox('Successfully canceled deal: ' + dealId, function() { getActiveDeals(); });
 				}
 			},
 			error: function(data) {
 				// Some error in ajax call
 				$('#spinner-overlay').fadeOut(100);
 
-				alertBox('Error: ' + JSON.stringify(data), function() {});
+				alertBox('Error: ' + JSON.stringify(data), function() { getActiveDeals(); });
 			},
 		});
 	}
@@ -580,7 +867,7 @@
 		$.ajax({
 
 			type: 'POST',
-  			url: '/api/deals/' + dealId + '/add_funds',
+  			url: './api/deals/' + dealId + '/add_funds',
   			data: requestBody,
   			dataType: 'json',
   			success: function(data) {
@@ -588,17 +875,17 @@
 				$('#spinner-overlay').fadeOut(100);
 
   				if (!data.success) {
-  					alertBox('Unable to update deal: ' + data['data'], function() {});
+  					alertBox('Unable to update deal: ' + data['data'], function() { getActiveDeals(); });
   				}
 				else {
-  					alertBox('Successfully added funds to: ' + dealId, function() {});
+  					alertBox('Successfully added funds to: ' + dealId, function() { getActiveDeals(); });
   				}
   			},
   			error: function(data) {
   				// Some error in ajax call
   				$('#spinner-overlay').fadeOut(100);
 
-	  			alertBox('Error: ' + JSON.stringify(data), function() {});
+	  			alertBox('Error: ' + JSON.stringify(data), function() { getActiveDeals(); });
   			},
   		});
 	}
@@ -609,13 +896,14 @@
 		const maxMins = 2;
 
 		let totalProfit = 0;
+		let totalProjectedProfit = 0;
 		let activeDeals = 0;
 		let inDeals = 0;
 		let dealDataErrors = 0;
 		const selectedBot = $('#active-bot-filter').val();
 
 		let msgBoxColor = '#386ec2';
-		let profitTotalColor = '#1a9f00';
+		let profitTotalClass = 'profit-positive';
 
 		let msgBox = '';
 
@@ -623,15 +911,19 @@
 		let dealsErrorArr = [];
 
 		dealTracker = {};
+		csvDataArr = [];
 
 		for (let i = 0; i < deals.length; i++) {
 
 			if(!activeBots.includes(deals[i].botName)) {
+
 				activeBots.push(deals[i].botName);
+
 				$('#active-bot-filter').append('<option value="' + deals[i].botName + '">' + deals[i].botName + '</option>');
 			}
 
 			if(selectedBot != 'all' && deals[i].botName != selectedBot) {
+
 				continue;
 			}
 
@@ -644,6 +936,7 @@
 					pause: { button: pauseButtonDeal },
 					resume: { button: resumeButtonDeal },
 					stop: { button: stopButtonDeal },
+					ai: { button: aiButtonDeal },
 					panic: { button: panicButtonDeal }
 			} = actionButtons;
 
@@ -652,40 +945,88 @@
 			inDeals += dealVolume;
 
 			let dealBackground = '';
-			let profitPercColor = '#1a9f00';
+			let profitPercClass = 'profit-positive';
 			let pauseButtonId = 'pause';
 
 			let dealCount;
 
 			const deal = deals[i];
-
 			const config = deal['config'];
 			const dealId = deal['dealId'];
 			const pause = deal['info']['pause'];
 			const pauseBuy = deal['info']['pause_buy'];
 			const pauseSell = deal['info']['pause_sell'];
+			const pauseReason = deal['info']['pause_reason'] || '';
+			const isSystemPaused = pauseReason === 'order_verify_buy' || pauseReason === 'order_verify_sell';
 			const dealError = deal['info']['error'];
 			const lastUpdated = deal['info']['updated'];
 			const botActive = deal['info']['bot_active'];
 			const profit = deal['info']['profit'];
+			const profitBase = deal['info']['profit_base'];
+			const profitQuoteProjected = Number(deal['info']['profit_quote_projected']);
 			const profitPerc = deal['info']['profit_percentage'];
+			const maxFunds = Math.round(deal['info']['max_funds']);
+			const maxDeviation = deal['info']['max_deviation'];
 
 			const duration = timeDiff(new Date(), new Date(deal['date']));
+			const dealSym = getDealSym(deal['info']['pair'], deal['config']['profitCurrency']);
+
+			let csvDealInfo = JSON.parse(JSON.stringify(deal.info));
+
+			const manualProperties = {
+				'started': dateConvertLocal(new Date(deal['date'])),
+				'updated': dateConvertLocal(new Date(csvDealInfo.updated)),
+				'duration': duration,
+				'bot_id': deal['botId'],
+				'bot_name': deal['info']['bot_name'],
+				'deal_id': dealId,
+				'profit_target_percentage': config['dcaTakeProfitPercent']
+			};
+
+			csvDealInfo = {
+				...manualProperties,
+				...Object.fromEntries(
+					Object.entries(csvDealInfo).filter(([key]) => !(key in manualProperties))
+				)
+			};
+
+			const reorderings = [
+				{ after: 'active', property: 'bot_active' },
+				{ after: 'profit_percentage', property: 'profit_target_percentage' }
+			];
+
+			reorderings.forEach(reordering => {
+
+				csvDealInfo = reorderProperties(csvDealInfo, reordering.after, reordering.property);
+			});
+
+			delete csvDealInfo['estimates'];
+
+			csvDataArr.push(csvDealInfo);
 
 			if (!botActive) {
 
-				stopButtonDeal = '';
+				stopButtonDeal = '<span class="pill-btn pill-disabled" title="Stop bot (bot inactive)"><span class="icon icon-stop" style="width:13px;height:13px;pointer-events:none;"></span></span>';
 			}
 
 			if (pause || pauseBuy || pauseSell) {
 
 				pauseButtonId = 'resume';
 				pauseButtonDeal = resumeButtonDeal;
+
+				// System-paused deals get a distinct orange tint to distinguish from manual pauses.
+				// Use a translucent tint (not a solid dark color) so it layers over the themed row
+				// background and stays readable in BOTH light and dark mode — a solid dark brown
+				// (#7a4500) rendered dark-text-on-dark and was unreadable in light mode.
+				if (isSystemPaused) {
+
+					dealBackground = 'rgba(255,140,0,0.22)';
+				}
 			}
 
 			if (profitPerc <= 0) {
 
-				profitPercColor = '#d82715';
+				profitPercClass = 'profit-negative';
 			}
 
 			if (deal['info']['deal_max'] == 0) {
@@ -712,7 +1053,9 @@
 
 					if (diffSec > maxSec) {
 
-						dealBackground = '#B78225';
+						// Translucent amber tint (see system-pause note above) — readable in
+						// light and dark mode, unlike the previous solid #B78225.
+						dealBackground = 'rgba(183,130,37,0.28)';
 						dealDataErrors++;
 					}
 					else {
@@ -738,10 +1081,19 @@
 				dealsErrorArr.push(dealId);
 			}
 
-			totalProfit += profit;
+			if (!isNaN(profit)) {
+
+				totalProfit += profit;
+			}
+
+			if (!isNaN(profitQuoteProjected)) {
+
+				totalProjectedProfit += profitQuoteProjected;
+			}
 
 			dealTracker[dealId] = {};
 
+			dealTracker[dealId]['date'] = deal['date'];
 			dealTracker[dealId]['info'] = deal['info'];
 			dealTracker[dealId]['config'] = config;
 			dealTracker[dealId]['orders'] = deal['orders'];
@@ -756,31 +1108,35 @@
 				safetyOrdersTotalDisplay += ' (+' + manualOrders.length + ')';
 			}
 
-			contentArr.push('<tr style="background-color: ' + dealBackground + ';" data-dealid="' + dealId + '" data-pair="' + deal['pair'] + '">');
+			const estimates = JSON.stringify(deal.info.estimates || {})
+				.replace(/&/g, '&amp;')
+				.replace(/"/g, '&quot;')
+				.replace(/'/g, '&#39;');
+
+			contentArr.push('<tr style="background-color: ' + dealBackground + ';" data-dealid="' + dealId + '" data-pair="' + deal['pair'] + '"  data-estimates="' + estimates + '">');
 			contentArr.push('<td>' + deal['info']['bot_name'] + '</td>');
-			contentArr.push('<td>' + dealId + '</td>');
+			contentArr.push('<td id="dealid-cell">' + dealId + '</td>');
 			contentArr.push('<td>' + deal['pair'] + '</td>');
-			contentArr.push('<td>' + duration + '</td>');		
-			contentArr.push('<td>$' + deal['info']['price_last'] + '</td>');
-			contentArr.push('<td>$' + deal['info']['price_target'] + '</td>');
-			contentArr.push('<td>$' + dealVolume.toFixed(2) + '</td>')
-			contentArr.push('<td style="color: ' + profitPercColor+ '">$' + profit + '</td>');
-			contentArr.push('<td style="color: ' + profitPercColor+ '">' + profitPerc + '%</td>');
+			contentArr.push('<td>' + duration + '</td>');
+			contentArr.push('<td>' + dealSym + convertNotation(deal['info']['price_last']) + '</td>');
+			contentArr.push('<td>' + dealSym + convertNotation(deal['info']['price_target']) + '</td>');
+			contentArr.push('<td>' + dealSym + dealVolume.toFixed(2) + '</td>')
+			contentArr.push('<td class="' + profitPercClass + '">' + dealSym + profit + '</td>');
+			contentArr.push('<td class="' + profitPercClass + '">' + profitBase + '</td>');
+			contentArr.push('<td class="' + profitPercClass + '">' + profitPerc + '%</td>');
+			contentArr.push('<td>' + dealSym + profitQuoteProjected + '</td>');
 			contentArr.push('<td>' + config['dcaTakeProfitPercent'] + '%</td>');
 			contentArr.push('<td>' + deal['info']['safety_orders_used'] + ' / ' + safetyOrdersTotalDisplay + '</td>');
+			contentArr.push('<td>' + dealSym + maxFunds + '</td>')
 			contentArr.push('<td>' + dealCount + '</td>');
-			contentArr.push('<td style="text-align: center;"><div id="edit' + dealId + i + '">' + editButtonDeal + '</div></td>');
-			contentArr.push('<td style="text-align: center;"><div id="panic' + dealId + i + '">' + panicButtonDeal + '</div></td>');
-			contentArr.push('<td style="text-align: center;"><div id="add' + dealId + i + '">' + addFundsButtonDeal + '</div></td>');
-			contentArr.push('<td data-pause="' + pause + '" data-pausebuy="' + pauseBuy + '" data-pausesell="' + pauseSell + '" style="text-align: center;"><div id="' + pauseButtonId + dealId + i + '">' + pauseButtonDeal + '</div></td>');
-			contentArr.push('<td style="text-align: center;"><div id="cancel' + dealId + i + '">' + cancelButtonDeal + '</div></td>');
-			contentArr.push('<td data-botid="' + deal['info']['bot_id'] + '" data-botname="' + deal['info']['bot_name'] + '" style="text-align: center;"><div id="stop' + deal['info']['bot_id'] + i + '">' + stopButtonDeal + '</div></td>');
+			const pillContent = aiButtonDeal + editButtonDeal + panicButtonDeal + addFundsButtonDeal + pauseButtonDeal + cancelButtonDeal + (stopButtonDeal || '');
+			contentArr.push('<td style="text-align: center;" data-pause="' + pause + '" data-pausebuy="' + pauseBuy + '" data-pausesell="' + pauseSell + '" data-pausereason="' + pauseReason + '" data-botid="' + deal['info']['bot_id'] + '" data-botname="' + deal['info']['bot_name'] + '"><div class="pill-group" id="actions' + dealId + i + '">' + pillContent + '</div></td>');
 			contentArr.push('</tr>');
 		}
 
 		if (totalProfit <= 0) {
 
-			profitTotalColor = '#d82715';
+			profitTotalClass = 'profit-negative';
 		}
 
 		$('#msgBox').empty();
@@ -804,19 +1160,32 @@
 
 		$('#botsDeals tbody').append(contentArr.join(''));
 
-		$('#totalProfit').css('color', profitTotalColor);
-		$('#totalProfit').html('$' + totalProfit.toFixed(2));
+		$('#totalProfit').removeClass('profit-positive profit-negative').addClass(profitTotalClass);
+		const summarySym = deals.length > 0 ? getDealSym(deals[0]['info']['pair'], deals[0]['config']['profitCurrency']) : '$';
+		$('#totalProfit').html(summarySym + totalProfit.toFixed(2));
 
-		$('#inDeals').html('$' + inDeals.toFixed(2));
+		$('#inDeals').html(summarySym + inDeals.toFixed(2));
 		$('#totalDeals').html(activeDeals);
-		
+		$('#projectedProfit').html(summarySym + (Math.round(totalProjectedProfit * 100) / 100).toFixed(2));
+
 		$('#botsDeals').tablesorter().trigger('update');
 
 		resizeBotsDeals();
+
+		return csvDataArr;
 	}
 
 
-	$(document).ready(function() {
+	const getCurrencySymbol = <%- getCurrencySymbol %>;
+
+function getDealSym(pair, profitCurrency) {
+	const parts = (pair || '').split('/');
+	const code = profitCurrency === 'base' ? parts[0] : parts[1];
+	return getCurrencySymbol(code) || '$';
+}
+
+
+$(document).ready(function() {
  
 		let tooltipDisplayTime = {};
 
@@ -832,6 +1201,98 @@
 
 			return null;
 		}
+
+
+		$(document).on('mouseenter', '#dealid-cell', function(e) {
+
+			try {
+				
+				let contentPriceTarget;
+				let noAdd = false;
+
+				const pair = $(this).closest('tr').attr('data-pair');
+				const estimates = JSON.parse($(this).closest('tr').attr('data-estimates'));
+
+				const [base, quote] = pair.split('/');
+				const amountNet = convertNotation(estimates['amount_net']);
+				const priceAvgNet = convertNotation(estimates['price_average_net']);
+				const priceTargetNet = convertNotation(estimates['price_target_net']);
+				const priceTargetChangePerc = convertNotation(estimates['price_target_change_percent']);
+
+				if (priceTargetChangePerc > 0) {
+					
+					contentPriceTarget = `This is a ${Math.abs(priceTargetChangePerc)}% reduction from the current target price.`;
+				}
+				else {
+					
+					contentPriceTarget = `Adding funds may increase the target price for this deal.`;
+					noAdd = true;
+				}
+
+				// Prevent duplicate tooltip
+				if ($('.dynamic-tooltip').length) return;
+
+				const tooltip = $(`
+					<span class="toolTipStatic dynamic-tooltip" style="position: absolute;">
+						<span class="toolTipText">
+							Buying ${base} at the current market price using ${getCurrencySymbol(quote)}${amountNet} ${quote} may bring the average price bought to ${getCurrencySymbol(quote)}${priceAvgNet} and the new target take profit price to ${getCurrencySymbol(quote)}${priceTargetNet}. ${contentPriceTarget}
+						</span>
+					</span>
+				`);
+
+				if (noAdd) {
+					
+					tooltip.find('.toolTipText').addClass('tooltip-red');
+				}
+
+				// Add tooltip to body
+				$('body').append(tooltip);
+
+				const $cell = $(this);
+				const cellOffset = $cell.offset();
+				const cellHeight = $cell.outerHeight();
+				const tooltipWidth = tooltip.outerWidth();
+				const tooltipHeight = tooltip.outerHeight();
+
+				// Clone the text into a temporary span to measure it
+				const textClone = $('<span>')
+					.text($cell.text().trim())
+					.css({
+						position: 'absolute',
+						visibility: 'hidden',
+						whiteSpace: 'nowrap',
+						font: $cell.css('font'), // preserve font for accuracy
+						fontSize: $cell.css('font-size'),
+						fontWeight: $cell.css('font-weight'),
+						fontFamily: $cell.css('font-family')
+					})
+					.appendTo('body');
+
+				const textWidth = textClone.outerWidth();
+			
+				textClone.remove();
+
+				// Final position
+				const tooltipTop = cellOffset.top + cellHeight / 2 - tooltipHeight / 2;
+				const tooltipLeft = cellOffset.left + textWidth + 6; // small buffer
+
+				tooltip.css({
+					top: tooltipTop + 'px',
+					left: tooltipLeft + 'px',
+					zIndex: 9999
+				});
+			}
+			catch (e) {
+	
+				console.error(e);
+			}
+		});
+
+
+		$(document).on('mouseleave', '#dealid-cell', function() {
+			
+			$('.dynamic-tooltip').remove();
+		});
 
 
 		$(document).on('mouseenter', '[id]', function() {
@@ -887,11 +1348,13 @@
 			const dealLast = $('#dealLast').prop('checked');
 			const dcaMaxOrder = $('#dcaMaxOrder').val();
 			const dcaTakeProfitPercent = $('#dcaTakeProfitPercent').val();
-	
+			const profitCurrency = $('#profitCurrency').val();
+
 			let dataObj = {
 							'dealLast': dealLast,
 							'dcaMaxOrder': dcaMaxOrder,
-							'dcaTakeProfitPercent': dcaTakeProfitPercent
+							'dcaTakeProfitPercent': dcaTakeProfitPercent,
+							'profitCurrency': profitCurrency
 						  };
 
 			modalTracker[modalId].dialog('close');
@@ -942,7 +1405,7 @@
 			durationLabels : '(?:years|year|y),(?:days|day|d),(?:hours|hour|h),(?:minutes|minute|min|m),(?:seconds|second|sec|s)',
 			textExtraction: {
 
-				8: function(node) {
+				9: function(node) {
 
 					if (node.innerHTML.indexOf('%') != -1) {
 
@@ -952,7 +1415,7 @@
 
 					return node.innerHTML;
 				},
-				9: function(node) {
+				11: function(node) {
 
 					if (node.innerHTML.indexOf('%') != -1) {
 
@@ -980,30 +1443,32 @@
 				},
 				7: {
 					sorter: "currency"
+				},
+				10: {
+					sorter: "currency"
 				}
 			}
 		});
 
 
-		$('#botDealSelectorShow').click(function() {
+		$('#csvDownload').click(function() {
 
-			if ($('.botDealSelectorWrapper').is(':visible')) {
-
-				$('.botDealSelectorWrapper').fadeOut(300);
-			}
-			else {
-
-				$('.botDealSelectorWrapper').fadeIn(300);
-			}
+			csvDownloadConfirm(csvDataArr);
 		});
 
 
+		$('#botDealSelectorShow').click(function() {
+
+			$('.botDealSelectorWrapper').toggleClass('is-visible');
+		});
+
+
+		// Row click — data cols open order history or trading view
 		$(document).on('click', '#botsDeals tbody tr td', function() {
 
 			let col = $(this).index();
 			let row = $(this).closest('tr');
 			let content = $(this).text();
-
 			let colCount = $(row).find('td').length;
 
 			if (col == 2) {
@@ -1015,85 +1480,9 @@
 
 				showTradingView(modalId, 'modal', false, false, pair, exchange);
 			}
-			else if (col == (colCount - 1) && content != '') {
+			else if (col < colCount - 1) {
 
-				// Disable / Stop Bot
-				let data = { 'bot_id': '' };
-
-				let botId = $(this).data('botid');
-				let botName = $(this).data('botname');
-
-				if (botId) {
-
-					data.bot_id = botId;
-
-					stopBotConfirm(botName, $(this), data);
-				}
-			}
-			else if (col == (colCount - 2)) {
-
-				// Cancel Deal
-				let pair = row.data('pair');
-				let dealId = row.data('dealid');
-
-				if (dealId) {
-
-					cancelDeal(pair, dealId);	
-				}
-      		}
-			else if (col == (colCount - 3)) {
-
-				// Pause Deal
-				let pair = row.data('pair');
-				let dealId = row.data('dealid');
-
-				let pause = $(this).data('pause');
-				let pauseBuy = $(this).data('pausebuy');
-				let pauseSell = $(this).data('pausesell');
-
-				if (dealId) {
-
-					pauseDeal(pair, dealId, pause, pauseBuy, pauseSell);
-				}
-			}
-			else if (col == (colCount - 4)) {
-
-				// Add Funds
-				let pair = row.data('pair');
-				let dealId = row.data('dealid');
-
-				if (dealId) {
-
-					showAddFunds(pair, dealId);	
-				}
-			}
-			else if (col == (colCount - 5)) {
-
-				// Panic Sell / Close Deal
-				let dealId = row.data('dealid');
-
-				if (dealId) {
-
-					panicSellConfirm(dealId);
-				}
-			}
-			else if (col == (colCount - 6)) {
-
-				// Edit Deal
-				let data = { 'deal_id': '' };
-
-				let dealId = row.data('dealid');
-
-				if (dealId) {
-
-					data.deal_id = dealId;
-
-					dealEdit(dealId);
-				}
-			}
-			else {
-
-				// Order History
+				// Order History — any data column
 				let dealId = row.data('dealid');
 
 				if (dealTracker[dealId] == undefined || dealTracker[dealId] == null) {
@@ -1101,7 +1490,54 @@
 					return;
 				}
 
-				showOrderHistory(modalId, dealId, dealTracker[dealId]['info']['active'], dealTracker[dealId]['orders']);
+				showOrderHistory(modalId, dealId, dealTracker[dealId]['info']['active'], dealTracker[dealId]['orders'], dealTracker[dealId]['info']['pair']);
+			}
+		});
+
+		// Pill button clicks — identified by pill-btn class on the clicked span
+		$(document).on('click', '#botsDeals .pill-btn', function(e) {
+
+			e.stopPropagation();
+
+			let $btn = $(this);
+			let $td  = $btn.closest('td');
+			let row  = $btn.closest('tr');
+			let dealId   = row.data('dealid');
+			let pair     = row.data('pair');
+			let btnTitle = $btn.attr('title');
+
+			if (btnTitle === 'AI Analyze deal') {
+
+				if (dealTracker[dealId] == undefined || dealTracker[dealId] == null) return;
+
+				renderAIContent(dealId);
+			}
+			else if (btnTitle === 'Edit deal') {
+
+				if (dealId) dealEdit(dealId);
+			}
+			else if (btnTitle === 'Close deal') {
+
+				if (dealId) panicSellConfirm(dealId);
+			}
+			else if (btnTitle === 'Add funds to deal') {
+
+				if (dealId) showAddFunds(pair, dealId);
+			}
+			else if (btnTitle === 'Pause deal' || btnTitle === 'Resume deal') {
+
+				if (dealId) pauseDeal(pair, dealId, $td.data('pause'), $td.data('pausebuy'), $td.data('pausesell'), $td.data('pausereason'));
+			}
+			else if (btnTitle === 'Cancel deal') {
+
+				if (dealId) cancelDeal(pair, dealId);
+			}
+			else if (btnTitle === 'Stop bot') {
+
+				let botId   = $td.data('botid');
+				let botName = $td.data('botname');
+
+				if (botId) stopBotConfirm(botName, $btn, { 'bot_id': botId });
 			}
 		});
 
@@ -1130,6 +1566,13 @@
 		</div>
 	</div>
 
+	<div id="circuitBreakerBanner" style="display:none; margin-bottom:10px;">
+		<div style="background:#7a4f00; color:#ffe08a; border:1px solid #c47f00; border-radius:6px; padding:10px 16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+			<span>⚡ <b>Circuit Breaker Active</b> — <span id="cbReason"></span> &nbsp;|&nbsp; Resumes in <span id="cbCountdown"></span></span>
+			<button class="btn btn-default" id="cbClearBtn" style="font-size:1.1rem; padding:3px 12px;">Clear</button>
+		</div>
+	</div>
+
 	<div id="contentBox">
 
 		<div style="position: relative;">
@@ -1137,18 +1580,31 @@
 			<div class="contentHeaderBox">
 
 				<b class="contentHeader">Active DCA Bot Deals</b>
-				<span id="botDealSelectorShow">&#9881;</span>
-				<span style="display: flex; font-size: 1.2rem; justify-content: center; gap: 20px; margin-top: 10px;">
-					<p style="margin-top: 0; margin-bottom: 0;">Active P/L: <span id="totalProfit"></span></p>
-					<p style="margin-top: 0; margin-bottom: 0;">In Deals: <span id="inDeals"></span></p>
-					<p style="margin-top: 0; margin-bottom: 0;">Deals: <span id="totalDeals"></span></p>
-					<div class="active-filter" style="display: inline-flex; align-items: center; gap: 5px; height: 20px;">
-						<p>Bot: </p>
-						<select class="form-field" id="active-bot-filter">
-							<option value="all"></option>
-						</select>
-					</div>
+
+				<span class="viewSettings">
+					<span id="csvDownload" class="viewIconBtn"><span class="icon icon-download" style="width:13px;height:13px;"></span></span>
+					<span id="botDealSelectorShow" class="viewIconBtn"><span class="icon icon-columns" style="width:13px;height:13px;"></span></span>
 				</span>
+
+				<div class="summary-bar">
+					<p>Active P/L: <span id="totalProfit"></span></p>
+					<p>Projected Profit: <span id="projectedProfit"></span></p>
+					<p>In Deals: <span id="inDeals"></span></p>
+					<p>Deals: <span id="totalDeals"></span></p>
+					<div class="active-filter">
+						<p>Bot:</p>
+							<select class="form-field" id="active-bot-filter">
+								<option value="all"></option>
+							</select>
+					</div>
+				</div>
+
+				<div class="summary-bar" id="portfolioRiskBar" style="display:none;">
+					<p>Portfolio: <span id="portfolioTotal"></span></p>
+					<p>Max Funds: <span id="portfolioMaxFunds"></span></p>
+					<p>Risk: <span id="portfolioRisk"></span></p>
+					<p id="portfolioBalanceAge" style="font-size:0.8em; opacity:0.6;"></p>
+				</div>
 			</div>
 
 			<span id="msgBox" style="position: relative; display: flex; justify-content: center;"></span>
@@ -1159,7 +1615,7 @@
 
 				<thead style="position: sticky; top: 0; z-index: 1000;">
 					<tr class="tableHeader">
-						<th>Bot Name</th> <th>Deal ID</th> <th>Pair</th> <th>Duration</th> <th>Price</th> <th>Price Target</th> <th>Volume</th> <th>Profit</th> <th>Profit %</th> <th>TP</th> <th>Safety Orders</th> <th>Deals</th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th> <th data-sorter="false" class="columnSelector-disable"></th>
+						<th>Bot Name</th> <th>Deal ID</th> <th>Pair</th> <th>Duration</th> <th>Price</th> <th>Price Target</th> <th>Volume</th> <th>Profit</th> <th>Profit &#x25C9;</th> <th>Profit %</th> <th>Profit &asymp;</th> <th>TP</th> <th>Safety Orders</th> <th>Max Funds</th> </th> <th>Deals</th> <th data-sorter="false" class="columnSelector-disable"></th>
 					</tr>
 				</thead>
 
@@ -1180,6 +1636,15 @@
 
 				<tr><td>Target Profit %:</td> <td><input id="dcaTakeProfitPercent" name="dcaTakeProfitPercent" class="form-field"></td></tr>
 				<tr><td>Max Safety Orders:</td> <td><input id="dcaMaxOrder" name="dcaMaxOrder" class="form-field"></td></tr>
+
+				<tr><td>Profit Currency: 
+
+					<span class="toolTip" style="padding: 0px 4px;">?<span class="toolTipText">
+					Currency used for the profit for this deal. Changing this will not affect other deals.
+					</span></span>
+
+				</td> <td><select id="profitCurrency" name="profitCurrency" class="form-field" style="width: 100px; cursor: pointer;"><option value="base">Base<option value="quote">Quote</option></select></td></tr>
+
 				<tr><td>Last Deal:
 				
 				<span class="toolTip" style="padding: 0px 4px;">?<span class="toolTipText">

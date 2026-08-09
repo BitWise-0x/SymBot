@@ -60,6 +60,66 @@ $.confirm({
 }
 
 
+function updateSystem() {
+
+$.confirm({
+	  title: false,
+	  boxWidth: "50%",
+	  useBootstrap: false,
+	  content: `<div style="font-size: 1.2rem; text-align: left;">Update <%- appData.name_main %>?<br><br>
+	<form action="" style="display: inline;">
+	<B>WARNING:</b>
+
+		<ul>
+			<li>This will update <%- appData.name_main %> and all Hub instances to the latest version.
+			<li>All functionality will stop and will only resume after the system is back online.
+			<li><%- appData.name_main %> will shutdown after the update completes. You must start it manually if you do not have a process manager that does it automatically.
+			<li>Performing a backup before updating the system is strongly recommended
+			<li>It is highly recommended to monitor logs and activity for a period of time after the update completes to ensure everything is working as expected.
+		</ul>
+
+	<input type="checkbox" id="confirmBox" class="form-field" style="width: 20px;" /> <b>Check the box to confirm <span style="color: #d80f08;">UPDATE</span> <%- appData.name_main %></b>
+	</form>
+	</div>`,
+	  buttons: {
+		  formSubmit: {
+			  btnClass: 'btn-default',
+			  text: '<div style="color: #d80f08;">Update</div>',
+			  action: function() {
+
+				const inputValue = parseFloat($('#confirmNum').val());
+				const confirmBox = $('#confirmBox').prop('checked');
+
+				if (!confirmBox) {
+
+					alertBox('You must check the box to confirm update', function() {});
+				}
+				else {
+
+					processUpdate();
+				 }
+			  },
+		  },
+		  cancel: {
+			  btnClass: 'btn-default',
+			  text: '<div style="color: #000000;">Cancel</div>',
+			  action: function() {},
+		},
+	},
+	  onContentReady: function() {
+
+		$('#confirmBox').prop('checked', false);
+
+		let jc = this;
+		  this.$content.find("form").on("submit", function(e) {
+			e.preventDefault();
+			  jc.$$formSubmit.trigger("click");
+		  });
+	  },
+  });
+}
+
+
 function backupDb() {
 
 $.confirm({
@@ -83,6 +143,10 @@ $.confirm({
 		<input class="form-field" type="password" style="width: 200px;" id="encryptPasswordConfirm" name="encryptPasswordConfirm" required>
 
 		<br><br>
+		<input type="checkbox" id="includeChatsBackup" class="form-field" style="width: 20px;" /> <b>Include AI chats</b>
+
+		<br><br>
+
 		<input type="checkbox" id="confirmBox" class="form-field" style="width: 20px;" /> <b>Check the box to confirm <span style="color: #d80f08;">BACKUP</span> database</b>
 	</form>
 	</div>`,
@@ -111,7 +175,8 @@ $.confirm({
 				}
 				else {
 
-					processBackupDb(password);
+					const includeChats = $('#includeChatsBackup').prop('checked');
+					processBackupDb(password, includeChats);
 				 }
 			  },
 		  },
@@ -124,6 +189,8 @@ $.confirm({
 	  onContentReady: function() {
 
 		$('#confirmBox').prop('checked', false);
+		$('#includeChatsBackup').simpleSwitch();
+		$('#includeChatsBackup').prop('checked', false);
 
 		let jc = this;
 		  this.$content.find("form").on("submit", function(e) {
@@ -162,6 +229,8 @@ $.confirm({
 
 		<br><br>
 		<input id="resetServerId" name="resetServerId" type=checkbox class="form-field"> &nbsp; <b>Reset server ID</b>
+		<br><br>
+		<input id="resetAiChats" name="resetAiChats" type=checkbox class="form-field"> &nbsp; <b>Reset AI chat history</b>
 		<br>
 		<input id="convertData" name="convertData" type=checkbox class="form-field"> &nbsp; <b>Convert all bots and deals to sandbox mode</b>
 	</form>
@@ -180,6 +249,7 @@ $.confirm({
 				const confirmBox = $('#confirmBox').prop('checked');
 				const convertData = $('#convertData').prop('checked');
 				const resetServerId = $('#resetServerId').prop('checked');
+				const resetAiChats  = $('#resetAiChats').prop('checked');
 				const password = $('#decryptPassword').val();
 
 				if (!confirmBox) {
@@ -192,7 +262,7 @@ $.confirm({
 				}
 				else {
 
-					processRestoreDb(password, convertData, resetServerId);
+					processRestoreDb(password, convertData, resetServerId, resetAiChats);
 				 }
 			  },
 		  },
@@ -209,6 +279,8 @@ $.confirm({
 
 		$('#resetServerId').simpleSwitch();
 		$('#resetServerId').prop('checked', false);
+		$('#resetAiChats').simpleSwitch();
+		$('#resetAiChats').prop('checked', false);
 	},
 	onContentReady: function() {
 
@@ -224,6 +296,141 @@ $.confirm({
 }
 
 
+function loadRollbacks() {
+
+	$.ajax({
+		type: 'GET',
+		url: './system/rollbacks',
+		dataType: 'json',
+		success: function(data) {
+
+			const $list = $('#rollback-list');
+			$list.empty();
+
+			if (!data.data || data.data.length === 0) {
+
+				$list.append('<div style="font-size: 1.1rem; color: #888;">No rollback snapshots available. Snapshots are created automatically before each update.</div>');
+				return;
+			}
+
+			data.data.forEach(function(snap) {
+
+				const date = snap.date ? new Date(snap.date).toLocaleString() : 'Unknown date';
+				$list.append(
+					'<div style="display: flex; align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px solid #3e3e3e;">' +
+					'<span style="font-size: 1.1rem; flex: 1;">v' + snap.version + ' &mdash; ' + date + '</span>' +
+					'<a href="javascript:void(0);" onclick="rollbackSystem(' + JSON.stringify(snap.snapshotName) + ');" style="color: #d80f08; font-size: 1.0rem;">Rollback</a>' +
+					'</div>'
+				);
+			});
+		},
+		error: function() {
+
+			$('#rollback-list').html('<div style="color: #d80f08;">Failed to load rollback snapshots.</div>');
+		}
+	});
+}
+
+
+function rollbackSystem(snapshotName) {
+
+	$.confirm({
+		title: false,
+		boxWidth: '50%',
+		useBootstrap: false,
+		content: '<div style="font-size: 1.2rem; text-align: left;">Rollback to ' + snapshotName + '?<br><br>' +
+			'<div style="font-size: 1.0rem; padding: 8px; background: rgba(255,140,0,0.15); border-left: 3px solid #ffa000; border-radius: 2px;">' +
+			'<b>Note:</b> Rollback restores code files only. The database is not affected. ' +
+			'If the update introduced database schema changes, rolling back the code may cause compatibility issues. ' +
+			'Review the logs after restart to confirm everything is working.</div><br>' +
+			'<input type="checkbox" id="rollbackConfirmBox" class="form-field" style="width: 20px;" /> ' +
+			'<b>Check the box to confirm <span style="color: #d80f08;">ROLLBACK</span></b>' +
+			'</div>',
+		buttons: {
+			formSubmit: {
+				btnClass: 'btn-default',
+				text: '<div style="color: #d80f08;">Rollback</div>',
+				action: function() {
+
+					if (!$('#rollbackConfirmBox').prop('checked')) {
+
+						alertBox('You must check the box to confirm rollback', function() {});
+						return false;
+					}
+
+					processRollback(snapshotName);
+				}
+			},
+			cancel: {
+				btnClass: 'btn-default',
+				text: '<div style="color: #000000;">Cancel</div>',
+				action: function() {}
+			}
+		},
+		onContentReady: function() {
+
+			$('#rollbackConfirmBox').prop('checked', false);
+		}
+	});
+}
+
+
+function processRollback(snapshotName) {
+
+	$('#spinner-overlay').fadeIn(100);
+
+	$.ajax({
+		type: 'POST',
+		url: './system/rollback',
+		contentType: 'application/json',
+		data: JSON.stringify({ snapshotName }),
+		dataType: 'json',
+		success: function(data) {
+
+			$('#spinner-overlay').fadeOut(100);
+
+			if (data.success) {
+
+				alertBox('Rollback successful! SymBot is shutting down. If you do not have a process manager it must be started manually.', function() {});
+			}
+			else {
+
+				alertBox('Rollback failed: ' + (data.error || 'Unknown error'), function() {});
+			}
+		},
+		error: function(data) {
+
+			$('#spinner-overlay').fadeOut(100);
+			alertBox('Error occurred during rollback.', function() {});
+		}
+	});
+}
+
+
+function showRollbacks() {
+
+	$.confirm({
+		title: false,
+		boxWidth: '60%',
+		useBootstrap: false,
+		content: '<div style="font-size: 1.2rem; text-align: left;">Rollback System<br><br>' +
+			'<div id="rollback-list" style="font-size: 1.1rem; min-height: 40px;">Loading...</div>' +
+			'</div>',
+		buttons: {
+			close: {
+				btnClass: 'btn-default',
+				text: '<div style="color: #000000;">Close</div>',
+				action: function() {}
+			}
+		},
+		onContentReady: function() {
+
+			loadRollbacks();
+		}
+	});
+}
+
+
 function processShutDown() {
 
     const requestBody = {};
@@ -232,7 +439,7 @@ function processShutDown() {
 
     $.ajax({
         type: 'POST',
-        url: '/system/shutdown',
+        url: './system/shutdown',
         data: requestBody,
         dataType: 'json',
         success: function(data) {
@@ -249,14 +456,56 @@ function processShutDown() {
 }
 
 
-function processBackupDb(password) {
+function processUpdate() {
+
+const requestBody = {};
+
+$('#spinner-overlay').fadeIn(100);
+
+$.ajax({
+		type: 'POST',
+		url: './system/update',
+		data: requestBody,
+        dataType: 'json',
+		success: function(data) {
+
+			$('#spinner-overlay').fadeOut(100);
+
+			alertBox('Update successful!', function() {});
+		},
+		error: function(data) {
+
+			$('#spinner-overlay').fadeOut(100);
+
+			let message = 'Error occurred during update process.';
+
+			const responseText = data.responseText || message;
+
+			try {
+
+				const parsedResponse = JSON.parse(responseText);
+				message = parsedResponse.message || responseText;
+			}
+			catch (e) {
+
+				message = responseText;
+			}
+
+			alertBox(message, function() {});
+		}
+	});
+}
+
+
+function processBackupDb(password, includeChats) {
 
 	const requestBody = new URLSearchParams();
 	requestBody.append('password', password);
+	requestBody.append('include_chats', includeChats ? 'true' : 'false');
 
 	$('#spinner-overlay').fadeIn(100);
 
-	fetch('/system/backup', {
+	fetch('./system/backup', {
 			method: 'POST',
 			body: requestBody,
 			headers: {
@@ -311,7 +560,7 @@ function processBackupDb(password) {
 }
 
 
-function processRestoreDb(password, convertData, resetServerId) {
+function processRestoreDb(password, convertData, resetServerId, resetAiChats) {
 
 	const fileInput = $('#file-input')[0]; // Assuming you have an input with id="file-input"
 	const file = fileInput.files[0];
@@ -327,13 +576,14 @@ function processRestoreDb(password, convertData, resetServerId) {
 	formData.append('backupFile', file);
 	formData.append('convertData', convertData);
 	formData.append('resetServerId', resetServerId);
+	formData.append('resetAiChats', resetAiChats || false);
 	formData.append('password', password);
 
 	$('#spinner-overlay').fadeIn(100);
 
 	$.ajax({
 		type: 'POST',
-		url: '/system/restore',
+		url: './system/restore',
 		data: formData,
 		contentType: false, // Prevent jQuery from overriding content type
 		processData: false, // Prevent jQuery from processing the data
@@ -371,20 +621,28 @@ function processRestoreDb(password, convertData, resetServerId) {
 
 <main>
 
-	<div id="contentBox" style="text-align: center; max-width: 400px; margin-top: 40px;">
+	<div id="contentBox" style="text-align: center; max-width: 480px; margin-top: 40px;">
 
-	<div style="display: inline-block; text-align: left; font-size: 1.3rem; width: 70%;">
+	<div style="display: inline-block; text-align: left; font-size: 1.3rem; width: 80%;">
 
 		<div class="mainMenuItem">
-			<a href="javascript:void(0);" onclick="backupDb();">Backup Database</a>
+			<a href="javascript:void(0);" onclick="backupDb();"><span class="menu-icon">&#9741;</span> Backup Database</a>
 		</div>
 
 		<div class="mainMenuItem">
-			<a href="javascript:void(0);" onclick="restoreDb();">Restore Database</a>
+			<a href="javascript:void(0);" onclick="restoreDb();"><span class="menu-icon">&#8601;</span> Restore Database</a>
+		</div>
+
+		<div class="mainMenuItem">
+			<a href="javascript:void(0);" onclick="updateSystem();"><span class="menu-icon">&#9651;</span> Update System</a>
+		</div>
+
+		<div class="mainMenuItem">
+			<a href="javascript:void(0);" onclick="showRollbacks();"><span class="menu-icon">&#8635;</span> Rollback System</a>
 		</div>
 
 		<div class="mainMenuItem" style="border-bottom: 0;">
-			<a href="javascript:void(0);" onclick="shutDownSystem();">Shutdown</a>
+			<a href="javascript:void(0);" onclick="shutDownSystem();"><span class="menu-icon">&#9632;</span> Shutdown</a>
 		</div>
 
 	</div>

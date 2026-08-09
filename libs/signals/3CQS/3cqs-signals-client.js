@@ -8,8 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 
-let pathRoot = path.dirname(fs.realpathSync(__dirname)).split(path.sep).join(path.posix.sep);
-pathRoot = pathRoot.substring(0, pathRoot.lastIndexOf('/', pathRoot.lastIndexOf('/') - 1));
+const pathRoot = path.resolve(__dirname, ...Array(3).fill('..'));
 
 const signalsFile = path.dirname(fs.realpathSync(__filename)) + '/signals.json';
 const signalsJson = require(signalsFile);
@@ -19,9 +18,12 @@ const Signals = Schema.Signals3CQSSchema;
 
 const providerId = signalsJson['metadata']['provider_id'];
 
+const disconnectDelayMs = 8000;
+
 let fatalError = false;
 let verboseNotifications = false;
 
+let socketGlobal;
 let shareData;
 
 
@@ -32,10 +34,22 @@ setInterval(() => {
 }, (60000 * 60));
 
 
-
 async function start(enabled, apiKey) {
 
-	if (providerId == undefined || providerId == null  || providerId == '') {
+	let disconnectNotificationTimeout;
+
+	let firstConnect = true;
+	let wasDisconnected = false;
+	let notifiedDisconnect = false;
+
+	if (socketGlobal) {
+
+		await stop(socketGlobal);
+
+		socketGlobal = undefined;
+	}
+
+	if (providerId == undefined || providerId == null || providerId == '') {
 
 		shareData.Common.logger('Invalid Provider ID: ' + signalsFile, true);
 
@@ -48,9 +62,7 @@ async function start(enabled, apiKey) {
 	}
 
 	const socket = require('socket.io-client')('https://stream.3cqs.com', {
-
 		'extraHeaders': {
-
 			'api-key': apiKey,
 			'user-agent': shareData.appData.name + '/' + shareData.appData.version
 		},
@@ -61,16 +73,30 @@ async function start(enabled, apiKey) {
 		'reconnectionDelay': 10000
 	});
 
+	socketGlobal = socket;
 
-	socket.on('connect', (data) => {
+	socket.on('connect', () => {
 
-		let msg = 'Connected to 3CQS Signals';
+		if (disconnectNotificationTimeout) {
 
-		sendNotification(msg, true);
+			clearTimeout(disconnectNotificationTimeout);
+			disconnectNotificationTimeout = null;
+		}
+
+		if (notifiedDisconnect) {
+
+			sendNotification('Reconnected to 3CQS Signals', true);
+		}
+		else if (firstConnect) {
+			
+			sendNotification('Connected to 3CQS Signals', true);
+		}
+
+		firstConnect = false;
+		wasDisconnected = false;
+		notifiedDisconnect = false;
 
 		let messageId = randomString(15);
-
-		// Get max last n signals
 
 		setTimeout(() => {
 
@@ -82,18 +108,16 @@ async function start(enabled, apiKey) {
 		}, 1000);
 	});
 
-
 	socket.io.on('ping', (data) => {
 
-		//showLog('3CQS SIGNAL PING', data);
+		// Optionally handle ping
 	});
-
 
 	socket.on('signal', (data) => {
 
 		let content = '3CQS SIGNAL RECEIVED';
 
-		if (data['created_history'] != undefined && data['created_history'] != null && data['created_history'] != '') {
+		if (data['created_history']) {
 
 			content += ' (HISTORY)';
 		}
@@ -101,17 +125,15 @@ async function start(enabled, apiKey) {
 		processSignal(data);
 
 		if (shareData.appData.verboseLog) {
-		
+
 			showLog(content, data);
 		}
 	});
-
 
 	socket.on('info', (data) => {
 
 		showLog('3CQS SIGNAL INFO', data);
 	});
-
 
 	socket.on('error', (data) => {
 
@@ -120,23 +142,19 @@ async function start(enabled, apiKey) {
 			fatalError = true;
 		}
 
-		// Too many tries
 		if (data['code'] == 429) {
-
-			// Disconnect and connect again after 30 seconds
 
 			socket.disconnect();
 
 			setTimeout(() => {
 
-				socket.connect();				
+				socket.connect();
 
 			}, 30000);
 		}
 
 		showLog('3CQS SIGNAL ERROR', data);
 	});
-
 
 	socket.on('connect_error', (data) => {
 
@@ -145,7 +163,6 @@ async function start(enabled, apiKey) {
 		showLog('3CQS SIGNAL CONNECT_ERROR', data);
 	});
 
-
 	socket.on('connect_failed', (data) => {
 
 		fatalError = true;
@@ -153,29 +170,28 @@ async function start(enabled, apiKey) {
 		showLog('3CQS SIGNAL CONNECT_FAILED', data);
 	});
 
-
 	socket.on('disconnect', (reason) => {
 
-		let msg = '3CQS SIGNAL Client Disconnected: ' + reason;
+		disconnectNotificationTimeout = setTimeout(() => {
 
-		sendNotification(msg, true);
+			wasDisconnected = true;
+			notifiedDisconnect = true;
 
-		//Either 'io server disconnect' or 'io client disconnect'
-		if (reason === 'io server disconnect') {
+			sendNotification('3CQS SIGNAL Client Disconnected: ' + reason, true);
 
-			let msg = '3CQS SIGNAL Server disconnected the client. Trying to reconnect.';
+			if (reason === 'io server disconnect') {
 
-			sendNotification(msg, true);
+				sendNotification('3CQS SIGNAL Server disconnected the client. Trying to reconnect.', true);
 
-			// Disconnected by server, so reconnect again
-			setTimeout(() => {
+				setTimeout(() => {
 
-				socket.connect();				
+					socket.connect();
 
-			}, 10000);
-		}
+				}, 10000);
+			}
+
+		}, disconnectDelayMs);
 	});
-
 
 	return socket;
 }
@@ -217,6 +233,13 @@ async function processSignal(data) {
 		return;
 	}
 
+	if (shareData.appData.circuit_breaker_active && signal == 'BOT_START') {
+
+		// Log that CB is active when a BOT_START arrives — enforcement is handled
+		// authoritatively in canStartDeal so all clients are treated consistently.
+		shareData.Common.logger(colors.yellow.bold('Circuit Breaker Active: BOT_START signal received for ' + symbol + ' — will be blocked by canStartDeal'));
+	}
+
 	const maxMins = 5;
 
 	const symbol = data['symbol'];
@@ -249,13 +272,7 @@ async function processSignal(data) {
 
 	let diffSec = (new Date().getTime() - new Date(created).getTime()) / 1000;
 
-	// Check if signal was already logged
-	const signalDataDb = await getSignalDb({ 'signal_id': signalId });
-
-	updateDb(data);
-
-	// Only start if signal has not been seen before
-	if (signalDataDb.length == 0 && signal == 'BOT_START' && diffSec < (60 * maxMins)) {
+	if (signal == 'BOT_START' && diffSec < (60 * maxMins)) {
 
 		let query = {
 						'active': true,
@@ -279,6 +296,17 @@ async function processSignal(data) {
 				const botName = bot.botName;
 				const config = bot.config;
 				const pairs = config.pair;
+
+				// Check if signal was already logged for a particular bot
+				const signalDataDb = await getSignalDb({ 'bot_id': botId, 'signal_id': signalId });
+
+				updateDb(botId, data);
+
+				// Only start if signal has not been seen before
+				if (signalDataDb.length != 0) {
+
+					return;
+				}
 
 				if (config.startConditions != undefined && config.startConditions != null) {
 
@@ -462,7 +490,7 @@ async function removeDataDb() {
 
 async function convertCondition(data) {
 
-	const numsRegEx = /^[0-9. ]+$/;
+	const numsRegEx = /^-?[0-9. ]+$/;
 
 	if (numsRegEx.test(data)) {
 
@@ -477,9 +505,10 @@ async function convertCondition(data) {
 }
 
 
-async function updateDb(data) {
+async function updateDb(botId, data) {
 
 	const signal = new Signals({
+									'bot_id': botId,
 									'signal_id': data.signal_id,
 									'signal_id_parent': data.signal_id_parent,
 									'created': data.created,
