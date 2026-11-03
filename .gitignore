@@ -7,3 +7,6 @@ node_modules
 # locally generated package-lock.json must never be committed.
 package-lock.json
 
+
+# Local working notes for this clone; never committed.
+.claude/
