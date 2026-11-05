@@ -674,6 +674,71 @@ register('clock_skew', async function (shareData) {
 });
 
 
+// Pure evaluation of which OPEN deals are HELD mid-close by the slippage-safe graceful close (#130). A deal
+// whose persisted partialSell.active is true is holding an unsold remainder because the market fell below the
+// floor after the take-profit triggered; it auto-resumes selling that remainder when price recovers above the
+// floor, so a hold is self-healing — but one that stays held wants an operator's eye (a prolonged below-floor
+// pair, or a decision to panic_sell). SINGLE SOURCE OF TRUTH is deal.partialSell (also what handleFloorHold
+// persists and what the UI pause banner reads) — this only reports it, never changes an order. A short GRACE
+// skips a very recent hold: handleFloorHold already sent a one-time alert, and a brief hold usually resolves on
+// the next tick, so the watchdog nags only about PERSISTENT holds. Returns a single finding, or null.
+function evaluateSellPartialHold(deals, now, graceMs) {
+
+	if (!Array.isArray(deals) || deals.length === 0) { return null; }
+
+	const nowMs = (now != null && isFinite(Number(now))) ? Number(now) : Date.now();
+	const grace = (graceMs != null && isFinite(Number(graceMs)) && Number(graceMs) >= 0) ? Number(graceMs) : (15 * 60 * 1000);
+
+	const held = [];
+
+	for (let i = 0; i < deals.length; i++) {
+
+		const d = deals[i];
+		const ps = d && d.partialSell;
+
+		if (!ps || ps.active !== true) { continue; }
+
+		const heldMs = ps.heldAt ? new Date(ps.heldAt).getTime() : nowMs;
+		const ageMs = nowMs - (isFinite(heldMs) ? heldMs : nowMs);
+
+		if (ageMs < grace) { continue; }
+
+		held.push({ id: (d.dealId || d.pair || '?'), pair: d.pair || '?', ageMs: Math.max(ageMs, 0) });
+	}
+
+	if (held.length === 0) { return null; }
+
+	held.sort(function (a, b) { return b.ageMs - a.ageMs; });
+
+	const mins = Math.round(held[0].ageMs / 60000);
+	const shown = held.slice(0, 10).map(function (h) { return h.pair + ' (' + Math.round(h.ageMs / 60000) + 'm)'; }).join(', ') + (held.length > 10 ? ', …' : '');
+
+	return {
+		action: 'watchdog.sell_partial_hold',
+		target: String(held.length),
+		detail: held.length + ' deal(s) held mid-close below the break-even floor (slippage-safe close), longest ' + mins + ' min: ' + shown + '. Each holds its unsold remainder and auto-resumes when price recovers above the floor; use panic_sell to force an exit now.'
+	};
+}
+
+// Held-deal monitor (#130). Surfaces deals the slippage-safe graceful close is holding below break-even, so a
+// prolonged hold is not silently forgotten. Read-only — reads open deals and reports; never touches an order
+// (panic_sell stays the only operator-driven below-floor exit). No-op on the Hub / in tests (no DCABot.getDeals),
+// and silent unless a hold has persisted past the grace window.
+register('sell_partial_hold', async function (shareData) {
+
+	const DCABot = shareData && shareData.DCABot;
+	if (!DCABot || typeof DCABot.getDeals !== 'function') { return null; }
+
+	const openDeals = await DCABot.getDeals({ status: 0 });
+
+	const graceMs = (shareData.appData && Number(shareData.appData.partial_sell_hold_grace_mins) > 0)
+		? Number(shareData.appData.partial_sell_hold_grace_mins) * 60 * 1000
+		: (15 * 60 * 1000);
+
+	return evaluateSellPartialHold(openDeals, Date.now(), graceMs);
+});
+
+
 function resolveIntervalMs(shareData) {
 
 	const secs = (shareData && shareData.appData) ? Number(shareData.appData.watchdog_interval_secs) : NaN;
@@ -707,4 +772,4 @@ function startMonitor(shareData, context) {
 }
 
 
-module.exports = { register, list, run, runOnce, startMonitor, resolveIntervalMs, DEFAULT_INTERVAL_MS, evaluateInstanceLiveness, livenessStartupGraceMs, isMutatingToolName, evaluateLockArtifacts, evaluateClockSkew };
+module.exports = { register, list, run, runOnce, startMonitor, resolveIntervalMs, DEFAULT_INTERVAL_MS, evaluateInstanceLiveness, livenessStartupGraceMs, isMutatingToolName, evaluateLockArtifacts, evaluateClockSkew, evaluateSellPartialHold };

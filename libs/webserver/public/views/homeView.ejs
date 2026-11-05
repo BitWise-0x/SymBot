@@ -28,11 +28,11 @@
 			</a>
 			<a class="home-quick-card" href="./bots">
 				<span class="home-quick-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M9 4h6"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></svg></span>
-				<span class="home-quick-label">Manage Bots</span>
+				<span class="home-quick-label">Manage DCA Bots</span>
 			</a>
 			<a class="home-quick-card" href="./bots/create">
 				<span class="home-quick-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></span>
-				<span class="home-quick-label">Create Bot</span>
+				<span class="home-quick-label">Create DCA Bot</span>
 			</a>
 		</div>
 
@@ -67,15 +67,17 @@
 						if (Array.isArray(load) && load.length >= 1 && cores > 0) {
 
 							const loadPct = Math.min(999, Math.round((load[0] / cores) * 100));
-							const loadClass = loadPct >= 90 ? 'health-load-high' : (loadPct >= 70 ? 'health-load-med' : 'health-load-low');
+							// Cutoffs single-sourced in SymBot.UI.severityClass; this family labels the middle tier "med".
+							const loadLabels = { high: 'high', mid: 'med', low: 'low' };
+							const loadClass = SymBot.UI.severityClass(loadPct, 'health-load', { labels: loadLabels });
 
 							$('#homeLoad').text(loadPct + '%')
-								.removeClass('health-load-low health-load-med health-load-high')
+								.removeClass(SymBot.UI.severityClassList('health-load', loadLabels))
 								.addClass(loadClass);
 						}
 						else {
 
-							$('#homeLoad').text('—').removeClass('health-load-low health-load-med health-load-high');
+							$('#homeLoad').text('—').removeClass(SymBot.UI.severityClassList('health-load', { high: 'high', mid: 'med', low: 'low' }));
 						}
 
 						$('#homeHealthStrip').removeClass('home-health-strip-hidden');

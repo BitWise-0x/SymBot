@@ -47,6 +47,7 @@ const AuthMiddleware = require(__dirname + '/libs/app/AuthMiddleware.js');
 const RoutePermissions = require(__dirname + '/libs/app/RoutePermissions.js');
 const Sessions = require(__dirname + '/libs/app/Sessions.js');
 const Watchdog = require(__dirname + '/libs/app/Watchdog.js');
+const SharedAppData = require(__dirname + '/libs/app/sharedAppData.js');
 const HubStore = require(__dirname + '/libs/app/store/HubStore.js');
 const Hub = require(__dirname + '/libs/app/Hub/Hub.js');
 const HubMain = require(__dirname + '/libs/app/Hub/Main.js');
@@ -187,6 +188,10 @@ async function startHub() {
 							'ip_filter': (hubData['data'] && hubData['data']['ip_filter']) || {},
 							// security.trust_proxy controls the client-IP source (see AuthMiddleware.clientIp).
 							'security': (hubData['data'] && hubData['data']['security']) || {},
+							// appData fields that MUST match a standalone instance (e.g. the pause-reason taxonomy the
+							// UI reads). Defined ONCE in libs/app/sharedAppData.js and spread into both entry points so
+							// instance and Hub never drift — add a shared field there, not in each literal.
+							...SharedAppData.commonFields(),
 							'path_root': __dirname,
 							'hub_filename': __filename,
 							'web_server_ports': undefined,

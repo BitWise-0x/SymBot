@@ -827,6 +827,12 @@ async function _updateConfigImpl(req, res) {
 		// Update live appData so circuit breaker takes effect immediately without restart
 		shareData.appData.circuit_breaker = appConfig['circuit_breaker'];
 
+		// Slippage-safe graceful close (#130): there is no config-form field yet, so this block is never rebuilt
+		// from the request body — it is preserved as-is in appConfig across a save. Mirror whatever is stored to
+		// live appData so a future UI toggle (and the stored default) take effect without a restart. Absent =
+		// feature off (today's behavior), which is the safe default.
+		if (appConfig['close_execution']) { shareData.appData.close_execution = appConfig['close_execution']; }
+
 
 		// Assemble the backup settings for the schedule row. Secrets left blank on the
 		// form fall back to the current stored values (sourced from the backup schedule,

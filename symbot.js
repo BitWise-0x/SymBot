@@ -16,6 +16,7 @@
 // and an unsupported runtime is caught first. Full rationale lives in libs/app/Bootstrap.js.
 const Bootstrap = require(__dirname + '/libs/app/Bootstrap.js');
 const FileLock = require(__dirname + '/libs/app/FileLock.js');
+const SharedAppData = require(__dirname + '/libs/app/sharedAppData.js');
 Bootstrap.enforceNodeVersion(__dirname, 'SymBot');
 Bootstrap.preferDnsOrder();
 
@@ -455,6 +456,13 @@ async function init() {
 										'cron_backup': appConfig['data']['cron_backup'],
 										'ai': appConfig['data']['ai'] || {},
 										'circuit_breaker': appConfig['data']['circuit_breaker'] || {},
+										// Slippage-safe graceful close (#130). Absent / disabled = today's behavior exactly
+										// (a graceful close never holds). `|| {}` keeps an old app.json safe on upgrade.
+										'close_execution': appConfig['data']['close_execution'] || {},
+										// appData fields that MUST be identical in a standalone instance and the Hub (e.g. the
+										// pause-reason taxonomy injected to the UI). Defined ONCE in libs/app/sharedAppData.js and
+										// spread into both entry points, so a new shared field is never added in just one place.
+										...SharedAppData.commonFields(),
 										'ip_filter': appConfig['data']['ip_filter'] || {},
 										// security.trust_proxy (client-IP source) and security.login_throttle
 										// are read from here — they were previously omitted so those options

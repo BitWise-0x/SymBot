@@ -281,25 +281,23 @@ SymBot.UI = {
 
 	/**
 	 * Classify a deal's pauseReason. A "system" pause is one SymBot applied itself (order verification,
-	 * a sell error) rather than a manual user pause — the UI tints those rows and warns before a manual
-	 * resume. Single source of truth for both the deal list and the pause/resume dialog so a new reason
-	 * is recognized everywhere at once.
+	 * a sell error, a slippage-safe-close hold) rather than a manual user pause — the UI tints those rows and
+	 * warns before a manual resume.
+	 *
+	 * SINGLE SOURCE OF TRUTH: the taxonomy lives in the backend (libs/app/pauseReasons.js — the same module the
+	 * money path SETS reasons from) and is injected into the page by partialsHeaderView.ejs as
+	 * window.SymBot.PAUSE_REASONS. This helper only looks it up, so the frontend can never drift from the
+	 * reasons the engine actually sets. If the map is absent (a page that did not include the header), a reason
+	 * is treated as a non-system (manual) pause rather than throwing — the UI degrades, never breaks.
 	 * @param {string} pauseReason
 	 * @returns {{ isSystem: boolean, type: string, description: string }}
 	 */
 	systemPauseInfo: function(pauseReason) {
 
-		const map = {
-			'order_verify_buy':    { type: 'buy order',  description: 'a buy order that could not be verified' },
-			'buy_error':           { type: 'buy order',  description: 'a buy order error (buys are paused; the deal can still take profit or stop-loss)' },
-			'order_verify_sell':   { type: 'sell order', description: 'a sell order that could not be verified' },
-			'sell_error':          { type: 'sell order', description: 'a sell order error (it retries automatically)' },
-			'sell_finalize_error': { type: 'sell order', description: 'a sell that filled but could not be finalized' }
-		};
-
+		const map = (typeof window !== 'undefined' && window.SymBot && window.SymBot.PAUSE_REASONS) || {};
 		const info = map[pauseReason || ''];
 
-		return { isSystem: !!info, type: info ? info.type : '', description: info ? info.description : '' };
+		return { isSystem: !!info, type: info ? info.side : '', description: info ? info.description : '' };
 	},
 
 
@@ -721,11 +719,295 @@ SymBot.UI = {
 			'ai':     { button: pill('',            'icon-ai',     'AI Analyze deal'),   tooltip: 'AI Analyze deal' },
 			'cancel': { button: pill('pill-danger', 'icon-cancel', 'Cancel deal'),       tooltip: 'Cancel deal' },
 			'edit':   { button: pill('',            'icon-edit',   'Edit deal'),         tooltip: 'Edit deal' },
-			'panic':  { button: pill('',            'icon-close',  'Close deal'),        tooltip: 'Close deal' },
+			'panic':  { button: pill('pill-danger', 'icon-close',  'Panic sell deal'),   tooltip: 'Panic sell — sell now at market, ignoring the profit target' },
 			'pause':  { button: pill('pill-warn',   'icon-pause',  'Pause deal'),        tooltip: 'Pause deal' },
 			'resume': { button: pill('pill-warn',   'icon-resume', 'Resume deal'),       tooltip: 'Resume deal' },
 			'stop':   { button: pill('pill-danger', 'icon-stop',   'Stop bot'),          tooltip: 'Stop bot' }
 		};
+	},
+
+
+	// ── Confirmation dialogs (single source of truth for the instance AND Hub surfaces) ──────────────────
+	// The delete-bot, enable/disable and panic-sell confirmations were previously hand-copied into both the
+	// instance views and the Hub views, so their wording, styling and safety mechanics (name-match / random
+	// number) drifted apart (e.g. one surface HTML-escaped the bot name and the other did not). These builders
+	// OWN the dialog markup, the confirmation mechanic and the button styling in ONE place; a caller passes only
+	// what legitimately differs between surfaces — the confirm/cancel ACTIONS (an instance calls a local
+	// function; the Hub calls an instance-scoped API action) and any per-surface side effects (auto-refresh,
+	// confirmWaiting). All user-facing text lives here, so a future i18n pass (message table + plurals) swaps it
+	// in ONE place rather than across every view — the language-agnostic seam. The bot name / deal id are always
+	// run through esc(), so a crafted name can never inject markup on either surface.
+	//
+	// opts: { onConfirm?: fn, onCancel?: fn } plus the per-dialog fields noted on each.
+
+	// Delete a bot — danger dialog with name-match confirmation. opts.botName. onConfirm fires only on an exact
+	// (trimmed) name match; a mismatch re-prompts and does not close.
+	confirmDeleteBot: function(opts) {
+
+		opts = opts || {};
+		var botName   = opts.botName || '';
+		var onConfirm = (typeof opts.onConfirm === 'function') ? opts.onConfirm : function () {};
+		var onCancel  = (typeof opts.onCancel  === 'function') ? opts.onCancel  : function () {};
+
+		$.confirm({
+			title: false,
+			boxWidth: '50%',
+			useBootstrap: false,
+			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">' +
+				'<b style="color: var(--color-danger);">Delete ' + SymBot.UI.esc(botName) + '?</b><br><br>' +
+				'<div style="font-size: var(--fs-body); padding: 8px; background: var(--color-danger-soft); border-left: 3px solid var(--color-danger); border-radius: 2px;">' +
+				'<b>This cannot be undone.</b> The bot and all of its deal history will be permanently deleted. Active deals must be closed or canceled first.' +
+				'</div><br>' +
+				'Type the bot name to confirm:<br>' +
+				'<form action="" style="display: inline;"><input type="text" id="deleteBotConfirmName" class="form-field" style="width: 100%; margin-top: 6px; box-sizing: border-box;" required /></form>' +
+				'</div>',
+			buttons: {
+				confirm: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-danger);">Delete Bot</div>',
+					action: function () {
+
+						var typed = (this.$content.find('#deleteBotConfirmName').val() || '').trim();
+
+						if (typed !== botName) { alertBox('Bot name does not match.'); return false; }
+
+						onConfirm();
+					}
+				},
+				cancel: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-neutral);">Cancel</div>',
+					action: function () { onCancel(); }
+				}
+			},
+			onContentReady: function () {
+
+				var jc = this;
+				this.$content.find('form').on('submit', function (e) { e.preventDefault(); jc.$$confirm.trigger('click'); });
+			}
+		});
+	},
+
+	// Enable / disable a bot. opts.botName, opts.enable (bool). onConfirm fires on OK. The caller keeps any
+	// confirmWaiting / auto-refresh handling in its own onConfirm/onCancel, since that differs per surface.
+	confirmToggleBot: function(opts) {
+
+		opts = opts || {};
+		var botName   = opts.botName || '';
+		var enable    = !!opts.enable;
+		var onConfirm = (typeof opts.onConfirm === 'function') ? opts.onConfirm : function () {};
+		var onCancel  = (typeof opts.onCancel  === 'function') ? opts.onCancel  : function () {};
+
+		var label = enable ? 'Enable' : 'Disable';
+		var color = enable ? 'var(--color-success)' : 'var(--color-danger)';
+
+		$.confirm({
+			title: false,
+			boxWidth: '50%',
+			useBootstrap: false,
+			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">' + label + ' ' + SymBot.UI.esc(botName) + '?</div>',
+			buttons: {
+				ok: {
+					btnClass: 'btn-default',
+					text: '<div style="color: ' + color + ';">' + label + ' Bot</div>',
+					action: function () { onConfirm(); }
+				},
+				cancel: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-neutral);">Cancel</div>',
+					action: function () { onCancel(); }
+				}
+			}
+		});
+	},
+
+	// Panic-sell a deal — the emergency market close that IGNORES the profit target (can realize a loss), so it
+	// is danger-styled and gated behind a random-number confirmation. opts.dealId. onConfirm fires only when the
+	// typed number matches. The wording makes the panic-vs-graceful-close distinction explicit: this is a
+	// panic sell (sells now at market, ignoring the profit target), never the graceful, profit-respecting close.
+	confirmPanicSell: function(opts) {
+
+		opts = opts || {};
+		var dealId    = opts.dealId;
+		var onConfirm = (typeof opts.onConfirm === 'function') ? opts.onConfirm : function () {};
+		var onCancel  = (typeof opts.onCancel  === 'function') ? opts.onCancel  : function () {};
+
+		var randNum = Math.floor(1000 + Math.random() * 9000);
+
+		$.confirm({
+			title: false,
+			boxWidth: '50%',
+			useBootstrap: false,
+			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">Panic sell deal ' + SymBot.UI.esc(String(dealId)) + ' now at market price?<br><br>' +
+				'This sells immediately and <b>ignores the profit target</b> — it can close the deal at a loss.<br><br>' +
+				'Type <b>' + randNum + '</b> in the box to confirm the panic sell: ' +
+				'<form action="" style="display: inline;"><input type="text" id="confirmNum" class="form-field" onkeypress="if (event.which < 48 || event.which > 57) if (event.which != 8) return false;" required /></form></div>',
+			buttons: {
+				formSubmit: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-danger);">Panic Sell</div>',
+					action: function () {
+
+						var confirmNum = this.$content.find('#confirmNum').val();
+
+						if (!confirmNum || confirmNum != randNum) { alertBox('Confirmation number incorrect'); return false; }
+
+						onConfirm();
+					}
+				},
+				cancel: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-neutral);">Cancel</div>',
+					action: function () { onCancel(); }
+				}
+			},
+			onContentReady: function () {
+
+				var jc = this;
+				this.$content.find('form').on('submit', function (e) { e.preventDefault(); jc.$$formSubmit.trigger('click'); });
+			}
+		});
+	},
+
+	// Cancel a deal — checkbox-confirmed. Cancelling stops the deal from any further trading but does NOT sell
+	// assets already bought. opts.dealId; onConfirm fires only once the confirm box is checked.
+	confirmCancelDeal: function(opts) {
+
+		opts = opts || {};
+		var dealId    = opts.dealId;
+		var onConfirm = (typeof opts.onConfirm === 'function') ? opts.onConfirm : function () {};
+		var onCancel  = (typeof opts.onCancel  === 'function') ? opts.onCancel  : function () {};
+
+		$.confirm({
+			title: false,
+			boxWidth: '50%',
+			useBootstrap: false,
+			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">Cancel deal ' + SymBot.UI.esc(String(dealId)) + '?<br><br>' +
+				'<form action="" style="display: inline;">' +
+				'This cancels the deal and stops any further trading. Assets already bought are <b>not</b> sold.' +
+				'<br><br>' +
+				'<input type="checkbox" id="confirmBox" class="form-field" style="width: 20px;" /> <b>Check to confirm <span style="color: var(--color-danger);">CANCEL</span> deal</b>' +
+				'</form></div>',
+			buttons: {
+				formSubmit: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-danger);">Cancel Deal</div>',
+					action: function () {
+
+						if (!this.$content.find('#confirmBox').prop('checked')) { alertBox('You must check the box to confirm'); return false; }
+
+						onConfirm();
+					}
+				},
+				cancel: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-neutral);">Cancel</div>',
+					action: function () { onCancel(); }
+				}
+			},
+			onContentReady: function () {
+
+				this.$content.find('#confirmBox').prop('checked', false);
+				var jc = this;
+				this.$content.find('form').on('submit', function (e) { e.preventDefault(); jc.$$formSubmit.trigger('click'); });
+			}
+		});
+	},
+
+	// Pause / resume a deal's buying and/or selling — two toggles plus a confirm box. When the deal was paused
+	// by SymBot itself, the same "system paused" caution is shown (built here from the pause reason, so the
+	// warning markup is not re-copied per surface). opts: { dealId, pause, pauseBuy, pauseSell, pauseReason }.
+	// onConfirm(pauseBuy, pauseSell) receives the chosen toggle states.
+	confirmPauseDeal: function(opts) {
+
+		opts = opts || {};
+		var dealId    = opts.dealId;
+		var pause     = !!opts.pause;
+		var pauseBuy  = !!opts.pauseBuy;
+		var pauseSell = !!opts.pauseSell;
+		var onConfirm = (typeof opts.onConfirm === 'function') ? opts.onConfirm : function () {};
+		var onCancel  = (typeof opts.onCancel  === 'function') ? opts.onCancel  : function () {};
+
+		var info = SymBot.UI.systemPauseInfo(opts.pauseReason || '');
+		var warn = info.isSystem
+			? '<div style="font-size: var(--fs-body); padding: 8px; margin-bottom: 10px; background: var(--color-warning-soft); border-left: 3px solid var(--color-warning); border-radius: 2px;">' +
+			  '<b>⚠ System paused:</b> This deal was automatically paused by the system due to ' + info.description + '. Review the situation before resuming manually.</div>'
+			: '';
+
+		$.confirm({
+			title: false,
+			boxWidth: '50%',
+			useBootstrap: false,
+			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">' + warn + 'Pause / Resume deal ' + SymBot.UI.esc(String(dealId)) + '?<br><br>' +
+				'<form action="" style="display: inline;">' +
+				'This pauses or resumes further buying and/or selling for this deal.<br><br>' +
+				'<input id="dealPauseBuy" name="dealPauseBuy" type="checkbox" class="form-field"> &nbsp; <b>Pause Buy</b><br>' +
+				'<input id="dealPauseSell" name="dealPauseSell" type="checkbox" class="form-field"> &nbsp; <b>Pause Sell</b><br><br>' +
+				'<input type="checkbox" id="confirmBox" class="form-field" style="width: 20px;" /> <b>Check to confirm <span style="color: var(--color-danger);">PAUSE / RESUME</span></b>' +
+				'</form></div>',
+			buttons: {
+				formSubmit: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-danger);">Pause / Resume Deal</div>',
+					action: function () {
+
+						if (!this.$content.find('#confirmBox').prop('checked')) { alertBox('You must check the box to confirm'); return false; }
+
+						onConfirm(!!this.$content.find('#dealPauseBuy').prop('checked'), !!this.$content.find('#dealPauseSell').prop('checked'));
+					}
+				},
+				cancel: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-neutral);">Cancel</div>',
+					action: function () { onCancel(); }
+				}
+			},
+			onOpenBefore: function () {
+
+				// A full pause implies both buy and sell paused.
+				var pb = pause ? true : pauseBuy;
+				var ps = pause ? true : pauseSell;
+
+				$('#dealPauseBuy').simpleSwitch();
+				$('#dealPauseSell').simpleSwitch();
+				$('#dealPauseBuy').prop('checked', pb).switchToggle(pb);
+				$('#dealPauseSell').prop('checked', ps).switchToggle(ps);
+			},
+			onContentReady: function () {
+
+				this.$content.find('#confirmBox').prop('checked', false);
+				var jc = this;
+				this.$content.find('form').on('submit', function (e) { e.preventDefault(); jc.$$formSubmit.trigger('click'); });
+			}
+		});
+	},
+
+	// Disable (stop) a bot. Open deals keep running until they complete. opts.botName; onConfirm fires on OK.
+	confirmStopBot: function(opts) {
+
+		opts = opts || {};
+		var botName   = opts.botName || '';
+		var onConfirm = (typeof opts.onConfirm === 'function') ? opts.onConfirm : function () {};
+		var onCancel  = (typeof opts.onCancel  === 'function') ? opts.onCancel  : function () {};
+
+		$.confirm({
+			title: false,
+			boxWidth: '50%',
+			useBootstrap: false,
+			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">Disable ' + SymBot.UI.esc(botName) + '? Current deals will continue running until they complete.</div>',
+			buttons: {
+				ok: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-danger);">Disable Bot</div>',
+					action: function () { onConfirm(); }
+				},
+				cancel: {
+					btnClass: 'btn-default',
+					text: '<div style="color: var(--color-neutral);">Cancel</div>',
+					action: function () { onCancel(); }
+				}
+			}
+		});
 	},
 
 	// The translucent row-background tint for a deal row, single-sourced so the Active Deals view and the Hub
@@ -737,6 +1019,30 @@ SymBot.UI = {
 		if (opts.hasDataError) { return 'rgba(183,130,37,0.28)'; }   // amber — data/tracker error
 		if (opts.isSystemPaused) { return 'rgba(255,140,0,0.22)'; }  // orange — system-paused
 		return '';
+	},
+
+	// Severity tier for a 0..100 value where HIGHER is worse (portfolio risk %, CPU load %, …). SINGLE SOURCE OF
+	// TRUTH for the high/mid cutoffs, which were copy-pasted (90 / 70) across the instance Active Deals view, the
+	// Hub home dashboard and the instance home dashboard — change them here and every surface moves together.
+	// Returns the full CSS class `<prefix>-<label>`. The middle/low label names differ between existing class
+	// families (portfolio-risk uses "mid", health-load uses "med"), so they are overridable via opts.labels;
+	// defaults are high/mid/low. opts.high / opts.mid override the cutoffs. A non-numeric value falls to the
+	// lowest tier (safe default — never shows a false "high"). Pure; no DOM.
+	severityClass: function(value, prefix, opts) {
+		opts = opts || {};
+		var high = (opts.high != null) ? Number(opts.high) : 90;
+		var mid  = (opts.mid  != null) ? Number(opts.mid)  : 70;
+		var labels = opts.labels || { high: 'high', mid: 'mid', low: 'low' };
+		var v = Number(value);
+		var tier = (isFinite(v) && v >= high) ? 'high' : ((isFinite(v) && v >= mid) ? 'mid' : 'low');
+		return prefix + '-' + labels[tier];
+	},
+
+	// The space-joined list of every class severityClass() can return for a prefix — for an element's
+	// removeClass() so the cleanup list can't drift from the class names themselves. Same opts.labels as above.
+	severityClassList: function(prefix, labels) {
+		labels = labels || { high: 'high', mid: 'mid', low: 'low' };
+		return [labels.high, labels.mid, labels.low].map(function(l) { return prefix + '-' + l; }).join(' ');
 	},
 
 	// Build the /api/tradingview widget URL for a pair, mapping ccxt exchange ids to TradingView's names.
@@ -854,6 +1160,87 @@ SymBot.UI = {
 	// getCurrencySymbol resolver in (it is in scope at the call site), so this never depends on a
 	// cross-script global. (Shared — was byte-identical across the deal views.)
 	dealSymbol: function(pair, profitCurrency, resolver) { var parts = (pair || '').split('/'); var code = profitCurrency === 'base' ? parts[0] : parts[1]; var fn = (typeof resolver === 'function') ? resolver : ((typeof getCurrencySymbol === 'function') ? getCurrencySymbol : null); return (fn && fn(code)) || '$'; },
+
+	// SINGLE SOURCE OF TRUTH for rendering a monetary amount. The views scatter `symbol + value.toFixed(2)` with
+	// a hard-coded '$' — which also hard-codes symbol-BEFORE-number ordering and a '.'/no-grouping format that is
+	// wrong for many locales. Routing money through here makes the whole app localizable from ONE place: pass a
+	// `locale` + currency `code` and it formats via Intl.NumberFormat (correct symbol position, decimal and
+	// grouping separators); with no locale it reproduces today's output EXACTLY (symbol-prefixed, 2 dp), so
+	// migrating a call site changes nothing visible until a locale is actually set. The language-agnostic seam.
+	//   opts: { symbol?, code?, locale?, decimals? (default 2) }
+	// Locale precedence: opts.locale, else a page-wide window.SymBot.LOCALE if set, else none (plain format).
+	formatMoney: function(amount, opts) {
+		opts = opts || {};
+		var n = Number(amount);
+		if (!isFinite(n)) { n = 0; }
+		var dp = (opts.decimals != null) ? Number(opts.decimals) : 2;
+		var locale = opts.locale || (typeof window !== 'undefined' && window.SymBot && window.SymBot.LOCALE) || null;
+		if (locale && opts.code) {
+			try {
+				return new Intl.NumberFormat(locale, { style: 'currency', currency: opts.code, minimumFractionDigits: dp, maximumFractionDigits: dp }).format(n);
+			}
+			catch (e) { /* unknown locale/currency → fall through to the plain, no-regression format */ }
+		}
+		var symbol = (opts.symbol != null) ? opts.symbol : '$';
+		return symbol + n.toFixed(dp);
+	},
+
+	// ── Message/i18n seam (single source for UI copy; language-agnostic) ─────────────────────────────────
+	// User-facing strings were assembled by concatenation in the views ('X is now ' + status, 'Deal ' + id +
+	// ' canceled'), which cannot be translated (word order, pluralization) and duplicated the same phrase across
+	// surfaces. t(key, params) looks a message up by KEY and substitutes {placeholders}, so the phrasing lives in
+	// ONE table and a translator gets whole sentences, not fragments. The built-in table is English (the
+	// default); a locale pack can be injected without code changes via window.SymBot.LOCALE + window.SymBot.
+	// MESSAGES[locale] (e.g. handed down from the backend through EJS, the same way the pause-reason taxonomy
+	// is) — t() prefers that override, then the built-in locale, then English, then the raw key (visible and
+	// debuggable, never a blank). Migrating a call site to t() is output-identical until a locale is set.
+	MESSAGES: {
+		en: {
+			'bot.status.enabled':   'enabled',
+			'bot.status.disabled':  'disabled',
+			'bot.now_status':       '{name} is now {status}',
+			'bot.toggled':          '{name} {status}',
+			'bot.status_unknown':   'Unable to change bot status',
+			'bot.deleted':          'Bot "{name}" and all deal history deleted.',
+			'deal.canceled':        'Deal {id} canceled',
+			'deal.panic_requested': 'Deal {id} panic sell requested',
+			'deal.pause_updated':   'Deal {id} pause updated'
+		}
+	},
+
+	// Substitute {placeholder} tokens from params. Values are inserted as-is (callers pass these to text sinks
+	// like alertBox, matching the previous raw-concatenation behavior); a caller that builds HTML esc()s first.
+	interpolate: function(tmpl, params) {
+		if (tmpl == null) { return ''; }
+		params = params || {};
+		return String(tmpl).replace(/\{(\w+)\}/g, function(m, k) { return (params[k] != null) ? String(params[k]) : m; });
+	},
+
+	t: function(key, params) {
+		var W = (typeof window !== 'undefined' && window.SymBot) || {};
+		var locale = W.LOCALE || 'en';
+		var override = W.MESSAGES && W.MESSAGES[locale];                 // injected locale pack (future; optional)
+		var builtin  = SymBot.UI.MESSAGES[locale] || SymBot.UI.MESSAGES.en;
+		var en       = SymBot.UI.MESSAGES.en || {};
+		var tmpl = (override && override[key] != null) ? override[key]
+		         : (builtin && builtin[key] != null)   ? builtin[key]
+		         : (en[key] != null)                   ? en[key]
+		         : key;                                                   // last resort: the key itself
+		return SymBot.UI.interpolate(tmpl, params);
+	},
+
+	// Locale-correct plural selection. forms is keyed by CLDR plural category (one/other/… — a locale may use
+	// few/many/zero too); {count} is interpolated into the chosen form. Uses Intl.PluralRules so the right
+	// category is picked per locale, with an English-style one/other fallback where PluralRules is unavailable.
+	plural: function(count, forms, locale) {
+		forms = forms || {};
+		locale = locale || (typeof window !== 'undefined' && window.SymBot && window.SymBot.LOCALE) || 'en';
+		var cat = 'other';
+		try { cat = new Intl.PluralRules(locale).select(Number(count)); }
+		catch (e) { cat = (Number(count) === 1) ? 'one' : 'other'; }
+		var form = (forms[cat] != null) ? forms[cat] : (forms.other != null ? forms.other : '');
+		return SymBot.UI.interpolate(form, { count: count });
+	},
 
 	// Fetch the bot list (GET ./api/bots) and hand the raw bots array to cb; cb([]) on error.
 	// Each view keeps its own option-rendering. (Shared — dedupes the ajax boilerplate.)

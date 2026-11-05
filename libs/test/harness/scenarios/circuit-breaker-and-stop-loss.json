@@ -1,0 +1,50 @@
+{
+  "note": "Circuit-breaker deal-start gate (the REAL DCABot.canStartDeal) and stop-loss decision (the REAL stopLoss.evaluate). Synthetic names / numeric only.",
+  "scenarios": [
+    {
+      "name": "an active circuit breaker refuses a deal start, before any pair/DB work",
+      "kind": "circuit_breaker",
+      "tags": ["regression"],
+      "pair": "ZORVX/USDT",
+      "input": { "breakerReason": "Portfolio loss 12% exceeded 10% limit", "config": {} },
+      "expect": [ { "field": "allowed", "is": false }, { "field": "reason", "contains": "Circuit Breaker Active" }, { "field": "reason", "contains": "Portfolio loss 12%" } ]
+    },
+    {
+      "name": "with the breaker cleared and no other limits, a start is allowed",
+      "kind": "circuit_breaker",
+      "tags": ["MFT"],
+      "pair": "ZORVX/USDT",
+      "input": { "breakerReason": null, "blacklisted": false, "config": {} },
+      "expect": [ { "field": "allowed", "is": true } ]
+    },
+    {
+      "name": "a blacklisted pair is still refused when the breaker is clear",
+      "kind": "circuit_breaker",
+      "tags": ["regression"],
+      "pair": "QORBL/USDT",
+      "input": { "breakerReason": null, "blacklisted": true, "config": {} },
+      "expect": [ { "field": "allowed", "is": false }, { "field": "reason", "contains": "blacklisted" } ]
+    },
+    {
+      "name": "stop-loss triggers when price falls to/through the stop level",
+      "kind": "stop_loss",
+      "tags": ["regression"],
+      "input": { "enabled": true, "price": 50, "average": 100, "stopLossPercent": 10, "reference": "average" },
+      "expect": [ { "field": "triggered", "is": true }, { "field": "reason", "equals": "stop_hit" }, { "field": "level", "close": 90, "tol": 0.00001 } ]
+    },
+    {
+      "name": "stop-loss does not trigger while price is above the stop level",
+      "kind": "stop_loss",
+      "tags": ["MFT"],
+      "input": { "enabled": true, "price": 200, "average": 100, "stopLossPercent": 10, "reference": "average" },
+      "expect": [ { "field": "triggered", "is": false }, { "field": "reason", "equals": "ok" } ]
+    },
+    {
+      "name": "stop-loss disabled is never evaluated as triggered",
+      "kind": "stop_loss",
+      "tags": ["MFT"],
+      "input": { "enabled": false, "price": 10, "average": 100, "stopLossPercent": 10 },
+      "expect": [ { "field": "triggered", "is": false }, { "field": "reason", "equals": "disabled" } ]
+    }
+  ]
+}

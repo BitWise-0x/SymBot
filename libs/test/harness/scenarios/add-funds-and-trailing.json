@@ -1,0 +1,46 @@
+{
+  "note": "Add-funds ladder/break-even math (the REAL AddFundsMath.computeAddFundsForward) and trailing take-profit = trailing stop (the REAL stopLoss.evaluate trailing path). Synthetic / numeric only.",
+  "scenarios": [
+    {
+      "name": "adding funds below average lowers the average and recomputes target + break-even",
+      "kind": "add_funds",
+      "tags": ["MFT", "regression"],
+      "input": { "sum": 1000, "qtySum": 10, "addAmount": 500, "exchangeFee": 0, "targetProfitPercent": 1, "addPrice": 50, "price": 50 },
+      "expect": [
+        { "field": "valid", "is": true },
+        { "field": "average_price_net", "close": 75, "tol": 0.0001 },
+        { "field": "break_even_net", "close": 75, "tol": 0.0001 },
+        { "field": "target_price_net", "close": 75.75, "tol": 0.0001 },
+        { "field": "average_price_change_percent", "close": 25, "tol": 0.0001 }
+      ]
+    },
+    {
+      "name": "an add with no amount is reported invalid, never a bogus projection",
+      "kind": "add_funds",
+      "tags": ["MFT"],
+      "input": { "sum": 1000, "qtySum": 10, "addAmount": 0, "exchangeFee": 0, "targetProfitPercent": 1, "addPrice": 50 },
+      "expect": [ { "field": "valid", "is": false } ]
+    },
+    {
+      "name": "trailing take-profit active below the peak, riding the run-up (not hit)",
+      "kind": "trailing_tp",
+      "tags": ["regression"],
+      "input": { "enabled": true, "price": 118, "average": 100, "stopLossPercent": 50, "trailingEnabled": true, "trailingDistance": 5, "trailingActivateProfit": 2, "profitPercentage": 18, "trailHighPrice": 120 },
+      "expect": [ { "field": "trailingActive", "is": true }, { "field": "triggered", "is": false }, { "field": "trailLevel", "close": 114, "tol": 0.00001 }, { "field": "reason", "equals": "trailing_active" } ]
+    },
+    {
+      "name": "trailing take-profit exits when price falls to the trail level",
+      "kind": "trailing_tp",
+      "tags": ["regression"],
+      "input": { "enabled": true, "price": 113, "average": 100, "stopLossPercent": 50, "trailingEnabled": true, "trailingDistance": 5, "trailingActivateProfit": 2, "profitPercentage": 13, "trailHighPrice": 120 },
+      "expect": [ { "field": "triggered", "is": true }, { "field": "trailLevel", "close": 114, "tol": 0.00001 }, { "field": "reason", "equals": "stop_hit" } ]
+    },
+    {
+      "name": "trailing take-profit stays inactive until the activation profit is reached",
+      "kind": "trailing_tp",
+      "tags": ["MFT"],
+      "input": { "enabled": false, "price": 101, "average": 100, "trailingEnabled": true, "trailingDistance": 5, "trailingActivateProfit": 5, "profitPercentage": 1, "trailHighPrice": 101 },
+      "expect": [ { "field": "trailingActive", "is": false }, { "field": "reason", "equals": "inactive" } ]
+    }
+  ]
+}

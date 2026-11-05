@@ -1,0 +1,137 @@
+{
+  "note": "Partial-sell remainder loop (the REAL DCABot.retryPartialFill). Synthetic names only. Reproduces the shape of real remainder incidents without real coins.",
+  "scenarios": [
+    {
+      "name": "remainder completes over one retry — all fills credited (#57 guarantee)",
+      "kind": "partial_sell",
+      "tags": ["MFT", "regression"],
+      "pair": "ZORVX/USDT",
+      "input": {
+        "side": "sell",
+        "requestedQty": 143941,
+        "initialFilledQty": 60193,
+        "initialPrice": 0.008520,
+        "fallbackPrice": 0.008456,
+        "retries": [ { "bid": 0.008456, "fill": 83748 } ]
+      },
+      "expect": [
+        { "field": "totalFilled", "equals": 143941 },
+        { "field": "qtyRemaining", "equals": 0 },
+        { "field": "retryCount", "equals": 1 }
+      ]
+    },
+    {
+      "name": "DEFAULT-OFF baseline (no floor) — remainder dumps into a walked-down book, still fully credited (#57), soft-flags below-break-even (why #130's floor is needed)",
+      "kind": "partial_sell",
+      "tags": ["regression"],
+      "pair": "QORBL/USDT",
+      "input": {
+        "side": "sell",
+        "requestedQty": 122490,
+        "initialFilledQty": 12346,
+        "initialPrice": 0.020147,
+        "fallbackPrice": 0.019912,
+        "breakeven": 0.0200,
+        "retries": [ { "bid": 0.019912, "fill": 110144 } ]
+      },
+      "expect": [
+        { "field": "totalFilled", "equals": 122490 },
+        { "field": "qtyRemaining", "equals": 0 }
+      ],
+      "flag": [
+        { "field": "soldBelowBreakeven", "is": false }
+      ]
+    },
+    {
+      "name": "remainder below the exchange minimum is accepted, not looped forever (MFT)",
+      "kind": "partial_sell",
+      "tags": ["MFT"],
+      "pair": "ZORVX/USDT",
+      "input": {
+        "side": "sell",
+        "requestedQty": 1000,
+        "initialFilledQty": 999.9,
+        "initialPrice": 1.0,
+        "fallbackPrice": 1.0,
+        "minAmount": 1,
+        "retries": [ { "bid": 1.0, "fill": 0 }, { "bid": 1.0, "fill": 0 } ]
+      },
+      "expect": [
+        { "field": "totalFilled", "equals": 999.9 },
+        { "field": "retryCount", "equals": 1 }
+      ]
+    },
+    {
+      "name": "#130 FLOOR GATE blocks the dump — bid below floor holds the remainder, nothing re-sold below floor (ROBO shape)",
+      "kind": "partial_sell",
+      "tags": ["MFT", "regression"],
+      "pair": "QORBL/USDT",
+      "input": {
+        "side": "sell",
+        "requestedQty": 143941,
+        "initialFilledQty": 60193,
+        "initialPrice": 0.008520,
+        "fallbackPrice": 0.008456,
+        "breakeven": 0.008554,
+        "floorPrice": 0.008554,
+        "retries": [ { "bid": 0.008456, "fill": 83748 } ]
+      },
+      "expect": [
+        { "field": "held", "is": true },
+        { "field": "holdReason", "equals": "below_floor" },
+        { "field": "placedCount", "equals": 0 },
+        { "field": "remainderSoldBelowFloor", "is": false },
+        { "field": "qtyRemaining", "equals": 83748 },
+        { "field": "totalFilled", "equals": 60193 }
+      ]
+    },
+    {
+      "name": "#130 FLOOR GATE allows the sell when the bid recovers to the floor — remainder completes, fully credited",
+      "kind": "partial_sell",
+      "tags": ["MFT", "DIR"],
+      "pair": "QORBL/USDT",
+      "input": {
+        "side": "sell",
+        "requestedQty": 143941,
+        "initialFilledQty": 60193,
+        "initialPrice": 0.008560,
+        "fallbackPrice": 0.008560,
+        "breakeven": 0.008554,
+        "floorPrice": 0.008554,
+        "retries": [ { "bid": 0.008560, "fill": 83748 } ]
+      },
+      "expect": [
+        { "field": "held", "is": false },
+        { "field": "placedCount", "equals": 1 },
+        { "field": "remainderSoldBelowFloor", "is": false },
+        { "field": "totalFilled", "equals": 143941 },
+        { "field": "qtyRemaining", "equals": 0 }
+      ]
+    },
+    {
+      "name": "remainder loop driven through the SimulatedExchange fill model — blotter VWAP/fee are net of signed slippage",
+      "kind": "partial_sell",
+      "tags": ["regression"],
+      "pair": "QORBL/USDT",
+      "input": {
+        "side": "sell",
+        "requestedQty": 100000,
+        "initialFilledQty": 0,
+        "fallbackPrice": 10,
+        "breakeven": 10,
+        "retries": [ { "bid": 10 }, { "bid": 9.9 } ],
+        "fillModel": { "depth": [60000, 40000], "slippageBps": 20, "commissionRate": 0.001 }
+      },
+      "expect": [
+        { "field": "totalFilled", "equals": 100000 },
+        { "field": "qtyRemaining", "equals": 0 },
+        { "field": "blotterFilled", "equals": 100000 },
+        { "field": "blotterVwap", "close": 9.94008, "tol": 0.0001 },
+        { "field": "blotterFee", "close": 994.008, "tol": 0.001 }
+      ],
+      "flag": [
+        { "field": "soldBelowBreakeven", "is": false }
+      ]
+    }
+  ]
+}

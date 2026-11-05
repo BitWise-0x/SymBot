@@ -1,0 +1,24 @@
+{
+  "note": "Take-profit target math (the REAL DCABot.calculateTargetPrice) through a SimulatedExchange with configured price precision. Synthetic names only.",
+  "scenarios": [
+    {
+      "name": "target = average x (1 + takeProfit% + fee%), two-decimal pair",
+      "kind": "target",
+      "tags": ["MFT"],
+      "pair": "ZORVX/USDT",
+      "exchange": { "precisionMode": 2, "markets": { "ZORVX/USDT": { "precision": { "price": 2 } } } },
+      "input": { "price": 100, "takeProfit": 1, "exchangeFee": 0.1 },
+      "expect": [ { "field": "target", "close": 101.1, "tol": 0.001 } ]
+    },
+    {
+      "name": "target on a low-priced (sub-cent) pair keeps full precision",
+      "kind": "target",
+      "tags": ["MFT", "regression"],
+      "pair": "QORBL/USDT",
+      "exchange": { "precisionMode": 2, "markets": { "QORBL/USDT": { "precision": { "price": 6 } } } },
+      "input": { "price": 0.02, "takeProfit": 1, "exchangeFee": 0.1 },
+      "comment": "exact TP target is 0.02022; calculateTargetPrice steps UP one 1e-6 tick so the deal never sells SHORT of the configured take-profit — assert it is never below the exact target and at most one tick above.",
+      "expect": [ { "field": "target", "atLeast": 0.02022 }, { "field": "target", "atMost": 0.0202211 } ]
+    }
+  ]
+}

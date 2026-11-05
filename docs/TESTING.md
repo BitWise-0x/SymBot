@@ -59,6 +59,61 @@ Two kinds of check live under `libs/test/`, and only the first is run by `npm te
     set whose paraphrases are deliberately distinct from `seed-learning.json` (enforced by a test). It is used
     at runtime by the maintainer aggregation feature and in `LearningAggregation.test.js`.
 
+### Money-path replay eval harness
+
+`libs/test/harness/` grades the DCA money path. It replays scripted market sequences through the *real*
+order-handling functions against an in-memory `SimulatedExchange`. It is deterministic and offline: no live
+model, no exchange, no real orders. Scenarios are declarative JSON files under `libs/test/harness/scenarios/`.
+They use synthetic names only, such as the invented pair `ZORVX/USDT`, and reproduce the shape of a real
+incident rather than any real coin.
+
+Run it in two ways. Both share one runner, so they can never disagree on a verdict:
+
+```bash
+npm test                  # runs MoneyPathEval.test.js as part of the suite; a scenario regression fails CI
+npm run eval:money-path    # standalone: readable report, exit 0 = PASS / 1 = FAIL  (add --json for machine output)
+```
+
+A run that grades nothing counts as a failure, never a silent pass.
+
+Grading has two tiers. A hard `expect` check gates the build. A soft `flag` check is for triage only, so a
+known-but-unfixed gap stays visible without blocking the build. Every confirmed money-path bug becomes a
+pinned scenario before the fix is trusted. Reproduce the incident's shape with synthetic names, confirm the
+scenario fails, then fix it.
+
+Each piece has one home, so nothing drifts:
+
+- `SimulatedExchange.js` — a CCXT-shaped, deterministic exchange with a fill model and blotter. It is the one
+  simulator, and the planned historical backtester reuses it.
+- `drivers.js` — one driver per scenario `kind`. Each driver calls the real money-path function for that decision.
+- `grade.js` — the assertion comparators.
+- `Harness.js` — the fail-safe runner.
+
+A scenario is one JSON object per file, or `{ "scenarios": [ … ] }`:
+
+```json
+{
+  "name": "remainder completes over one retry — all fills credited",
+  "kind": "partial_sell",
+  "tags": ["MFT", "regression"],
+  "pair": "ZORVX/USDT",
+  "input": { "side": "sell", "requestedQty": 143941, "initialFilledQty": 60193,
+             "retries": [ { "bid": 0.008456, "fill": 83748 } ] },
+  "expect": [ { "field": "totalFilled", "equals": 143941 }, { "field": "qtyRemaining", "equals": 0 } ],
+  "flag":   [ { "field": "soldBelowBreakeven", "is": false } ]
+}
+```
+
+The comparators used in `expect` and `flag` are `equals`, `close` (`{ "close": x, "tol": y }`), `atLeast`,
+`atMost`, `is` (strict), `contains` (case-insensitive substring), and `oneOf`. The kinds available today are
+`partial_sell`, `partial_buy`, `target`, `shortfall`, `tradable`, `clock`, `price_sanity`, `stop_loss`,
+`trailing_tp`, `add_funds`, `circuit_breaker`, and `order_fill`.
+
+To add a case for an existing kind, drop a JSON file in `scenarios/`. Nothing else needs to change. To grade a
+new decision, add a driver in `drivers.js` that calls the one real money-path function and returns a plain
+outcome object, register it in that file's `kind` map, then write the scenarios. `grade.js` and
+`SimulatedExchange.js` are reused as they are.
+
 ## Conventions
 
 - Every confirmed bug becomes a permanent test. When a real defect (or an adversarial finding in an AI QA

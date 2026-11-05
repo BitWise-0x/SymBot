@@ -135,13 +135,13 @@
 				const v = Number(s.profit_by_currency[c] || 0);
 				const sym = (s.currency_symbols && s.currency_symbols[c]) || '';
 				const cls = v >= 0 ? 'profit-positive' : 'profit-negative';
-				return '<span class="' + cls + '">' + (v >= 0 ? '+' : '') + sym + v.toFixed(2) + '</span> <span class="journal-stat-sub">' + escapeHtml(c) + '</span>';
+				return '<span class="' + cls + '">' + (v >= 0 ? '+' : '') + SymBot.UI.formatMoney(v, { symbol: sym }) + '</span> <span class="journal-stat-sub">' + escapeHtml(c) + '</span>';
 			}).join('<br>');
 		}
 		else {
 			const only = (s.currencies && s.currencies.length === 1) ? s.currencies[0] : '';
 			const sym = (only && s.currency_symbols && s.currency_symbols[only]) || '';
-			totalPlCell = '<span class="' + profitClass + '">' + profitSign + sym + s.total_profit.toFixed(2) + '</span>';
+			totalPlCell = '<span class="' + profitClass + '">' + profitSign + SymBot.UI.formatMoney(s.total_profit, { symbol: sym }) + '</span>';
 		}
 
 		const streakNice = s.current_streak_type

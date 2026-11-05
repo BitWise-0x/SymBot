@@ -38,9 +38,7 @@
 
 	function toggleBotConfirm(instanceId, botId, botName, enable) {
 
-		const action  = enable ? 'bot_enable' : 'bot_disable';
-		const btnText = enable ? 'Enable' : 'Disable';
-		const btnColor = enable ? 'var(--color-success)' : 'var(--color-danger)';
+		const action = enable ? 'bot_enable' : 'bot_disable';
 
 		if (confirmWaiting) return;
 
@@ -48,65 +46,55 @@
 
 		_autoRefresh.stop();
 
-		$.confirm({
-			title: false,
-			boxWidth: '50%',
-			useBootstrap: false,
-			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">' + btnText + ' ' + SymBot.UI.esc(botName) + '?</div>',
-			buttons: {
-				ok: {
-					btnClass: 'btn-default',
-					text: '<div style="color: ' + btnColor + ';">' + btnText + ' Bot</div>',
-					action: function() {
+		// Dialog markup + styling live in SymBot.UI (shared with the instance view). This caller keeps the
+		// Hub-specific API call, the immediate row/toggle update, and the confirmWaiting / reload handling.
+		SymBot.UI.confirmToggleBot({
+			botName: botName,
+			enable: enable,
+			onConfirm: function() {
 
-						$('#spinner-overlay').fadeIn(100);
+				$('#spinner-overlay').fadeIn(100);
 
-						$.ajax({
-							type: 'POST',
-							url: './api/hub/bots/action',
-							contentType: 'application/json',
-							data: JSON.stringify({ instanceId, action, botId }),
-							dataType: 'json',
-							success: function(res) {
+				$.ajax({
+					type: 'POST',
+					url: './api/hub/bots/action',
+					contentType: 'application/json',
+					data: JSON.stringify({ instanceId, action, botId }),
+					dataType: 'json',
+					success: function(res) {
 
-								$('#spinner-overlay').fadeOut(100);
-								confirmWaiting = false;
-
-								if (!res.success) {
-
-									alertBox('Error: ' + (res.data || 'Unknown error'), function() { setReloadTimeout(); });
-								}
-								else {
-
-									// Update toggle state immediately without waiting for next refresh
-									const $row = $('[data-botid="' + botId + '"]');
-									$row.attr('data-active', enable);
-									$('#toggle' + botId).prop('checked', enable).switchToggle(enable);
-
-									alertBox(SymBot.UI.esc(botName) + ' ' + (enable ? 'enabled' : 'disabled'), function() { setReloadTimeout(); });
-								}
-							},
-							error: function(err) {
-
-								$('#spinner-overlay').fadeOut(100);
-								confirmWaiting = false;
-
-								if (err.status === 401) { window.location.href = './login'; return; }
-
-								alertBox('Error: ' + JSON.stringify(err), function() { setReloadTimeout(); });
-							}
-						});
-					}
-				},
-				cancel: {
-					btnClass: 'btn-default',
-					text: '<div style="color: var(--color-neutral);">Cancel</div>',
-					action: function() {
-
+						$('#spinner-overlay').fadeOut(100);
 						confirmWaiting = false;
-						setReloadTimeout();
+
+						if (!res.success) {
+
+							alertBox('Error: ' + (res.data || 'Unknown error'), function() { setReloadTimeout(); });
+						}
+						else {
+
+							// Update toggle state immediately without waiting for next refresh
+							const $row = $('[data-botid="' + botId + '"]');
+							$row.attr('data-active', enable);
+							$('#toggle' + botId).prop('checked', enable).switchToggle(enable);
+
+							alertBox(SymBot.UI.t('bot.toggled', { name: SymBot.UI.esc(botName), status: SymBot.UI.t(enable ? 'bot.status.enabled' : 'bot.status.disabled') }), function() { setReloadTimeout(); });
+						}
+					},
+					error: function(err) {
+
+						$('#spinner-overlay').fadeOut(100);
+						confirmWaiting = false;
+
+						if (err.status === 401) { window.location.href = './login'; return; }
+
+						alertBox('Error: ' + JSON.stringify(err), function() { setReloadTimeout(); });
 					}
-				}
+				});
+			},
+			onCancel: function() {
+
+				confirmWaiting = false;
+				setReloadTimeout();
 			}
 		});
 	}
@@ -114,51 +102,12 @@
 
 	function deleteBotConfirm(instanceId, botId, botName) {
 
-		$.confirm({
-			title: false,
-			boxWidth: '50%',
-			useBootstrap: false,
-			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">' +
-				'<b style="color: var(--color-danger);">Delete ' + SymBot.UI.esc(botName) + '?</b><br><br>' +
-				'<div style="font-size: var(--fs-body); padding: 8px; background: var(--color-danger-soft); border-left: 3px solid var(--color-danger); border-radius: 2px;">' +
-				'<b>This cannot be undone.</b> The bot and all of its deal history will be permanently deleted. Active deals must be closed or canceled first.' +
-				'</div><br>' +
-				'Type the bot name to confirm:<br>' +
-				'<form action="" style="display: inline;"><input type="text" id="deleteBotConfirmName" class="form-field" style="width: 100%; margin-top: 6px; box-sizing: border-box;" required /></form>' +
-				'</div>',
-			buttons: {
-				confirm: {
-					btnClass: 'btn-default',
-					text: '<div style="color: var(--color-danger);">Delete Bot</div>',
-					action: function() {
-
-						const typed = this.$content.find('#deleteBotConfirmName').val().trim();
-
-						if (typed !== botName) {
-
-							alertBox('Bot name does not match.');
-							return false;
-						}
-
-						botAction(instanceId, 'delete', botId, {}, 'Bot "' + SymBot.UI.esc(botName) + '" and all deal history deleted.');
-					}
-				},
-				cancel: {
-					btnClass: 'btn-default',
-					text: '<div style="color: var(--color-neutral);">Cancel</div>',
-					action: function() { setReloadTimeout(); }
-				}
-			},
-			onContentReady: function() {
-
-				let jc = this;
-
-				this.$content.find('form').on('submit', function(e) {
-
-					e.preventDefault();
-					jc.$$confirm.trigger('click');
-				});
-			}
+		// Dialog markup + name-match confirmation live in SymBot.UI (shared with the instance view). This caller
+		// supplies only the Hub-specific delete action and its post-cancel reload.
+		SymBot.UI.confirmDeleteBot({
+			botName: botName,
+			onConfirm: function() { botAction(instanceId, 'delete', botId, {}, SymBot.UI.t('bot.deleted', { name: SymBot.UI.esc(botName) })); },
+			onCancel: function() { setReloadTimeout(); }
 		});
 	}
 
@@ -431,7 +380,7 @@ $(document).ready(function() {
 
 			<div class="contentHeaderBox">
 
-				<b class="contentHeader">Hub Bots</b>
+				<b class="contentHeader">DCA Bots</b>
 
 				<span class="viewSettings">
 					<select id="hubRefreshInterval" class="form-field" style="width: auto; cursor: pointer;" title="Refresh interval"></select>
@@ -449,7 +398,7 @@ $(document).ready(function() {
 							<option value="all"></option>
 						</select>
 					</div>
-					<button id="hubCreateBot" class="btn-default" style="font-size: var(--fs-body); padding: 3px 10px; cursor: pointer;">+ Create Bot</button>
+					<button id="hubCreateBot" class="btn-default" style="font-size: var(--fs-body); padding: 3px 10px; cursor: pointer;">+ Create DCA Bot</button>
 				</div>
 			</div>
 
@@ -458,6 +407,12 @@ $(document).ready(function() {
 				<div id="hubBotsLoadingMsg" class="deals-state-msg">Loading bots&hellip;</div>
 				<div id="hubBotsEmptyMsg" class="deals-state-msg" style="display: none;">No bots found.</div>
 
+				<!-- DELIBERATE: the Hub bot list is a cross-instance OVERVIEW, so it leads with an Instance column
+				     (which the single-instance list has no need for) and intentionally shows a COMPACT set of
+				     per-bot fields — it omits the instance list's detail columns (Created / Updated / Deviation /
+				     Volume Scale / Step Scale) to stay readable across many instances. A per-bot's full detail is
+				     available by opening that bot, and the column-selector button above lets an operator add back
+				     any column they want. This is an intentional difference from DCABotsView, not drift. -->
 				<table id="hubBots" border=0 cellspacing=0 cellpadding=0 style="display: none;">
 
 				<thead style="position: sticky; top: 0; z-index: 1000;">
