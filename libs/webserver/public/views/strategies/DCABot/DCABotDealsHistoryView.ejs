@@ -176,7 +176,7 @@
 
 		$('#totalProfit').removeClass('profit-positive profit-negative').addClass(profitTotalClass);
 		const summarySym = deals.length > 0 ? getDealSym(deals[0]['pair'], deals[0]['profit_currency']) : '$';
-		$('#totalProfit').html(summarySym + totalProfit.toFixed(2));
+		$('#totalProfit').html(SymBot.UI.formatMoney(totalProfit, { symbol: summarySym }));
 		$('#totalDeals').html(deals.length);
 
 		$('#botsDeals').tablesorter().trigger('update');

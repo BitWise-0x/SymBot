@@ -1,0 +1,43 @@
+{
+  "note": "SimulatedExchange fill model + blotter (signed slippage, separate commission, depth-capped partials, and a DEPLETING order-book walk). Synthetic / numeric only.",
+  "scenarios": [
+    {
+      "name": "signed slippage: a BUY fills ABOVE the reference price",
+      "kind": "order_fill",
+      "tags": ["MFT"],
+      "pair": "ZORVX/USDT",
+      "exchange": { "fill": { "slippageBps": 10 } },
+      "input": { "orders": [ { "side": "buy", "amount": 100, "price": 50 } ] },
+      "expect": [ { "field": "firstAvg", "close": 50.05, "tol": 0.0001 }, { "field": "firstFilled", "equals": 100 }, { "field": "firstStatus", "equals": "closed" } ]
+    },
+    {
+      "name": "signed slippage + commission + depth cap: a SELL fills BELOW and partially",
+      "kind": "order_fill",
+      "tags": ["regression"],
+      "pair": "ZORVX/USDT",
+      "exchange": { "fill": { "slippageBps": 20, "commissionRate": 0.001, "depth": [80] } },
+      "input": { "orders": [ { "side": "sell", "amount": 100, "price": 10 } ] },
+      "expect": [
+        { "field": "firstAvg", "close": 9.98, "tol": 0.0001 },
+        { "field": "firstFilled", "equals": 80 },
+        { "field": "firstStatus", "equals": "canceled" },
+        { "field": "totalFee", "close": 0.79840, "tol": 0.0001 }
+      ]
+    },
+    {
+      "name": "order-book walk: a second sell gets a WORSE price because the book thinned (ROBO/KAIO cascade)",
+      "kind": "order_fill",
+      "tags": ["regression"],
+      "pair": "QORBL/USDT",
+      "exchange": { "fill": { "book": { "bids": [ [0.0085, 60000], [0.0084, 60000], [0.0083, 60000] ] } } },
+      "input": { "side": "sell", "orders": [ { "amount": 100000, "price": 0.0085 }, { "amount": 50000, "price": 0.0084 } ] },
+      "expect": [
+        { "field": "orderCount", "equals": 2 },
+        { "field": "totalFilled", "equals": 150000 },
+        { "field": "firstAvg", "close": 0.00846, "tol": 0.0000001 },
+        { "field": "lastAvg", "close": 0.00834, "tol": 0.0000001 },
+        { "field": "vwap", "close": 0.00842, "tol": 0.0000001 }
+      ]
+    }
+  ]
+}

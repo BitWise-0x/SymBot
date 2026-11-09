@@ -1,0 +1,37 @@
+{
+  "note": "Delisting / suspended / limit-only gate (the REAL pairStatus.evaluatePairTradable) over SimulatedExchange markets. Synthetic names only.",
+  "scenarios": [
+    {
+      "name": "a normal active pair is tradable",
+      "kind": "tradable",
+      "tags": ["MFT"],
+      "pair": "ZORVX/USDT",
+      "exchange": { "markets": { "ZORVX/USDT": { "active": true, "info": { "status": "online" } } } },
+      "expect": [ { "field": "tradable", "is": true }, { "field": "limitOnly", "is": false }, { "field": "status", "equals": "ok" } ]
+    },
+    {
+      "name": "a limit-only pair is flagged (SymBot places market orders)",
+      "kind": "tradable",
+      "tags": ["regression"],
+      "pair": "QORBL/USDT",
+      "exchange": { "markets": { "QORBL/USDT": { "active": true, "info": { "limit_only": true } } } },
+      "expect": [ { "field": "tradable", "is": true }, { "field": "limitOnly", "is": true }, { "field": "status", "equals": "limit_only" } ]
+    },
+    {
+      "name": "an inactive (suspended/delisted) pair is not tradable",
+      "kind": "tradable",
+      "tags": ["regression"],
+      "pair": "VEXON/USDT",
+      "exchange": { "markets": { "VEXON/USDT": { "active": false } } },
+      "expect": [ { "field": "tradable", "is": false }, { "field": "status", "equals": "inactive" } ]
+    },
+    {
+      "name": "a pair missing from the exchange (removed/delisted) is not tradable",
+      "kind": "tradable",
+      "tags": ["regression"],
+      "pair": "GONEX/USDT",
+      "exchange": { "markets": { "ZORVX/USDT": { "active": true } } },
+      "expect": [ { "field": "tradable", "is": false }, { "field": "status", "equals": "missing" } ]
+    }
+  ]
+}

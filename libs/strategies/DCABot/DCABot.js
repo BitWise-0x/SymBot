@@ -12,12 +12,18 @@ const Table = require('easy-table');
 const Percentage = require('percentagejs');
 const Common = require(pathRoot + '/libs/app/Common.js');
 const AddFundsMath = require(pathRoot + '/libs/app/AddFundsMath.js');
+const PauseReasons = require(pathRoot + '/libs/app/pauseReasons.js');
+// Deal pause-reason KEY constants (SINGLE SOURCE OF TRUTH, libs/app/pauseReasons.js, also injected to the UI).
+// Setting a reason via PR.* instead of a raw string means the engine can only ever set a reason the taxonomy
+// (and therefore the frontend) knows about — a typo or a new reason not added to the module fails fast.
+const PR = PauseReasons.KEY;
 const portfolioGuard = require(pathRoot + '/libs/strategies/DCABot/portfolioGuard.js');
 const Schema = require(pathRoot + '/libs/mongodb/DCABotSchema');
 const DbQueries = require(__dirname + '/DCABotDbQueries.js');
 const PriceGuard = require(__dirname + '/priceGuard.js');
 const StopLoss = require(__dirname + '/stopLoss.js');
 const PairStatus = require(__dirname + '/pairStatus.js');
+const SellFloor = require(__dirname + '/sellFloor.js');
 
 const Bots = Schema.Bots;
 const Deals = Schema.Deals;
@@ -94,6 +100,8 @@ async function retryPartialFill({
 	maxRetries = maxPartialSellRetries,
 	delayMs = partialSellRetryDelayMs,
 	logLabel = 'Partial fill',
+	floorPrice = null,    // slippage-safe graceful close (#130): lowest price a SELL remainder may fill at.
+	                      // null = disabled -> byte-identical to the legacy loop. SELL side only; ignored for buys.
 	io = null             // test-only dependency injection; production always uses the real module I/O
 }) {
 
@@ -101,9 +109,16 @@ async function retryPartialFill({
 	const _io = io || { getSymbol, filterPrice, filterAmount, orderFilledQty, delay: Common.delay, log: (m) => Common.logger(m) };
 	const _log = (m) => { try { _io.log(colors.bgYellow.bold(m)); } catch (e) { /* logging must never break the loop */ } };
 
+	// The floor gate is active ONLY for a sell with a usable floor price supplied. evaluateSellFloor is the
+	// single source of truth for the decision (shared with the eval harness); injectable for tests.
+	const _evaluateFloor = (_io.evaluateSellFloor || SellFloor.evaluateSellFloor);
+	const floorActive = (side === 'sell' && SellFloor.isPosFinite(floorPrice));
+
 	let totalFilled  = Number(initialFilledQty) || 0;
 	let qtyRemaining = Number(requestedQty) - totalFilled;
 	let retryCount   = 0;
+	let held         = false;   // true when the loop stopped because the bid fell below the floor (hold, don't dump)
+	let holdReason   = null;
 
 	while (retryCount < maxRetries && qtyRemaining > 0) {
 
@@ -126,6 +141,30 @@ async function retryPartialFill({
 
 			_log(logLabel + ' retry halted for deal ID ' + dealId + ' — remaining ' + qtyRemaining + ' is below the exchange minimum. Accepting fill.');
 			break;
+		}
+
+		// Slippage-safe floor gate (#130): a graceful close must never re-sell the remainder below the floor
+		// (break-even net of fees, or target minus a configured give-back). The take-profit only fires at/above
+		// target, so a fresh bid below the floor means the market dropped AFTER the trigger — the one moment
+		// selling is wrong. HOLD instead of dumping: stop the loop WITHOUT placing an order and report held, so
+		// the caller persists the partial-sell state and pauses the deal (it auto-resumes when price recovers).
+		// Uses the raw fresh bid (priceRetry), not the precision-filtered price. Only panic_sell ignores the
+		// floor. Inactive (floorPrice null / a buy) -> this block is skipped and the loop is byte-identical.
+		if (floorActive) {
+
+			const floorCheck = _evaluateFloor({ bid: priceRetry, floorPrice });
+
+			if (!floorCheck.allow) {
+
+				held = true;
+				holdReason = floorCheck.reason;
+
+				_log(logLabel + ' retry halted for deal ID ' + dealId + ' — best bid ' + priceRetry +
+					' is below the floor ' + floorPrice + ' (' + floorCheck.reason + '). Holding ' +
+					qtyRemaining + ' remaining rather than selling below floor.');
+
+				break;
+			}
 		}
 
 		_log(logLabel + ' retry ' + retryCount + '/' + maxRetries + ' for deal ID ' + dealId + ' — remaining ' + qtyRemainingFiltered);
@@ -152,7 +191,7 @@ async function retryPartialFill({
 		}
 	}
 
-	return { totalFilled, qtyRemaining: Math.max(qtyRemaining, 0), retryCount };
+	return { totalFilled, qtyRemaining: Math.max(qtyRemaining, 0), retryCount, held, holdReason };
 }
 
 // Tolerance (percent) by which an exchange-reported order cost may sit below
@@ -1306,7 +1345,7 @@ const handleBaseOrder = async ({ config, exchange, dealId, deal, orders, pair, p
 				const msgErr = 'Invalid base order for deal ID ' + dealId + '. Pausing deal and verifying in ' + retryMins + ' minutes.';
 				await sendDealMessage('deal_error', msgErr);
 
-				isDealPauseReason = 'order_verify_buy';
+				isDealPauseReason = PR.ORDER_VERIFY_BUY;
 				await pauseDeal(config.botId, dealId, null, true, null, isDealPauseReason);
 				isDealPauseBuy = true;
 
@@ -1442,6 +1481,13 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 		let sellOrderStatusInvalid = false;
 		let sellNSF = false;
 		let sellSuccess = true;
+
+		// Slippage-safe graceful close (#130): set true when the remainder loop HELD because the bid fell below
+		// the floor. The deal is then persisted + paused (sell_partial_hold) instead of finalized — it never dumps.
+		let heldForFloor = false;
+		let heldReason = null;
+		let heldAttemptReq = 0;   // the quantity THIS attempt tried to sell (the whole-remaining at attempt start)
+		let heldRemainingQty = 0; // what is still unsold after the hold (the whole-remaining now)
 
 		// Actual execution tally for this sell. A sell can complete as several partial
 		// fills at different prices (exchange cancels part way, remainder retried), so
@@ -1590,6 +1636,72 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 		else {
 
 			qtySumSellOrder = qtySumSellBase;
+		}
+
+		// ── Slippage-safe graceful close (#130) ──────────────────────────────────────────────────────────
+		// Floor = the lowest price this close may fill at. ONLY a graceful take-profit close gets a floor:
+		// panic_sell, a user cancel and stop-loss must always execute (principle A — only panic_sell/stop ignore
+		// the floor), so for those the floor stays null and the sell path is byte-identical to today. Default-off:
+		// with close_execution.enabled false (the default) floorPrice is null everywhere and nothing changes.
+		const closeExecCfg = (shareData.appData && shareData.appData.close_execution) || {};
+		const floorEnabled = Common.convertBoolean(closeExecCfg.enabled, false)
+			&& Common.convertBoolean(closeExecCfg.hold_on_floor_breach, true);
+		const floorGraceful = !isDealPanicSell && !isDealCancel && !isDealStopLoss && !cancelOnly;
+
+		let floorPrice = null;
+
+		if (floorEnabled && floorGraceful) {
+
+			floorPrice = SellFloor.computeFloorPrice({
+				'average': currentOrder.average,
+				'exchangeFeePercent': config.exchangeFee,
+				'mode': (closeExecCfg.floor === 'target_minus_give_back') ? 'target_minus_give_back' : 'breakeven',
+				'targetPrice': currentOrder.target,
+				'giveBackPct': closeExecCfg.give_back_pct
+			});
+		}
+
+		// Resume of a deal that was HELD mid-close (sell_partial_hold). deal.partialSell is the persisted, single
+		// source of truth for how much already sold and how much remains — re-read from the DB every tick, so it
+		// survives a restart (crash-safe, #129/#132 pattern). SAFE-BY-CONSTRUCTION: we sell ONLY the explicitly
+		// persisted remaining quantity (never a re-derived full quantity), and only if it is a sane positive
+		// number no larger than the original request; anything else means the state is unreadable, so we HOLD
+		// rather than sell (it can never oversell). The already-sold fills are seeded into the tracker so the
+		// final close credits the WHOLE position (prior + new) at a true VWAP through the existing finalize path.
+		// qtySumSellOrder stays the WHOLE position this close covers (used for finalize crediting / the profit
+		// basis / sellData). sellQtyThisAttempt is what this tick actually PLACES: the whole on a normal close,
+		// or ONLY the persisted remainder on a resume. In the normal (non-resume) case the two are identical, so
+		// every per-attempt call below is byte-identical to today. SellFloor.resolveResumeSell is the pure,
+		// unit-tested single source of truth for the safe resume quantity + seeded prior fills — it can never
+		// return a quantity larger than the persisted remainder, and returns invalid (never a full fallback)
+		// when the state is unreadable, so the deal holds rather than overselling.
+		let sellQtyThisAttempt = qtySumSellOrder;
+		let resumePartialInvalid = false;
+
+		const resume = SellFloor.resolveResumeSell(deal && deal.partialSell);
+
+		if (resume.active) {
+
+			if (resume.invalid) {
+
+				resumePartialInvalid = true;
+			}
+			else {
+
+				sellQtyThisAttempt = resume.sellQty;
+
+				for (let fi = 0; fi < resume.fills.length; fi++) {
+
+					fillTracker['fills'].push(resume.fills[fi]);
+					fillTracker['qty'] += resume.fills[fi].qty;
+					fillTracker['proceeds'] += resume.fills[fi].value;
+				}
+
+				for (let oi = 0; oi < resume.orderIds.length; oi++) {
+
+					sellOrderIds.push(resume.orderIds[oi]);
+				}
+			}
 		}
 
 		// Calculate profit based on new exchange fee percent
@@ -1854,9 +1966,100 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 			sendNotificationFinish(config.botName, dealId, pair, sellData);
 		};
 
+		// Slippage-safe graceful close (#130): the remainder loop HELD because the best bid fell below the floor.
+		// Persist the partial-sell progress and pause the deal (sell_partial_hold) INSTEAD of finalizing — the deal
+		// stays open at status:0, holding the unsold remainder, and auto-resumes selling ONLY that remainder when
+		// price recovers above the floor (handled before the order loop in dcaFollow). Crash-safe: the state lives
+		// in the deal record, so a restart re-reads it and keeps holding — it never re-dumps and never re-derives
+		// the full quantity. The already-sold portion is credited in `fills` so the eventual close reports a true
+		// VWAP over the whole position. Never reached for panic_sell / cancel / stop-loss (those carry no floor).
+		// wasAlreadyHeld: this close is itself a RESUME that re-held (the deal was already in sell_partial_hold).
+		// Used to send the operator notification only on the FIRST transition into a hold, so a deal that keeps
+		// re-holding (price at target but the bid stays below the floor) logs every time but does not spam alerts.
+		const wasAlreadyHeld = !!(deal && deal.partialSell && deal.partialSell.active);
+
+		const handleFloorHold = async (attemptReq, remaining, reason) => {
+
+			const soldThisAttempt = Math.max(Number(attemptReq) - Number(remaining), 0);
+
+			const partialSell = {
+				'active': true,
+				'side': 'sell',
+				'requestedQty': Number(attemptReq),     // what THIS attempt tried to sell (whole-remaining at attempt start)
+				'remainingQty': Number(remaining),      // whole-remaining now — the resume sells ONLY this, never more
+				'soldThisAttempt': soldThisAttempt,
+				'proceeds': Number(fillTracker['proceeds']) || 0,
+				'fills': fillTracker['fills'],           // all fills so far (prior + this attempt) for a true closing VWAP
+				'orderIds': sellOrderIds,
+				'floorPrice': Number(floorPrice),
+				'holdReason': reason || 'below_floor',
+				'average': currentOrder.average,
+				'target': currentOrder.target,
+				// First time this close went on hold — preserved across re-holds so the watchdog reports the TRUE
+				// hold duration (a re-hold on a later resume attempt must not reset the clock).
+				'heldAt': (wasAlreadyHeld && deal.partialSell && deal.partialSell.heldAt) ? deal.partialSell.heldAt : new Date(),
+				'lastHeldAt': new Date()
+			};
+
+			// Persist to the OPEN deal only (status:0), so a concurrent close can never be overwritten. The pause is
+			// written in the same shape resumeDeal / the tick reader expect (pausedSell + pauseReason).
+			await Deals.updateOne({ dealId, 'status': 0 }, {
+				'partialSell': partialSell,
+				'pausedSell': true,
+				'pauseReason': PR.SELL_PARTIAL_HOLD
+			});
+
+			await pauseDeal(config.botId, dealId, null, null, true, PR.SELL_PARTIAL_HOLD);
+
+			isDealPauseSell = true;
+			isDealPauseReason = PR.SELL_PARTIAL_HOLD;
+
+			await updateDealTracker({
+				'exchange': exchange,
+				'deal_id': dealId,
+				'price': price,
+				'config': config,
+				'orders': orders,
+				'pause': isDealPause,
+				'pause_buy': isDealPauseBuy,
+				'pause_sell': true,
+				'pause_reason': PR.SELL_PARTIAL_HOLD
+			});
+
+			Common.logger(colors.bgYellow.bold(
+				'Deal ID ' + dealId + ' graceful close HELD (' + (reason || 'below_floor') + ') — best bid below floor ' +
+				formatPrice(pair, floorPrice) + '. Holding ' + Number(remaining).toFixed(8) + ' ' + (pair.split('/')[0] || '') +
+				' unsold; will auto-resume when price recovers above the floor. Use panic_sell to force an exit.'
+			));
+
+			// Notify only on the FIRST hold (not on every re-hold), so a deal that keeps re-holding does not spam.
+			if (!wasAlreadyHeld) {
+
+				Common.sendNotification({
+					'message': '⏸️ Graceful close held for deal ID ' + dealId + ' (' + pair + ').\n\nThe market dropped below break-even (floor ' + formatPrice(pair, floorPrice) + ') after the sell triggered, so SymBot is HOLDING ' + Number(remaining).toFixed(8) + ' ' + (pair.split('/')[0] || '') + ' rather than selling at a loss. It will finish selling automatically when price recovers above the floor. To force an exit now at market, use panic_sell.',
+					'type': 'warning',
+					'telegram_id': shareData.appData.telegram_id
+				});
+			}
+		};
+
+		// SAFE-BY-CONSTRUCTION guard (#130): a resume whose persisted partial-sell state is unreadable must NEVER
+		// fall back to selling the full position (that would oversell the coin already sold). Hold the deal,
+		// alert once, and leave it for manual reconcile — the sell path below is skipped entirely.
+		if (resumePartialInvalid && !isDealPanicSell && !isDealCancel) {
+
+			Common.logger(colors.bgRed.bold('Deal ID ' + dealId + ' resume HELD — partial-sell state unreadable (remainingQty invalid). Not selling; manual reconcile required.'));
+
+			await sendDealMessage('deal_error', 'Deal ID ' + dealId + ' held: its saved partial-sell progress is unreadable, so SymBot will not re-sell (to avoid overselling). Please reconcile this deal manually.');
+
+			await pauseDeal(config.botId, dealId, null, null, true, PR.SELL_PARTIAL_HOLD);
+
+			return ( loopSignal(false, false) );
+		}
+
 		if (!config.sandBox && !isDealCancel && !cancelOnly) {
 
-			const sell = await sellOrder({ exchange, dealId, pair, qty: qtySumSellOrder, price: priceFiltered });
+			const sell = await sellOrder({ exchange, dealId, pair, qty: sellQtyThisAttempt, price: priceFiltered });
 
 			// Sell not successful / Sell successful but verification failed
 			if (!sell.success || (sell.success && !sell.success_verify)) {
@@ -1882,7 +2085,7 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 
 					// Check if exchange canceled after a partial fill (e.g. Coinbase price protection)
 					const cancelPartialFilled = orderFilledQty(sell);
-					const cancelShortfall = partialFillShortfallPercent(cancelPartialFilled, qtySumSellOrder);
+					const cancelShortfall = partialFillShortfallPercent(cancelPartialFilled, sellQtyThisAttempt);
 
 					if (cancelPartialFilled > 0 && cancelShortfall > partialSellFillThresholdPercent) {
 
@@ -1912,19 +2115,31 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 						// main-sell paths use). Bookkeeping is identical to before — record each fill and track
 						// its order id — and an NSF (still-settling) attempt extends the settlement wait via the
 						// onEmptyFill hook, exactly as the previous inline loop did.
-						await retryPartialFill({
+						const settleRetry = await retryPartialFill({
 							side: 'sell', exchange, pair, dealId,
-							requestedQty: Number(qtySumSellOrder), initialFilledQty: cancelPartialFilled, fallbackPrice: price,
+							requestedQty: Number(sellQtyThisAttempt), initialFilledQty: cancelPartialFilled, fallbackPrice: price,
 							placeOrder: ({ qty, price: retryPrice }) => sellOrder({ exchange, dealId, pair, qty, price: retryPrice }),
 							onFill: recordSellRetryFill,
 							onEmptyFill: async (orderResult) => { if (orderResult && orderResult.nsf) { await Common.delay(settlementDelayMs); } },
 							isAborted: () => (isDealCancel || isDealPanicSell),
+							floorPrice,
 							logLabel: 'Settlement retry'
 						});
 
-						// Mark sell successful so deal closes with the partial fill
-						sellSuccess = true;
-						sellOrderStatusInvalid = false;
+						if (settleRetry.held) {
+
+							// Floor gate held the remainder (bid below floor): do NOT close — persist + pause instead.
+							heldForFloor = true;
+							heldReason = settleRetry.holdReason;
+							heldAttemptReq = Number(sellQtyThisAttempt);
+							heldRemainingQty = Number(settleRetry.qtyRemaining);
+						}
+						else {
+
+							// Mark sell successful so deal closes with the partial fill
+							sellSuccess = true;
+							sellOrderStatusInvalid = false;
+						}
 
 					} else {
 
@@ -1940,7 +2155,7 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 					msgErr = `Invalid order for deal ID ${dealId}. Pausing sell orders for ${retryMins} minutes.`;
 
 					isDealVerifying = true;
-					isDealPauseReason = 'order_verify_sell';
+					isDealPauseReason = PR.ORDER_VERIFY_SELL;
 
 					// KNOWN LIMITATION (restart during verification): the in-flight sell order ID is held only in
 					// memory here — it is not persisted to the deal (sellData is written only on a clean close).
@@ -1970,7 +2185,7 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 					//   (a) a panic-sell / stop-loss is not wrongly deferred (nothing is in flight to oversell), and
 					//   (b) the tick-level sell-error reset can lift this pause once the error has had time to
 					//       clear, instead of stranding the deal paused until a manual resume or restart.
-					isDealPauseReason = 'sell_error';
+					isDealPauseReason = PR.SELL_ERROR;
 				}
 
 				if (msgErr) {
@@ -1978,7 +2193,7 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 					await sendDealMessage(msgType, msgErr);
 					// The reason is set by the specific error branch above ('order_verify_sell' for an invalid
 					// order being verified, 'sell_error' for a generic error). Default defensively if unset.
-					if (!isDealPauseReason) { isDealPauseReason = 'order_verify_sell'; }
+					if (!isDealPauseReason) { isDealPauseReason = PR.ORDER_VERIFY_SELL; }
 					await pauseDeal(config.botId, dealId, null, null, true, isDealPauseReason);
 					isDealPauseSell = true;
 				}
@@ -1993,7 +2208,7 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 				recordFill(initialQtyFilled, sell['data_order'], priceFiltered);
 
 				let totalQtyFilled = initialQtyFilled;
-				let qtyRemaining = Number(qtySumSellOrder) - totalQtyFilled;
+				let qtyRemaining = Number(sellQtyThisAttempt) - totalQtyFilled;
 
 				// Only attempt partial fill retry if the exchange reported a positive
 				// filled quantity. A zero or null quantity after a successful
@@ -2001,7 +2216,7 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 				// not that nothing was filled. Retrying in that case would sell again
 				// on a position that has already been fully closed. Shortfall via the shared helper
 				// (returns 0 for a zero/undefined fill), the same gate the buy side uses.
-				const shortfallPercent = partialFillShortfallPercent(initialQtyFilled, qtySumSellOrder);
+				const shortfallPercent = partialFillShortfallPercent(initialQtyFilled, sellQtyThisAttempt);
 
 				if (shortfallPercent > partialSellFillThresholdPercent) {
 
@@ -2009,7 +2224,7 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 					// (the same helper the buy side uses).
 					Common.logger(colors.bgYellow.bold(
 						'Partial sell fill detected for deal ID ' + dealId +
-						' / Requested: ' + qtySumSellOrder +
+						' / Requested: ' + sellQtyThisAttempt +
 						' / Filled: ' + totalQtyFilled.toFixed(8) +
 						' / Remaining: ' + qtyRemaining.toFixed(8) +
 						' / Shortfall: ' + shortfallPercent.toFixed(2) + '%'
@@ -2023,10 +2238,11 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 
 					const retry = await retryPartialFill({
 						side: 'sell', exchange, pair, dealId,
-						requestedQty: Number(qtySumSellOrder), initialFilledQty: totalQtyFilled, fallbackPrice: price,
+						requestedQty: Number(sellQtyThisAttempt), initialFilledQty: totalQtyFilled, fallbackPrice: price,
 						placeOrder: ({ qty, price: retryPrice }) => sellOrder({ exchange, dealId, pair, qty, price: retryPrice }),
 						onFill: recordSellRetryFill,
 						isAborted: () => (isDealCancel || isDealPanicSell),
+						floorPrice,
 						logLabel: 'Partial sell'
 					});
 
@@ -2034,9 +2250,18 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 					qtyRemaining   = retry.qtyRemaining;
 					const retryCount = retry.retryCount;
 
+					if (retry.held) {
+
+						// Floor gate held the remainder (bid below floor): do NOT finalize — persist + pause instead.
+						heldForFloor = true;
+						heldReason = retry.holdReason;
+						heldAttemptReq = Number(sellQtyThisAttempt);
+						heldRemainingQty = Number(qtyRemaining);
+					}
+
 					if (retryCount >= maxPartialSellRetries) {
 
-						const finalShortfall = ((Math.max(qtyRemaining, 0) / Number(qtySumSellOrder)) * 100).toFixed(2);
+						const finalShortfall = ((Math.max(qtyRemaining, 0) / Number(sellQtyThisAttempt)) * 100).toFixed(2);
 
 						Common.logger(colors.bgRed.bold(
 							'Max partial sell retries reached for deal ID ' + dealId +
@@ -2096,6 +2321,12 @@ const handleSell = async ({ config, exchange, dealId, deal, orders, order, curre
 			}
 
 			await Common.delay(2000);
+		}
+		else if (heldForFloor) {
+
+			// Floor gate held the remainder (#130): persist + pause instead of finalizing. Checked BEFORE
+			// sellSuccess because the main partial-sell path leaves sellSuccess true when it holds.
+			await handleFloorHold(heldAttemptReq, heldRemainingQty, heldReason);
 		}
 		else if (sellSuccess) {
 
@@ -2442,7 +2673,7 @@ const handleSafetyOrder = async ({ config, exchange, dealId, deal, orders, order
 				// the deal's BUYS stay paused, but take-profit / stop-loss / panic / cancel can still exit it
 				// (there is no pending coin to strand). This mirrors the base-order path, which likewise
 				// reserves 'order_verify_buy' for an unverified in-flight order only.
-				isDealPauseReason = buyOrderInvalid ? 'order_verify_buy' : 'buy_error';
+				isDealPauseReason = buyOrderInvalid ? PR.ORDER_VERIFY_BUY : PR.BUY_ERROR;
 				const pauseData = await pauseDeal(config.botId, dealId, null, true, null, isDealPauseReason);
 				isDealPauseBuy = true;
 			}
@@ -2603,7 +2834,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 
 						const dealSellErr = await Deals.findOne({ dealId, status: 0 });
 
-						if (dealSellErr && Common.convertBoolean(dealSellErr.pausedSell, false) && dealSellErr.pauseReason === 'sell_error') {
+						if (dealSellErr && Common.convertBoolean(dealSellErr.pausedSell, false) && dealSellErr.pauseReason === PR.SELL_ERROR) {
 
 							await pauseDeal(configDataObj.botId, dealId, null, null, false, '');
 
@@ -2950,7 +3181,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 						&& !cancelOnly
 						&& !isDealPanicSell && !isDealCancel
 						&& !isDealPauseSell && !isDealVerifying
-						&& isDealPauseReason !== 'order_verify_buy') {
+						&& isDealPauseReason !== PR.ORDER_VERIFY_BUY) {
 
 						// order_verify_buy = a safety-order buy is placed and in background verification
 						// (likely filled but not yet credited). Do not arm the stop-loss until it resolves,
@@ -2967,6 +3198,35 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 					if (slDecision['trailingActive'] && StopLoss.toBool(dealCfg.dcaTrailingReplacesTakeProfit)) {
 
 						suppressTakeProfit = true;
+					}
+				}
+
+				// ── Slippage-safe graceful close (#130): auto-resume a held remainder ──────────────────────
+				// A deal HELD mid-close (sell_partial_hold, see handleFloorHold) re-attempts selling ONLY the
+				// persisted remainder once price has recovered to at/above the take-profit target. Lifting the
+				// sell pause here lets the normal take-profit branch below re-fire; handleSell then reads
+				// deal.partialSell (the persisted single source of truth) and sells ONLY remainingQty, with its
+				// floor gate STILL enforced — so if the bid is somehow back below the floor it simply re-holds,
+				// never dumping. A panic_sell / cancel is untouched (both bypass the hold and force an exit via
+				// their own terms). Fail-safe: if the persisted remainder is unreadable, handleSell holds again
+				// rather than re-deriving the full quantity (it can never oversell).
+				if (deal.partialSell && deal.partialSell.active && isDealPauseReason === PR.SELL_PARTIAL_HOLD
+					&& !isDealPanicSell && !isDealCancel && !cancelOnly && Number(price) > 0) {
+
+					const priceSellOrderResume = Number(currentOrder.target) + (Number(currentOrder.target) * priceSlippageSellPercent);
+
+					if (Number(price) >= priceSellOrderResume) {
+
+						// Price is back at/above target (which is above the floor). Lift the sell hold so the
+						// take-profit branch re-fires THIS tick and re-attempts the remainder.
+						isDealPauseSell = false;
+						isDealPauseReason = '';
+
+						Common.logger(colors.green.bold(
+							'Deal ID ' + dealId + ' graceful-close hold RESUMING — price ' + formatPrice(pair, price) +
+							' recovered to target ' + formatPrice(pair, currentOrder.target) +
+							'; re-attempting the held remainder (floor still enforced).'
+						));
 					}
 				}
 
@@ -3017,7 +3277,7 @@ const dcaFollow = async (configDataObj, exchange, dealId) => {
 						// cancel — would sell only the credited qty and strand the pending buy's coin, and the
 						// post-close reconcile (status:0 filter) would never pick it up. Block the whole branch
 						// until the buy resolves, exactly as for a sell in flight.
-						else if (isDealPauseReason !== 'order_verify_sell' && isDealPauseReason !== 'sell_finalize_error' && isDealPauseReason !== 'order_verify_buy' && ((price >= priceSellOrder && !cancelOnly && !suppressTakeProfit && !isDealVerifying && !isDealPause && !isDealPauseSell) || isDealCancel || isDealPanicSell || isDealStopLoss)) {
+						else if (isDealPauseReason !== PR.ORDER_VERIFY_SELL && isDealPauseReason !== PR.SELL_FINALIZE_ERROR && isDealPauseReason !== PR.ORDER_VERIFY_BUY && ((price >= priceSellOrder && !cancelOnly && !suppressTakeProfit && !isDealVerifying && !isDealPause && !isDealPauseSell) || isDealCancel || isDealPanicSell || isDealStopLoss)) {
 
 							const sellResult = await handleSell({
 								config, exchange, dealId, deal, orders, order, currentOrder, filledOrders,
@@ -4387,7 +4647,7 @@ const verifyInvalidOrder = async ({ count = 0, mins = 2, exchange, pair, botId, 
 					// async-function refactor: a throw here can no longer swallow the resolve and hang the deal).
 					Common.logger('verifyInvalidOrder: post-verify finalize failed for deal ' + dealId + ': ' + ((cbErr && (cbErr.stack || cbErr.message)) || cbErr), true);
 
-					try { await pauseDeal(botId, dealId, true, true, true, 'sell_finalize_error'); } catch (e) {}
+					try { await pauseDeal(botId, dealId, true, true, true, PR.SELL_FINALIZE_ERROR); } catch (e) {}
 					try { await sendDealMessage('deal_error', 'Deal ID ' + dealId + ' order verified as filled but finalizing the close failed — the deal has been paused for attention (not re-sold). Error: ' + ((cbErr && cbErr.message) || cbErr)); } catch (e) {}
 
 					return ({ success: false, callbackFailed: true, error: (cbErr && cbErr.message) || String(cbErr) });
@@ -7707,9 +7967,9 @@ async function resumeDeal(dealObj) {
 	// verifyInvalidOrder so it continues polling rather than sitting paused forever.
 	const resumePauseReason = dealObj.pauseReason || '';
 
-	if (resumePauseReason === 'order_verify_buy' || resumePauseReason === 'order_verify_sell') {
+	if (resumePauseReason === PR.ORDER_VERIFY_BUY || resumePauseReason === PR.ORDER_VERIFY_SELL) {
 
-		const isSell = resumePauseReason === 'order_verify_sell';
+		const isSell = resumePauseReason === PR.ORDER_VERIFY_SELL;
 		const retryMins = 2;
 
 		// Find the pending order ID from the most recent unfilled order
@@ -7789,7 +8049,7 @@ async function resumeDeal(dealObj) {
 			}
 		}
 	}
-	else if (resumePauseReason === 'sell_error') {
+	else if (resumePauseReason === PR.SELL_ERROR) {
 
 		// A generic sell error paused this deal's sells (there is no order to verify). The in-memory
 		// retry/reset tracker that would normally lift that pause does not survive a restart, so clear
@@ -7799,7 +8059,7 @@ async function resumeDeal(dealObj) {
 
 		await pauseDeal(botId, dealId, false, false, false, '');
 	}
-	else if (resumePauseReason === 'buy_error') {
+	else if (resumePauseReason === PR.BUY_ERROR) {
 
 		// A non-in-flight buy failure (insufficient funds / exchange-cancelled / generic) paused this
 		// deal's buys. There is no order to verify, and the in-memory state that would let it lift the
@@ -7809,6 +8069,17 @@ async function resumeDeal(dealObj) {
 		Common.logger( colors.bgYellow.bold('Deal ID ' + dealId + ' was paused (buy_error) at shutdown; clearing pause and resuming.') );
 
 		await pauseDeal(botId, dealId, false, false, false, '');
+	}
+	else if (resumePauseReason === PR.SELL_PARTIAL_HOLD) {
+
+		// Slippage-safe graceful close (#130): the deal held its unsold remainder because the market fell below
+		// the floor. UNLIKE sell_error/buy_error above, this pause is lifted by PRICE recovery, not by an
+		// in-memory tracker — and that logic re-evaluates every tick from the PERSISTED deal (deal.partialSell +
+		// the current price vs target), so it already survives a restart. Therefore DO NOT clear the pause here:
+		// the deal must stay held until price recovers above the floor (or the operator panic_sells). Clearing it
+		// would resume take-profit monitoring and could re-dump the remainder. Just log and resume following; the
+		// tick-level auto-resume handles the rest, selling ONLY the persisted remainder.
+		Common.logger( colors.bgYellow.bold('Deal ID ' + dealId + ' was HELD mid-close (sell_partial_hold) at shutdown; keeping the hold. It will auto-resume selling the remainder when price recovers above the floor (or use panic_sell).') );
 	}
 
 	// Resuming an existing deal — bypass requestDealStart/queue intentionally.

@@ -165,6 +165,12 @@ const CATALOG = {
 		fix: 'Check the named pair on the exchange and read its delisting notice for the dates. While the pair still has a market, decide how to exit the deal (for now this is a manual decision — close it in profit if you can, or accept the loss and panic-sell before trading halts). Avoid starting new deals on it; SymBot already refuses to open one on an inactive or limit-only pair.'
 	},
 
+	// ── Slippage-safe graceful close (held deals) ──
+	'watchdog.sell_partial_hold': {
+		meaning: 'One or more deals are being HELD part-way through closing. On a thin (low-liquidity) pair a take-profit sell can fill only part way, and selling the leftover into a dropped order book would lock in a loss below your break-even. With the slippage-safe close turned on, SymBot refuses to do that: it holds the unsold remainder, keeps the deal open, and finishes selling automatically once the price recovers above your break-even floor. This reminder lists the deals that have been holding for a while, so a long-running hold is not forgotten. It is informational — nothing is stuck or broken, and the already-sold portion has been credited normally.',
+		fix: 'No action is required if you are happy to wait for the price to recover — the deal will finish on its own and this reminder clears. If you would rather exit now and accept the current price (including a loss), use panic sell on the listed deal, which deliberately ignores the floor and sells at market immediately. If holds happen often on a particular pair, consider that pair\'s liquidity, or adjust the floor under close_execution in the configuration.'
+	},
+
 	// ── Singleton-lock hygiene ──
 	'watchdog.orphaned_lock': {
 		meaning: 'A single-instance lock file in data/locks is held by a process ID that is no longer running and has not been refreshed for well past its normal interval — a leftover from a hard crash or power loss. SymBot reclaims such a lock automatically the next time an instance starts, so it normally clears itself; it only matters if that dead process ID has since been reused by an unrelated program, in which case a restart could be refused.',

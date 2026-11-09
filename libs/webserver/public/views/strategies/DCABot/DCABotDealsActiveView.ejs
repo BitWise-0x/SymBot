@@ -90,20 +90,15 @@
 		const balanceStale     = !portfolio.is_sandbox && !!portfolio.balance_stale;
 
 		// Portfolio total
-		$('#portfolioTotal').text(balanceAvailable ? (sym + (portfolio.portfolio_total || 0).toFixed(2) + ' ' + quoteCcy) : 'updating…');
+		$('#portfolioTotal').text(balanceAvailable ? (SymBot.UI.formatMoney(portfolio.portfolio_total, { symbol: sym }) + ' ' + quoteCcy) : 'updating…');
 
 		// Max Funds (always known from the deal configs, independent of the exchange balance)
-		$('#portfolioMaxFunds').text(sym + (portfolio.total_max_funds || 0).toFixed(2));
+		$('#portfolioMaxFunds').text(SymBot.UI.formatMoney(portfolio.total_max_funds, { symbol: sym }));
 
-		// Risk % with color coding
+		// Risk % with color coding. Cutoffs live once in SymBot.UI.severityClass (shared with both dashboards);
+		// a null/undefined risk falls to the low tier, as before.
 		const risk = portfolio.risk_percent;
-		let riskClass = 'portfolio-risk-low';
-
-		if (risk !== null && risk !== undefined) {
-
-			if (risk >= 90)      riskClass = 'portfolio-risk-high';
-			else if (risk >= 70) riskClass = 'portfolio-risk-mid';
-		}
+		const riskClass = SymBot.UI.severityClass(risk, 'portfolio-risk');
 
 		$('#portfolioRisk')
 			.attr('class', riskClass)
@@ -209,51 +204,9 @@
 
 	function panicSellConfirm(dealId) {
 
-		let randNum = Math.floor(1000 + Math.random() * 9000);
-
-		$.confirm({
-
-					title: false,
-					boxWidth: '50%',
-					useBootstrap: false,
-					content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">Close deal ' + dealId + ' at current market price?<br><br>' +
-						'Type <b>' + randNum + '</b> in the box to confirm close deal: ' +
-						'<form action="" style="display: inline;"><input type="text" id="confirmNum" class="form-field" onkeypress="if (event.which < 48 || event.which > 57) if (event.which != 8) return false;" required /></form></div>',
-					buttons: {
-								formSubmit: {
-												btnClass: 'btn-default',
-												text: '<div style="color: var(--color-danger);">Close Deal</div>',
-												action: function () {
-
-													let confirmNum = this.$content.find('#confirmNum').val();
-													
-													if (!confirmNum || confirmNum != randNum) {
-
-														alertBox('Confirmation number incorrect');
-														return false;
-													}
-													
-													panicSell(dealId);
-												}
-											},
-							 	cancel: {
-
-									 		btnClass: 'btn-default',
-									 		text: '<div style="color: var(--color-neutral);">Cancel</div>',	
-										 	action: function () { }
-									 	}
-							 },
-							 onContentReady: function () {
-
-							 	let jc = this;
-
-							 	this.$content.find('form').on('submit', function (e) {
-
-							 		e.preventDefault();
-							 		jc.$$formSubmit.trigger('click');
-								});
-							}
-		});
+		// Dialog markup + random-number confirmation live in SymBot.UI (shared with the Hub). This caller supplies
+		// only the instance-specific panic-sell action.
+		SymBot.UI.confirmPanicSell({ dealId: dealId, onConfirm: function () { panicSell(dealId); } });
 	}
 
 
@@ -261,30 +214,9 @@
 
 		_autoRefresh.stop();
 
-		$.confirm({
-
-					title: false,
-					boxWidth: '50%',
-					useBootstrap: false,
-					content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">Disable ' + SymBot.UI.esc(botName) + '? Current deals will continue running until they complete.</div>',
-					buttons: {
-
-								ok: {
-										btnClass: 'btn-default',
-										text: '<div style="color: var(--color-danger);">Disable Bot</div>',
-										action: function () {
-
-											stopBot(selector, data);
-										}
-									 },
-							 	cancel: {
-
-									 		btnClass: 'btn-default',
-									 		text: '<div style="color: var(--color-neutral);">Cancel</div>',	
-										 	action: function () { setReloadTimeout(); }
-									 	}
-							 }
-		});
+		// Dialog markup lives in SymBot.UI (shared with the Hub). This caller supplies the instance-specific
+		// disable action and its post-cancel reload.
+		SymBot.UI.confirmStopBot({ botName: botName, onConfirm: function () { stopBot(selector, data); }, onCancel: function () { setReloadTimeout(); } });
 	}
 
 
@@ -487,7 +419,7 @@
 
 						if (!data.success) {
 
-							alertBox('Unable to close deal: ' + data['data'], function() { getActiveDeals(); });
+							alertBox('Unable to panic sell deal: ' + data['data'], function() { getActiveDeals(); });
 						}
 						else {
 
@@ -578,92 +510,16 @@
 
 	function pauseDeal(pair, dealId, pause, pauseBuy, pauseSell, pauseReason) {
 
-		let pairSplit = pair.split('/');
-		let quote = pairSplit[1];
-
-		const pauseInfo = SymBot.UI.systemPauseInfo(pauseReason);
-		const isSystemPaused = pauseInfo.isSystem;
-		const systemWarning = isSystemPaused
-			? '<div style="font-size: var(--fs-body); padding: 8px; margin-bottom: 10px; background: var(--color-warning-soft); border-left: 3px solid var(--color-warning); border-radius: 2px;">' +
-			  '<b>⚠ System paused:</b> This deal was automatically paused by the system due to ' + pauseInfo.description + '. ' +
-			  'Review the situation before resuming manually.</div>'
-			: '';
-
-		$.confirm({
-			title: false,
-			boxWidth: "50%",
-			useBootstrap: false,
-	 		content: `<div style="font-size: var(--fs-dialog-title); text-align: left;">Pause / Resume deal ${dealId}?<br><br>
-			<form action="" style="display: inline;">
-			${systemWarning}
-			This will pause or resume any further buying and / or selling for this deal
-			<br><br>
-
-			<input id="dealPauseBuy" name="dealPauseBuy" type=checkbox class="form-field"> &nbsp; <b>Pause Buy</b>
-			<br>
-			<input id="dealPauseSell" name="dealPauseSell" type=checkbox class="form-field"> &nbsp; <b>Pause Sell</b>
-
-			<br><br>
-			<input type="checkbox" id="confirmBox" class="form-field" style="width: 20px;" /> <b>Check the box to confirm <span style="color: var(--color-danger);">PAUSE / RESUME</span> deal</b>
-			</form>
-			</div>`,
-			buttons: {
-				  formSubmit: {
-					  btnClass: 'btn-default',
-					  text: '<div style="color: var(--color-danger);">Pause / Resume Deal</div>',
-					  action: function() {
-
-						const inputValue = parseFloat($('#confirmNum').val());
-						const confirmBox = $('#confirmBox').prop('checked');
-
-						const pauseBuy = convertBoolean($('#dealPauseBuy').prop('checked'), false);
-						const pauseSell = convertBoolean($('#dealPauseSell').prop('checked'), false);
-
-						if (!confirmBox) {
-
-							alertBox('You must check the box to confirm pause / resume deal', function() {});
-						}
-						else {
-
-							processPauseDeal(dealId, pauseBuy, pauseSell);
-				 		}
-			  		},
-				},
-		  		cancel: {
-			 		btnClass: 'btn-default',
-			  		text: '<div style="color: var(--color-neutral);">Cancel</div>',
-			  		action: function() {},
-				},
-			},
-			onOpenBefore: function () {
- 
-				// Set both buy and sell to true
-				if (pause) {
-
-					pauseBuy = true;
-					pauseSell = true;
-				}
-
-				$('#dealPauseBuy').simpleSwitch();
-				$('#dealPauseSell').simpleSwitch();
-
-				$('#dealPauseBuy').prop('checked', pauseBuy);
-				$('#dealPauseBuy').switchToggle(pauseBuy);
-
-				$('#dealPauseSell').prop('checked', pauseSell);
-				$('#dealPauseSell').switchToggle(pauseSell);
-			},
-	  		onContentReady: function() {
-
-				$('#confirmBox').prop('checked', false);
-
-				let jc = this;
-		  		this.$content.find("form").on("submit", function(e) {
-					e.preventDefault();
-			  		jc.$$formSubmit.trigger("click");
-		  		});
-	  		},
-  		});
+		// Dialog markup, the system-pause warning and the toggles live in SymBot.UI (shared with the Hub). This
+		// caller supplies the instance-specific pause action.
+		SymBot.UI.confirmPauseDeal({
+			dealId: dealId,
+			pause: pause,
+			pauseBuy: pauseBuy,
+			pauseSell: pauseSell,
+			pauseReason: pauseReason,
+			onConfirm: function(pb, ps) { processPauseDeal(dealId, pb, ps); }
+		});
 	}
 
 
@@ -706,56 +562,9 @@
 
 	function cancelDeal(pair, dealId) {
 
-		let pairSplit = pair.split('/');
-		let quote = pairSplit[1];
-
-		$.confirm({
-	 		title: false,
-			boxWidth: "50%",
-	  		useBootstrap: false,
-	  		content: `<div style="font-size: var(--fs-dialog-title); text-align: left;">Cancel deal ${dealId}?<br><br>
-			<form action="" style="display: inline;">
-			This will cancel and remove the active deal from any further trading without selling any assets already bought from previous orders
-			<br><br>
-			<input type="checkbox" id="confirmBox" class="form-field" style="width: 20px;" /> <b>Check the box to confirm <span style="color: var(--color-danger);">CANCEL</span> deal</b>
-			</form>
-			</div>`,
-	  		buttons: {
-		  		formSubmit: {
-			  		btnClass: 'btn-default',
-			  		text: '<div style="color: var(--color-danger);">Cancel Deal</div>',
-			  		action: function() {
-
-				  		const inputValue = parseFloat($('#confirmNum').val());
-						const confirmBox = $('#confirmBox').prop('checked');
-
-						if (!confirmBox) {
-
-							alertBox('You must check the box to confirm cancel deal', function() {});
-						}
-						else {
-
-							processCancelDeal(dealId);
-				 		}
-			  		},
-		  		},
-		  		cancel: {
-			  		btnClass: 'btn-default',
-			  		text: '<div style="color: var(--color-neutral);">Cancel</div>',
-			  		action: function() {},
-				},
-			},
-	  		onContentReady: function() {
-
-				$('#confirmBox').prop('checked', false);
-
-				let jc = this;
-		  		this.$content.find("form").on("submit", function(e) {
-					e.preventDefault();
-			  		jc.$$formSubmit.trigger("click");
-		  		});
-	  		},
-  		});
+		// Dialog markup + checkbox confirmation live in SymBot.UI (shared with the Hub). This caller supplies the
+		// instance-specific cancel action.
+		SymBot.UI.confirmCancelDeal({ dealId: dealId, onConfirm: function() { processCancelDeal(dealId); } });
 	}
 
 
@@ -1146,7 +955,7 @@
 			contentArr.push('<td>' + duration + '</td>');
 			contentArr.push('<td>' + SymBot.UI.pendingCell(awaiting, dealSym + convertNotation(deal['info']['price_last'])) + '</td>');
 			contentArr.push('<td>' + dealSym + convertNotation(deal['info']['price_target']) + stopLossDisplay + '</td>');
-			contentArr.push('<td>' + dealSym + dealVolume.toFixed(2) + '</td>')
+			contentArr.push('<td>' + SymBot.UI.formatMoney(dealVolume, { symbol: dealSym }) + '</td>')
 			contentArr.push('<td class="' + profitPercClass + '">' + SymBot.UI.pendingCell(awaiting, dealSym + profit) + '</td>');
 			contentArr.push('<td class="' + profitPercClass + '">' + SymBot.UI.pendingCell(awaiting, profitBase) + '</td>');
 			contentArr.push('<td class="' + profitPercClass + '">' + SymBot.UI.pendingCell(awaiting, profitPerc + '%') + '</td>');
@@ -1204,11 +1013,11 @@
 
 		$('#totalProfit').removeClass('profit-positive profit-negative').addClass(profitTotalClass);
 		const summarySym = deals.length > 0 ? getDealSym(deals[0]['info']['pair'], deals[0]['config']['profitCurrency']) : '$';
-		$('#totalProfit').html(summarySym + totalProfit.toFixed(2));
+		$('#totalProfit').html(SymBot.UI.formatMoney(totalProfit, { symbol: summarySym }));
 
-		$('#inDeals').html(summarySym + inDeals.toFixed(2));
+		$('#inDeals').html(SymBot.UI.formatMoney(inDeals, { symbol: summarySym }));
 		$('#totalDeals').html(activeDeals);
-		$('#projectedProfit').html(summarySym + (Math.round(totalProjectedProfit * 100) / 100).toFixed(2));
+		$('#projectedProfit').html(SymBot.UI.formatMoney(totalProjectedProfit, { symbol: summarySym }));
 
 		$('#botsDeals').tablesorter().trigger('update');
 
@@ -1868,7 +1677,7 @@ $(document).ready(function() {
 
 				if (dealId) dealEdit(dealId);
 			}
-			else if (btnTitle === 'Close deal') {
+			else if (btnTitle === 'Panic sell deal') {
 
 				if (dealId) panicSellConfirm(dealId);
 			}

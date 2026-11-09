@@ -81,9 +81,7 @@
 			if (portfolio) {
 
 				const riskPct = portfolio.risk_percent;
-				const riskClass = riskPct >= 90 ? 'portfolio-risk-high'
-				                : riskPct >= 70 ? 'portfolio-risk-mid'
-				                : 'portfolio-risk-low';
+				const riskClass = SymBot.UI.severityClass(riskPct, 'portfolio-risk');
 
 				const quoteArr = Object.keys(portfolio.balances || {});
 				const quote    = quoteArr[0] || 'USD';
@@ -91,7 +89,7 @@
 
 				const portfolioVal = portfolio.is_sandbox
 					? '<span style="opacity:0.5;">Sandbox</span>'
-					: quoteSym + (portfolio.portfolio_total || 0).toFixed(2);
+					: SymBot.UI.formatMoney(portfolio.portfolio_total, { symbol: quoteSym });
 
 				const balanceAge = portfolio.is_sandbox ? '' :
 					portfolio.balance_updated
@@ -109,7 +107,7 @@
 					'</div>' +
 					'<div class="hub-dash-card-row">' +
 						'<span class="hub-dash-label">Max Funds</span>' +
-						'<span>' + quoteSym + (portfolio.total_max_funds || 0).toFixed(2) + '</span>' +
+						'<span>' + SymBot.UI.formatMoney(portfolio.total_max_funds, { symbol: quoteSym }) + '</span>' +
 					'</div>' +
 					'<div class="hub-dash-card-row">' +
 						'<span class="hub-dash-label">Risk</span>' +

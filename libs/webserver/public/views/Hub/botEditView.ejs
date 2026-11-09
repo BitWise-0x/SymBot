@@ -12,7 +12,7 @@
 	const instanceName = <%- JSON.stringify(String(instanceName || '')).replace(/</g, '\\u003c') %>;
 	const pairButtons  = <%- JSON.stringify(scData && scData.pair_buttons ? scData.pair_buttons : []).replace(/</g, '\\u003c') %>;
 	const startConditionsMeta = <%- JSON.stringify(scData && scData.start_conditions_metadata ? scData.start_conditions_metadata : {}).replace(/</g, '\\u003c') %>;
-	const botText      = isUpdate ? 'Update Bot' : 'Create Bot';
+	const botText      = isUpdate ? 'Update DCA Bot' : 'Create DCA Bot';
 
 
 	function getFormData(createStep) {
