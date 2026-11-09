@@ -1,0 +1,33 @@
+{
+  "note": "Clock-skew decision (the REAL Watchdog.evaluateClockSkew) and partial-fill shortfall math (DCABot.partialFillShortfallPercent). Synthetic / numeric only.",
+  "scenarios": [
+    {
+      "name": "clock ~1.5s AHEAD trips the skew warning (the Binance -1021 class)",
+      "kind": "clock",
+      "tags": ["regression"],
+      "input": { "skewMs": 1500, "warnMs": 1000 },
+      "expect": [ { "field": "flagged", "is": true }, { "field": "ahead", "is": true } ]
+    },
+    {
+      "name": "clock within tolerance does not trip",
+      "kind": "clock",
+      "tags": ["MFT"],
+      "input": { "skewMs": 500, "warnMs": 1000 },
+      "expect": [ { "field": "flagged", "is": false } ]
+    },
+    {
+      "name": "shortfall percent of a large partial fill",
+      "kind": "shortfall",
+      "tags": ["MFT"],
+      "input": { "filled": 60193, "requested": 143941 },
+      "expect": [ { "field": "percent", "close": 58.18, "tol": 0.01 } ]
+    },
+    {
+      "name": "a full fill has zero shortfall",
+      "kind": "shortfall",
+      "tags": ["MFT"],
+      "input": { "filled": 143941, "requested": 143941 },
+      "expect": [ { "field": "percent", "equals": 0 } ]
+    }
+  ]
+}

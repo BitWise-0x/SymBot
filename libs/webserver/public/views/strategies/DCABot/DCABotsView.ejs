@@ -42,11 +42,13 @@
 
 						if (!data.success) {
 
-							alertBox('Unable to change bot status');
+							alertBox(SymBot.UI.t('bot.status_unknown'));
 						}
 						else {
 
-							alertBox((data.botName ? data.botName : 'Bot') + ' is now ' + status);
+							// Phrasing lives once in SymBot.UI.MESSAGES; the status word is itself a message key, so a
+							// locale pack translates both the sentence and the word. English output is unchanged.
+							alertBox(SymBot.UI.t('bot.now_status', { name: SymBot.UI.esc(data.botName || 'Bot'), status: SymBot.UI.t('bot.status.' + status) }));
 						}
 					},
 					error: function(data) {
@@ -62,111 +64,37 @@
 
 	function confirmBot(api, data, botId, botName) {
 
-		let botText;
+		if (confirmWaiting) { return; }
 
-		if (api.match(/enable/i)) {
-				
-			botText = 'Enable';
-		}
-		else {
-				
-			botText = 'Disable';
-		}
+		confirmWaiting = true;
 
-		if (!confirmWaiting) {
+		// Dialog markup + styling live in SymBot.UI (shared with the Hub). This caller keeps the instance-specific
+		// confirmWaiting guard and the toggle-switch bookkeeping.
+		SymBot.UI.confirmToggleBot({
+			botName: botName,
+			enable: /enable/i.test(api),
+			onConfirm: function () {
 
-			confirmWaiting = true;
+				$('#toggle' + botId).prop('disabled', false);
+				$('#toggle' + botId).click();
 
-			$.confirm({
-						title: false,
-						boxWidth: '50%',
-						useBootstrap: false,
-						content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">' + botText + ' ' + botName + '?</div>',
-						buttons: {
+				setTimeout(function () { confirmWaiting = false; $('#toggle' + botId).prop('disabled', true); }, 500);
 
-									ok: {
-											btnClass: 'btn-default',
-											text: '<div style="color: var(--color-success);">' + botText + ' Bot</div>',
-											action: function () {
+				toggleBot(api, data);
+			},
+			onCancel: function () {
 
-												$('#toggle' + botId).prop('disabled', false);
-												$('#toggle' + botId).click();
-											
-												setTimeout( function() {
-																			confirmWaiting = false;
-																			$('#toggle' + botId).prop('disabled', true);
-
-																	   }, 500);
-
-												toggleBot(api, data);
-											}
-										},
-										cancel: {
-
-									 		btnClass: 'btn-default',
-									 		text: '<div style="color: var(--color-neutral);">Cancel</div>',	
-									 		action: function () {
-
-									 			setTimeout( function() {
-																			confirmWaiting = false;
-
-																	   }, 500);
-											}
-										}
-								 }
-			});
-		}
+				setTimeout(function () { confirmWaiting = false; }, 500);
+			}
+		});
 	}
 
 
 	function deleteBot(botId, botName) {
 
-		$.confirm({
-			title: false,
-			boxWidth: '50%',
-			useBootstrap: false,
-			content: '<div style="font-size: var(--fs-dialog-title); text-align: left;">' +
-				'<b style="color: var(--color-danger);">Delete ' + botName + '?</b><br><br>' +
-				'<div style="font-size: var(--fs-body); padding: 8px; background: var(--color-danger-soft); border-left: 3px solid var(--color-danger); border-radius: 2px;">' +
-				'<b>This cannot be undone.</b> The bot and all of its deal history will be permanently deleted. Active deals must be closed or canceled first.' +
-				'</div><br>' +
-				'Type the bot name to confirm:<br>' +
-				'<form action="" style="display: inline;"><input type="text" id="deleteBotConfirmName" class="form-field" style="width: 100%; margin-top: 6px; box-sizing: border-box;" required /></form>' +
-				'</div>',
-			buttons: {
-				confirm: {
-					btnClass: 'btn-default',
-					text: '<div style="color: var(--color-danger);">Delete Bot</div>',
-					action: function() {
-
-						const typed = this.$content.find('#deleteBotConfirmName').val().trim();
-
-						if (typed !== botName) {
-
-							alertBox('Bot name does not match.');
-							return false;
-						}
-
-						processDeleteBot(botId, botName);
-					}
-				},
-				cancel: {
-					btnClass: 'btn-default',
-					text: '<div style="color: var(--color-neutral);">Cancel</div>',
-					action: function() {}
-				}
-			},
-			onContentReady: function() {
-
-				let jc = this;
-
-				this.$content.find('form').on('submit', function(e) {
-
-					e.preventDefault();
-					jc.$$confirm.trigger('click');
-				});
-			}
-		});
+		// Dialog markup + name-match confirmation live in SymBot.UI (shared with the Hub). This caller supplies
+		// only the instance-specific delete action.
+		SymBot.UI.confirmDeleteBot({ botName: botName, onConfirm: function() { processDeleteBot(botId, botName); } });
 	}
 
 
